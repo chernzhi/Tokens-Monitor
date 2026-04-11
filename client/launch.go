@@ -141,20 +141,22 @@ var managedLaunchPresets = []launchPreset{
 }
 
 type monitorRuntime struct {
-	reporter      *Reporter
-	server        *http.Server
-	listener      net.Listener
-	proxyAddr     string
-	listenPort    int
-	gatewayServer *http.Server // nil if gateway_port not configured
-	gatewayLn     net.Listener // nil if gateway_port not configured
-	gatewayPort   int
+	reporter       *Reporter
+	reporterCancel context.CancelFunc
+	server         *http.Server
+	listener       net.Listener
+	proxyAddr      string
+	listenPort     int
+	gatewayServer  *http.Server // nil if gateway_port not configured
+	gatewayLn      net.Listener // nil if gateway_port not configured
+	gatewayPort    int
 }
 
 func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string) (*monitorRuntime, error) {
 	reporter := NewReporter(cfg)
 	reporter.sourceApp = sourceApp
-	go reporter.Start()
+	reporterCtx, reporterCancel := context.WithCancel(context.Background())
+	go reporter.Start(reporterCtx)
 
 	ctxPing, cancelPing := context.WithTimeout(context.Background(), 6*time.Second)
 	go func() {
@@ -174,7 +176,8 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string) (*
 	proxy.listenPort = listenPort
 
 	rt := &monitorRuntime{
-		reporter: reporter,
+		reporter:       reporter,
+		reporterCancel: reporterCancel,
 		server: &http.Server{
 			Handler:           proxy,
 			ReadHeaderTimeout: 30 * time.Second,
@@ -209,7 +212,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string) (*
 }
 
 func (m *monitorRuntime) Shutdown(ctx context.Context) error {
-	m.reporter.Flush()
+	m.reporterCancel() // signal reporter goroutine to exit (it will do a final Flush)
 	if m.gatewayServer != nil {
 		m.gatewayServer.Shutdown(ctx)
 	}

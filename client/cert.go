@@ -147,6 +147,8 @@ func loadCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.PrivateKey, err
 	return cert, key, nil
 }
 
+const maxCertCacheSize = 1000
+
 // GetCert returns a TLS certificate for the given hostname, generating on-the-fly if needed.
 func (cm *CertManager) GetCert(hostname string) (*tls.Certificate, error) {
 	cm.mu.RLock()
@@ -162,6 +164,18 @@ func (cm *CertManager) GetCert(hostname string) (*tls.Certificate, error) {
 	// Double-check after acquiring write lock
 	if c, ok := cm.cache[hostname]; ok {
 		return c, nil
+	}
+
+	// Evict entries if cache is full
+	if len(cm.cache) >= maxCertCacheSize {
+		count := 0
+		for k := range cm.cache {
+			delete(cm.cache, k)
+			count++
+			if count >= maxCertCacheSize/4 {
+				break
+			}
+		}
 	}
 
 	c, err := cm.issueLeaf(hostname)

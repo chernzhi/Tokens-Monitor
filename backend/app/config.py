@@ -2,8 +2,15 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql+asyncpg://monitor:monitor_dev_123@localhost:5432/token_monitor"
+    DATABASE_URL: str = ""
     REDIS_URL: str = "redis://localhost:6379/0"
+
+    # 认证配置
+    COLLECT_API_KEY: str = ""  # 上报用全局 API Key，为空时进入迁移宽限期（仅告警不拒绝）
+    ADMIN_PASSWORD: str = ""   # 管理接口密码，为空时拒绝所有管理请求返回 503
+
+    # CORS 允许域名（逗号分隔），为空时使用默认内网地址
+    CORS_ALLOWED_ORIGINS: str = ""
 
     # New API 配置
     NEWAPI_BASE_URL: str = "http://localhost:3001"

@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: token-monitor-backend:latest
+          image: token-monitor-backend:v1.0.0  # Pin to specific version; never use :latest
           ports:
             - containerPort: 8000
           envFrom:
@@ -29,12 +29,21 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
           livenessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -65,7 +74,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: token-monitor-frontend:latest
+          image: token-monitor-frontend:v1.0.0  # Pin to specific version; never use :latest
           ports:
             - containerPort: 80
           resources:
@@ -75,6 +84,21 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+          securityContext:
+            runAsNonRoot: false  # nginx requires root for port 80; use unprivileged nginx image to enable runAsNonRoot
+            allowPrivilegeEscalation: false
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service

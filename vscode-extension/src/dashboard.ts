@@ -304,6 +304,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             const timer = setTimeout(() => controller.abort(), 5000);
             const response = await fetch(`${this.config.serverUrl}/api/clients/identity-check?${params.toString()}`, {
                 signal: controller.signal,
+                headers: this.config.apiKey ? { 'X-API-Key': this.config.apiKey } : {},
             });
             clearTimeout(timer);
             if (!response.ok) {
@@ -2589,7 +2590,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             const pct = total > 0 ? Math.round((value / total) * 100) : 0;
             return '<div class="breakdown-row">' +
                 '<div class="breakdown-top">' +
-                    '<span class="breakdown-label">' + key + '</span>' +
+                    '<span class="breakdown-label">' + escapeHtml(String(key)) + '</span>' +
                     '<span class="breakdown-value">' + value.toLocaleString() + ' <span style="opacity:0.65;margin-left:6px;">' + pct + '%</span></span>' +
                 '</div>' +
                 '<div class="breakdown-bar"><div class="breakdown-fill" style="width:' + pct + '%"></div></div>' +

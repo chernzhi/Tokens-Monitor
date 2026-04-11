@@ -44,6 +44,8 @@ type Config struct {
 	// GatewayPort 为 API Gateway 专用端口（可选）。设置后，该端口仅提供反向代理 /v1/* 与 /vendor/* 路由，
 	// 不做 CONNECT MITM，也不需要 CA 证书信任。设为 0 或省略则 Gateway 路由共享 MITM 主端口。
 	GatewayPort int `json:"gateway_port,omitempty"`
+	// APIKey 上报数据时附加的认证 Key，对应服务端 COLLECT_API_KEY 配置。为空时不发送 X-API-Key 头。
+	APIKey string `json:"api_key,omitempty"`
 }
 
 // EffectiveInstallSystemProxy 是否写入系统代理与环境变量。省略字段时默认 false，优先保持本机网络环境不变。

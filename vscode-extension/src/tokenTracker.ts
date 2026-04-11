@@ -73,6 +73,7 @@ export class TokenTracker {
     private readonly appScopeKey: string;
     private isReporting = false;
     private eventBus?: EventBus;
+    private tokenUsageListener?: (data: any) => void;
     private lastCollectSuccessAt?: string;
     private lastCollectError?: string;
     private lastStatsSyncAt?: string;
@@ -188,9 +189,8 @@ export class TokenTracker {
     start() {
         // Subscribe to token-usage events from EventBus
         if (this.eventBus) {
-            this.eventBus.on('token-usage', (data) => {
-                this.addRecord(data);
-            });
+            this.tokenUsageListener = (data) => this.addRecord(data);
+            this.eventBus.on('token-usage', this.tokenUsageListener);
         }
 
         // Check offline queue every 60 seconds
@@ -207,6 +207,10 @@ export class TokenTracker {
     }
 
     stop() {
+        if (this.eventBus && this.tokenUsageListener) {
+            this.eventBus.off('token-usage', this.tokenUsageListener);
+            this.tokenUsageListener = undefined;
+        }
         if (this.offlineQueueTimer) {
             clearInterval(this.offlineQueueTimer);
             this.offlineQueueTimer = null;
@@ -377,12 +381,15 @@ export class TokenTracker {
     private getJSON<T>(url: string): Promise<T> {
         return new Promise((resolve, reject) => {
             const parsed = new URL(url);
-            const options = {
+            const options: Record<string, any> = {
                 hostname: parsed.hostname,
                 port: parsed.port,
                 path: parsed.pathname + parsed.search,
                 method: 'GET',
                 timeout: 10_000,
+                headers: {
+                    ...(this.config.apiKey ? { 'X-API-Key': this.config.apiKey } : {}),
+                },
             };
 
             const transport = parsed.protocol === 'https:' ? https : http;
@@ -414,7 +421,7 @@ export class TokenTracker {
         return new Promise((resolve, reject) => {
             const body = JSON.stringify(data);
             const parsed = new URL(url);
-            const options = {
+            const options: Record<string, any> = {
                 hostname: parsed.hostname,
                 port: parsed.port,
                 path: parsed.pathname,
@@ -422,6 +429,7 @@ export class TokenTracker {
                 headers: {
                     'Content-Type': 'application/json; charset=utf-8',
                     'Content-Length': Buffer.byteLength(body, 'utf8'),
+                    ...(this.config.apiKey ? { 'X-API-Key': this.config.apiKey } : {}),
                 },
                 timeout: 15_000,
             };

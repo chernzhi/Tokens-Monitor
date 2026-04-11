@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import case, func, select, cast, Date as SADate
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import require_admin
 from app.canonical import dashboard_tz, source_app_display_name, source_app_key_sql_case
 from app.config import settings
 from app.database import get_db
@@ -513,7 +514,7 @@ async def get_logs(
     return UsageLogResponse(items=items, total=total)
 
 
-@router.get("/admin/unpriced-models")
+@router.get("/admin/unpriced-models", dependencies=[Depends(require_admin)])
 async def get_unpriced_models(
     days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),

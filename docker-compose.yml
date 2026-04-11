@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: token_monitor
       POSTGRES_USER: monitor
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-Otw2026Monitor!}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD environment variable must be set}
     ports:
       - "127.0.0.1:15432:5432"  # 避免与已有PG冲突
     volumes:
@@ -33,7 +33,7 @@ services:
     ports:
       - "8000:8000"  # 客户端上报 + API
     environment:
-      DATABASE_URL: postgresql+asyncpg://monitor:${DB_PASSWORD:-Otw2026Monitor!}@db:5432/token_monitor
+      DATABASE_URL: postgresql+asyncpg://monitor:${DB_PASSWORD:?DB_PASSWORD must be set}@db:5432/token_monitor
       REDIS_URL: redis://redis:6379/0
       EXTENSION_DIR: /data/extensions
     env_file:

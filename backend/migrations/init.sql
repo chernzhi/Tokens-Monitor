@@ -141,6 +141,22 @@ CREATE TABLE clients (
 CREATE INDEX idx_clients_last_seen ON clients(last_seen);
 CREATE INDEX idx_clients_user_id ON clients(user_id);
 
+-- ── 性能索引（高频查询优化） ────────────────────────────────
+-- request_id 去重查询
+CREATE INDEX IF NOT EXISTS idx_usage_request_id
+    ON token_usage_logs (request_id)
+    WHERE request_id IS NOT NULL;
+-- Tokscale 删除-替换操作的三列组合索引
+CREATE INDEX IF NOT EXISTS idx_usage_user_source_time
+    ON token_usage_logs (user_id, source, request_at);
+-- 告警去重检查
+CREATE INDEX IF NOT EXISTS idx_alerts_type_target
+    ON alerts (alert_type, target_type, target_id, created_at);
+-- 突增检测覆盖索引
+CREATE INDEX IF NOT EXISTS idx_daily_date_user_tokens
+    ON daily_usage_summary (date, user_id)
+    INCLUDE (total_tokens);
+
 -- ══════════════════════════════════════════════════════════════
 -- 插入默认模型定价（价格单位: $/1K tokens, 截至 2026-04）
 -- ══════════════════════════════════════════════════════════════

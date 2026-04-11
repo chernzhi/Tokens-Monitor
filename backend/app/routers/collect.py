@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import require_api_key
 from app.canonical import dashboard_tz, source_app_display_name
 from app.config import settings
 from app.database import get_db
@@ -365,7 +366,7 @@ async def _upsert_client_presence(
     ))
 
 
-@router.get("/clients/identity-check", response_model=IdentityCheckResponse)
+@router.get("/clients/identity-check", response_model=IdentityCheckResponse, dependencies=[Depends(require_api_key)])
 async def identity_check(
     user_id: str,
     user_name: str,
@@ -430,9 +431,14 @@ async def identity_check(
 
 # ── Endpoints ────────────────────────────────────────────────
 
-@router.post("/collect")
+MAX_BATCH_SIZE = 500
+
+
+@router.post("/collect", dependencies=[Depends(require_api_key)])
 async def collect_usage(records: list[UsageRecordIn], db: AsyncSession = Depends(get_db)):
     """Receive batched token usage records from client applications."""
+    if len(records) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=400, detail=f"batch too large (max {MAX_BATCH_SIZE})")
     if not records:
         return {"status": "ok", "inserted": 0}
 
@@ -503,7 +509,7 @@ async def collect_usage(records: list[UsageRecordIn], db: AsyncSession = Depends
     return {"status": "ok", "inserted": inserted, "skipped_duplicates": skipped_duplicates}
 
 
-@router.post("/collect/tokscale")
+@router.post("/collect/tokscale", dependencies=[Depends(require_api_key)])
 async def collect_tokscale_usage(
     data: TokscaleSubmitRequest,
     request: Request,
@@ -598,7 +604,7 @@ async def collect_tokscale_usage(
     }
 
 
-@router.post("/clients/heartbeat")
+@router.post("/clients/heartbeat", dependencies=[Depends(require_api_key)])
 async def client_heartbeat(
     data: ClientHeartbeatIn,
     request: Request,
@@ -657,7 +663,7 @@ async def client_heartbeat(
 
 from app.routers.dashboard import ESTIMATE_SOURCE, _request_local_date_column, _ts_range
 
-@router.get("/clients/my-stats", response_model=MyStatsResponse)
+@router.get("/clients/my-stats", response_model=MyStatsResponse, dependencies=[Depends(require_api_key)])
 async def get_my_stats(
     user_id: str,
     user_name: str,
@@ -694,7 +700,7 @@ async def get_my_stats(
     return MyStatsResponse(today_tokens=int(today_tokens), today_requests=int(today_requests))
 
 
-@router.get("/clients/my-daily-usage", response_model=MyDailyUsageResponse)
+@router.get("/clients/my-daily-usage", response_model=MyDailyUsageResponse, dependencies=[Depends(require_api_key)])
 async def get_my_daily_usage(
     user_id: str,
     user_name: str,
@@ -807,7 +813,11 @@ async def get_my_daily_usage(
 
 
 @router.get("/clients/online")
-async def get_online_clients(db: AsyncSession = Depends(get_db)):
+async def get_online_clients(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
     """Return count of clients seen recently (last_seen within window).
 
     使用 15 分钟窗口：客户端心跳约每 30s 一次，避免短暂网络抖动或大屏刷新间隔导致误显示 0 在线。
@@ -818,14 +828,17 @@ async def get_online_clients(db: AsyncSession = Depends(get_db)):
     )
     count = result.scalar()
 
-    # Also return full client list
+    total_result = await db.execute(select(func.count()).select_from(Client))
+    total = total_result.scalar() or 0
+
     result = await db.execute(
-        select(Client).order_by(Client.last_seen.desc())
+        select(Client).order_by(Client.last_seen.desc()).limit(limit).offset(offset)
     )
     clients = result.scalars().all()
 
     return {
         "online_count": count,
+        "total": total,
         "clients": [
             {
                 "client_id": c.client_id,

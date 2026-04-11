@@ -1,14 +1,31 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
 from app.routers import collect, dashboard, extension
 from app.services.scheduler import start_scheduler, stop_scheduler
+
+logger = logging.getLogger(__name__)
+
+
+def _get_cors_origins() -> list[str]:
+    raw = settings.CORS_ALLOWED_ORIGINS
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return ["http://localhost:3080", "http://localhost:5173"]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not settings.DATABASE_URL:
+        raise RuntimeError("DATABASE_URL 未配置，请在 .env 或环境变量中设置")
+    if not settings.COLLECT_API_KEY:
+        logger.warning("COLLECT_API_KEY 未配置，上报接口处于迁移宽限期（无认证）")
+    if not settings.ADMIN_PASSWORD:
+        logger.warning("ADMIN_PASSWORD 未配置，管理接口将返回 503")
     start_scheduler()
     yield
     stop_scheduler()
@@ -18,10 +35,10 @@ app = FastAPI(title="AI Token Monitor", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
 app.include_router(dashboard.router)

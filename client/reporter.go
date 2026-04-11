@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,9 +43,9 @@ type UsageRecord struct {
 
 // ReporterStats tracks cumulative reporting statistics.
 type ReporterStats struct {
-	TotalReported int
-	TotalTokens   int64
-	TotalFailed   int
+	TotalReported atomic.Int64
+	TotalTokens   atomic.Int64
+	TotalFailed   atomic.Int64
 }
 
 // Reporter batches usage records and periodically sends them to the central server.
@@ -145,7 +146,8 @@ func newRequestID() string {
 }
 
 // Start begins the periodic reporting loop. Should be called in a goroutine.
-func (r *Reporter) Start() {
+// Exits when ctx is cancelled, performing a final Flush.
+func (r *Reporter) Start(ctx context.Context) {
 	r.sendHeartbeatWithRetry()
 
 	flushTicker := time.NewTicker(30 * time.Second)
@@ -155,6 +157,9 @@ func (r *Reporter) Start() {
 
 	for {
 		select {
+		case <-ctx.Done():
+			r.Flush()
+			return
 		case <-flushTicker.C:
 			r.Flush()
 		case <-heartbeatTicker.C:
@@ -180,6 +185,9 @@ func (r *Reporter) postJSONRetry(path string, body []byte) (*http.Response, erro
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		if r.cfg.APIKey != "" {
+			req.Header.Set("X-API-Key", r.cfg.APIKey)
+		}
 		resp, err := r.client.Do(req)
 		if err != nil {
 			lastErr = err
@@ -218,19 +226,19 @@ func (r *Reporter) Flush() {
 	resp, err := r.postJSONRetry("/api/collect", data)
 	if err != nil {
 		log.Printf("[上报] 最终失败: %v (将重试)", err)
-		r.Stats.TotalFailed += len(records)
+		r.Stats.TotalFailed.Add(int64(len(records)))
 		r.requeue(records)
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
-	r.Stats.TotalReported += len(records)
+	r.Stats.TotalReported.Add(int64(len(records)))
 	for _, rec := range records {
-		r.Stats.TotalTokens += int64(rec.TotalTokens)
+		r.Stats.TotalTokens.Add(int64(rec.TotalTokens))
 	}
 	log.Printf("[上报] 成功 %d 条 → %s (累计: %d 条, %d tokens)",
-		len(records), r.cfg.ServerURL, r.Stats.TotalReported, r.Stats.TotalTokens)
+		len(records), r.cfg.ServerURL, r.Stats.TotalReported.Load(), r.Stats.TotalTokens.Load())
 }
 
 func (r *Reporter) requeue(records []UsageRecord) {

@@ -257,6 +257,7 @@ func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager) *Prox
 			TLSHandshakeTimeout: 15 * time.Second,
 			MaxIdleConns:        200,
 			IdleConnTimeout:     90 * time.Second,
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 		},
 	}
 }
@@ -421,6 +422,7 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 		Certificates: []tls.Certificate{*cert},
 		// 与上游一致：Copilot / 多数云 API 默认 HTTP/2（ALPN h2）；仅 http/1.1 时客户端无法对话。
 		NextProtos: []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS12,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("[MITM] handshake error %s: %v", hostname, err)
@@ -808,8 +810,8 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 		"extra_monitor_hosts":    len(s.cfg.ExtraMonitorHosts),
 		"extra_monitor_suffixes": len(s.cfg.ExtraMonitorSuffixes),
 		"stats": map[string]interface{}{
-			"total_reported": s.reporter.Stats.TotalReported,
-			"total_tokens":   s.reporter.Stats.TotalTokens,
+			"total_reported": s.reporter.Stats.TotalReported.Load(),
+			"total_tokens":   s.reporter.Stats.TotalTokens.Load(),
 		},
 	})
 }

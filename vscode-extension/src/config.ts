@@ -12,12 +12,14 @@ export interface MonitorConfig {
     proxyPort: number;
     gatewayPort: number;
     upstreamProxy: string;
+    apiKey: string;
 }
 
 interface IdentityInfo {
     user_id?: string;
     user_name?: string;
     department?: string;
+    api_key?: string;
 }
 
 let _identityCache: IdentityInfo | null | undefined; // undefined = not yet loaded
@@ -56,6 +58,7 @@ export function getConfig(): MonitorConfig {
         proxyPort: getPort(cfg.get<number>('proxyPort', 18090), 18090),
         gatewayPort: getPort(cfg.get<number>('gatewayPort', 18091), 18091),
         upstreamProxy: cfg.get<string>('upstreamProxy', '').trim(),
+        apiKey: cfg.get<string>('apiKey', '') || identity?.api_key || '',
     };
 }
 
