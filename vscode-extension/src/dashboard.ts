@@ -1,7 +1,10 @@
 import * as vscode from 'vscode';
-import { TokenTracker } from './tokenTracker';
+import * as fs from 'fs';
+import * as path from 'path';
+import { getWindowsCertificateTrustStatus, WindowsCertificateTrustStatus } from './certificateTrust';
+import { TokenTracker, TrackerRuntimeStatus } from './tokenTracker';
 import { MonitorConfig, getConfig } from './config';
-import { LocalProxyStatusSnapshot, ProxyManager } from './proxyManager';
+import { LocalProxyStatusSnapshot, ProxyEnvironmentDiagnosis, ProxyManager } from './proxyManager';
 
 const PROXY_RELOAD_PENDING_KEY = 'aiTokenMonitor.proxyReloadPending';
 
@@ -16,6 +19,8 @@ interface IdentityStatusData {
 interface ProxyStatusData {
     proxyRunning: boolean;
     reloadRequired: boolean;
+    blocked: boolean;
+    blockedReason?: string;
 }
 
 interface UpdateCheckResultData {
@@ -25,10 +30,26 @@ interface UpdateCheckResultData {
     currentVersion?: string;
 }
 
+interface LinkCheckItemData {
+    id: string;
+    title: string;
+    status: 'ok' | 'warning' | 'error' | 'neutral' | 'checking';
+    summary: string;
+    detail?: string;
+}
+
+interface LinkCheckData {
+    overallStatus: 'ok' | 'warning' | 'error' | 'neutral' | 'checking';
+    checkedAt?: string;
+    items: LinkCheckItemData[];
+}
+
 export class DashboardProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
     private refreshTimer?: ReturnType<typeof setInterval>;
     private config: MonitorConfig;
+    private lastLinkCheck?: { fetchedAt: number; data: LinkCheckData };
+    private linkCheckInFlight?: Promise<LinkCheckData>;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -112,6 +133,18 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                         data: { checking: false, result: { status: 'error', message: `检查更新失败：${message}` } }
                     });
                 }
+            } else if (msg.type === 'runLinkCheck') {
+                this.postLinkCheck({
+                    overallStatus: 'checking',
+                    items: [
+                        { id: 'local-proxy', title: '本地代理', status: 'checking', summary: '正在检查本地代理与当前路由…' },
+                        { id: 'environment', title: '代理环境', status: 'checking', summary: '正在检查当前代理环境与接管策略…' },
+                        { id: 'certificate', title: '证书安装', status: 'checking', summary: '正在检查当前用户证书信任状态…' },
+                        { id: 'upstream', title: '上游代理', status: 'checking', summary: '正在检查外网转发链路…' },
+                        { id: 'reporting', title: '最近上报', status: 'checking', summary: '正在检查最近上报与服务端连通性…' },
+                    ],
+                });
+                await this.refreshLinkCheck(true);
             }
         });
     }
@@ -167,6 +200,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             userId: this.config.userId,
             userName: this.config.userName,
             department: this.config.department,
+            upstreamProxy: this.config.upstreamProxy,
             copilotOrg: this.config.copilotOrg,
             // copilotPat is stored in SecretStorage and never sent to the webview
         };
@@ -174,7 +208,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
     private async saveConfig(data: Record<string, unknown>): Promise<void> {
         const cfg = vscode.workspace.getConfiguration('aiTokenMonitor');
-        const stringKeys = ['serverUrl', 'userId', 'userName', 'department', 'copilotOrg'] as const;
+        const stringKeys = ['serverUrl', 'userId', 'userName', 'department', 'upstreamProxy', 'copilotOrg'] as const;
         for (const key of stringKeys) {
             if (key in data) {
                 await cfg.update(key, String(data[key] ?? ''), vscode.ConfigurationTarget.Global);
@@ -206,6 +240,13 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
     private postIdentityStatus(data: IdentityStatusData): void {
         this.view?.webview.postMessage({
             type: 'identityStatus',
+            data,
+        });
+    }
+
+    private postLinkCheck(data: LinkCheckData): void {
+        this.view?.webview.postMessage({
+            type: 'linkCheck',
             data,
         });
     }
@@ -284,14 +325,372 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
     public async notifyProxyStatus(): Promise<void> {
         const running = this.proxyManager ? await this.proxyManager.isProxyAvailable() : false;
+        const diagnosis = this.proxyManager ? await this.proxyManager.getEnvironmentDiagnosis() : null;
         const reloadRequired = this.globalState.get<boolean>(PROXY_RELOAD_PENDING_KEY, false);
+        const blocked = Boolean(this.config.transparentMode && diagnosis && !diagnosis.allowTakeover);
+        const blockedReason = blocked && diagnosis
+            ? [diagnosis.summary, diagnosis.recommendedAction || diagnosis.detail].filter(Boolean).join(' ')
+            : undefined;
         this.view?.webview.postMessage({
             type: 'proxyStatus',
             data: {
                 proxyRunning: running,
                 reloadRequired,
+                blocked,
+                blockedReason,
             } satisfies ProxyStatusData,
         });
+    }
+
+    private async refreshLinkCheck(force = false): Promise<void> {
+        const data = await this.fetchLinkCheck(force);
+        this.postLinkCheck(data);
+    }
+
+    private async fetchLinkCheck(force = false): Promise<LinkCheckData> {
+        const cacheTtlMs = 20_000;
+        if (!force && this.lastLinkCheck && (Date.now() - this.lastLinkCheck.fetchedAt) < cacheTtlMs) {
+            return this.lastLinkCheck.data;
+        }
+        if (this.linkCheckInFlight) {
+            return this.linkCheckInFlight;
+        }
+
+        this.linkCheckInFlight = this.buildLinkCheckData()
+            .then(data => {
+                this.lastLinkCheck = { fetchedAt: Date.now(), data };
+                return data;
+            })
+            .finally(() => {
+                this.linkCheckInFlight = undefined;
+            });
+
+        return this.linkCheckInFlight;
+    }
+
+    private async buildLinkCheckData(): Promise<LinkCheckData> {
+        const [localStatus, serverHealth, diagnosis] = await Promise.all([
+            this.proxyManager?.getLocalStatus() ?? Promise.resolve(null),
+            this.checkServerHealth(),
+            this.proxyManager?.getEnvironmentDiagnosis() ?? Promise.resolve(this.getDefaultDiagnosis()),
+        ]);
+        const trackerStatus = this.tracker.getRuntimeStatus();
+        const items = [
+            this.buildLocalProxyItem(localStatus, diagnosis),
+            this.buildEnvironmentItem(diagnosis),
+            this.buildCertificateItem(),
+            this.buildUpstreamItem(localStatus, diagnosis),
+            this.buildReportingItem(localStatus, trackerStatus, serverHealth),
+        ];
+
+        return {
+            overallStatus: this.pickOverallStatus(items),
+            checkedAt: new Date().toISOString(),
+            items,
+        };
+    }
+
+    private getDefaultDiagnosis(): ProxyEnvironmentDiagnosis {
+        return {
+            kind: 'direct',
+            level: 'neutral',
+            allowTakeover: true,
+            summary: '当前未检测到需要特殊处理的代理环境。',
+            detail: '如果机器依赖公司代理或桌面代理，请先配置明确的上游代理。',
+            detectedDesktopProcesses: [],
+            detectedTunAdapters: [],
+            checkedAt: new Date().toISOString(),
+        };
+    }
+
+    private async checkServerHealth(): Promise<{ ok: boolean; detail: string }> {
+        if (!this.config.serverUrl.trim()) {
+            return { ok: false, detail: '未配置上报地址' };
+        }
+        try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5000);
+            const response = await fetch(`${this.config.serverUrl}/health`, { signal: controller.signal });
+            clearTimeout(timer);
+            if (!response.ok) {
+                return { ok: false, detail: `服务端返回 ${response.status}` };
+            }
+            return { ok: true, detail: '服务端健康检查正常' };
+        } catch (error) {
+            return {
+                ok: false,
+                detail: error instanceof Error ? error.message : '服务端不可达',
+            };
+        }
+    }
+
+    private buildLocalProxyItem(localStatus: LocalProxyStatusSnapshot | null, diagnosis: ProxyEnvironmentDiagnosis): LinkCheckItemData {
+        const reloadRequired = this.globalState.get<boolean>(PROXY_RELOAD_PENDING_KEY, false);
+        const recentLogs = this.proxyManager?.getRecentOutputLines(3) ?? [];
+        if (!this.config.transparentMode) {
+            return {
+                id: 'local-proxy',
+                title: '本地代理',
+                status: 'neutral',
+                summary: '当前未启用监控代理；只有启用后，Copilot / AI 请求才会经过本地监控链路。',
+                detail: '如需开始采集，点击上方“启动”即可。',
+            };
+        }
+        if (!diagnosis.allowTakeover) {
+            return {
+                id: 'local-proxy',
+                title: '本地代理',
+                status: 'warning',
+                summary: '当前已启用监控代理，但为了保护现有网络环境，本次没有覆盖 VS Code 代理设置。',
+                detail: [diagnosis.summary, diagnosis.recommendedAction || diagnosis.detail].filter(Boolean).join(' '),
+            };
+        }
+        if (!localStatus || localStatus.status !== 'running') {
+            return {
+                id: 'local-proxy',
+                title: '本地代理',
+                status: 'error',
+                summary: '监控代理已启用，但本地 ai-monitor 当前不可用。',
+                detail: recentLogs.length > 0 ? recentLogs.join(' | ') : '请检查 Output 面板 AI Token Monitor Proxy。',
+            };
+        }
+        if (reloadRequired) {
+            return {
+                id: 'local-proxy',
+                title: '本地代理',
+                status: 'warning',
+                summary: `ai-monitor 正在端口 ${localStatus.port || this.config.proxyPort} 运行，但当前窗口仍待重载。`,
+                detail: '未重载前，现有 Copilot 连接可能还在走旧链路。',
+            };
+        }
+        return {
+            id: 'local-proxy',
+            title: '本地代理',
+            status: 'ok',
+            summary: `ai-monitor 正在端口 ${localStatus.port || this.config.proxyPort} 运行，当前窗口路由已接通。`,
+            detail: `版本 ${localStatus.version || '未知'}；本地累计已上报 ${localStatus.stats?.total_reported ?? 0} 条请求。`,
+        };
+    }
+
+    private buildEnvironmentItem(diagnosis: ProxyEnvironmentDiagnosis): LinkCheckItemData {
+        return {
+            id: 'environment',
+            title: '代理环境',
+            status: diagnosis.level,
+            summary: diagnosis.summary,
+            detail: [diagnosis.detail, diagnosis.recommendedAction].filter(Boolean).join(' '),
+        };
+    }
+
+    private buildCertificateItem(): LinkCheckItemData {
+        const appData = process.env.APPDATA;
+        const certPath = appData ? path.join(appData, 'ai-monitor', 'ca.crt') : '';
+        const fileExists = certPath ? fs.existsSync(certPath) : false;
+
+        if (process.platform !== 'win32') {
+            return {
+                id: 'certificate',
+                title: '证书安装',
+                status: fileExists ? 'warning' : 'neutral',
+                summary: fileExists ? '本地 CA 文件已生成；非 Windows 环境需手动确认系统是否已信任。' : '当前平台未提供自动证书检查。',
+                detail: certPath || '未找到 CA 文件路径。',
+            };
+        }
+
+        const trustStatus = this.getWindowsCertificateTrustStatus(certPath, fileExists);
+        if (trustStatus.trusted === true) {
+            return {
+                id: 'certificate',
+                title: '证书安装',
+                status: 'ok',
+                summary: 'AI Monitor Local CA 已安装到当前用户信任存储。',
+                detail: trustStatus.trustSource === 'certutil'
+                    ? `${certPath}；已通过 certutil 指纹校验确认受信任。`
+                    : (fileExists ? certPath : '证书已在系统信任存储中。'),
+            };
+        }
+        if (fileExists) {
+            return {
+                id: 'certificate',
+                title: '证书安装',
+                status: 'warning',
+                summary: '本地 CA 文件存在，但当前用户信任存储里未检测到受信任证书。',
+                detail: trustStatus.detail || certPath,
+            };
+        }
+        return {
+            id: 'certificate',
+            title: '证书安装',
+            status: 'error',
+            summary: '未找到本地 CA 证书文件，HTTPS MITM 可能无法正常工作。',
+            detail: '启用监控代理时会自动尝试安装当前用户证书。',
+        };
+    }
+
+    private getWindowsCertificateTrustStatus(certPath: string, fileExists: boolean): WindowsCertificateTrustStatus {
+        return getWindowsCertificateTrustStatus(certPath, {
+            platform: process.platform,
+            fileExists: () => fileExists,
+            logger: {
+                info: message => console.info(`[dashboard] ${message}`),
+                warn: message => console.warn(`[dashboard] ${message}`),
+            },
+        });
+    }
+
+    private buildUpstreamItem(localStatus: LocalProxyStatusSnapshot | null, diagnosis: ProxyEnvironmentDiagnosis): LinkCheckItemData {
+        const configured = this.normalizeValue(this.config.upstreamProxy);
+        const upstream = this.normalizeValue(localStatus?.upstream_proxy ?? diagnosis.upstreamProxy ?? configured);
+        const sourceLabel: Record<NonNullable<ProxyEnvironmentDiagnosis['upstreamSource']>, string> = {
+            config: '扩展设置',
+            vscode: 'VS Code 代理',
+            previous: '历史 VS Code 代理',
+            system: '系统代理',
+            env: '环境变量',
+            'local-discovery': '本机自动发现',
+        };
+        if (upstream && upstream !== '(direct)') {
+            return {
+                id: 'upstream',
+                title: '上游代理',
+                status: 'ok',
+                summary: `当前外网转发会继续走上游代理：${upstream}`,
+                detail: diagnosis.upstreamSource
+                    ? `来源：${sourceLabel[diagnosis.upstreamSource]}。这能兼容已有商业桌面代理或公司代理链路。`
+                    : '这能兼容已有商业桌面代理或公司代理链路。',
+            };
+        }
+        if (diagnosis.kind === 'system-pac') {
+            return {
+                id: 'upstream',
+                title: '上游代理',
+                status: 'warning',
+                summary: '系统当前走 PAC 自动代理，扩展不会直接把 PAC 作为上游。',
+                detail: diagnosis.recommendedAction || diagnosis.detail,
+            };
+        }
+        if (diagnosis.kind === 'desktop-proxy' && diagnosis.detectedDesktopProcesses.length > 0) {
+            return {
+                id: 'upstream',
+                title: '上游代理',
+                status: diagnosis.allowTakeover ? 'neutral' : 'warning',
+                summary: diagnosis.allowTakeover
+                    ? `当前依赖桌面代理进程 ${diagnosis.detectedDesktopProcesses.join('、')} 维持外网链路。`
+                    : '当前桌面代理未暴露可复用上游，扩展已停止接管。',
+                detail: diagnosis.recommendedAction || diagnosis.detail,
+            };
+        }
+        if (localStatus?.upstream_proxy === '(direct)') {
+            return {
+                id: 'upstream',
+                title: '上游代理',
+                status: 'neutral',
+                summary: '当前外网请求为直连模式，没有额外上游代理。',
+                detail: '如果你的环境依赖桌面代理，请检查系统代理是否已开启。',
+            };
+        }
+        if (configured) {
+            return {
+                id: 'upstream',
+                title: '上游代理',
+                status: 'warning',
+                summary: `已配置上游代理 ${configured}，但本地代理尚未返回运行中的上游信息。`,
+                detail: '启动监控代理后会再次自动探测。',
+            };
+        }
+        return {
+            id: 'upstream',
+            title: '上游代理',
+            status: 'neutral',
+            summary: '暂未检测到额外上游代理配置。',
+            detail: '如果当前网络本来就是直连，这属于正常情况。',
+        };
+    }
+
+    private buildReportingItem(
+        localStatus: LocalProxyStatusSnapshot | null,
+        trackerStatus: TrackerRuntimeStatus,
+        serverHealth: { ok: boolean; detail: string },
+    ): LinkCheckItemData {
+        if (!this.config.serverUrl.trim() || !this.config.userId.trim() || !this.config.userName.trim()) {
+            return {
+                id: 'reporting',
+                title: '最近上报',
+                status: 'warning',
+                summary: '上报地址或身份信息未填写完整，当前无法完成服务器侧校验。',
+                detail: '请先在基础设置里填写上报地址、工号和姓名。',
+            };
+        }
+
+        const queueInfo = `待发送 ${trackerStatus.pendingQueueLength} 条`;
+        const lastCollect = trackerStatus.lastCollectSuccessAt
+            ? `最近 collect 成功 ${this.formatTimestamp(trackerStatus.lastCollectSuccessAt)}`
+            : (localStatus?.stats?.total_reported
+                ? `本地代理累计已上报 ${localStatus.stats.total_reported} 条请求`
+                : '当前会话还没有新的 collect 成功记录');
+        const lastSync = trackerStatus.lastStatsSyncAt
+            ? `my-stats 同步 ${this.formatTimestamp(trackerStatus.lastStatsSyncAt)}`
+            : '尚未拿到最近一次 my-stats 同步时间';
+
+        if (!serverHealth.ok) {
+            return {
+                id: 'reporting',
+                title: '最近上报',
+                status: 'error',
+                summary: `服务端检查失败：${serverHealth.detail}`,
+                detail: `${queueInfo}；${lastCollect}`,
+            };
+        }
+
+        if (trackerStatus.lastCollectError) {
+            return {
+                id: 'reporting',
+                title: '最近上报',
+                status: trackerStatus.pendingQueueLength > 0 ? 'error' : 'warning',
+                summary: `最近一次上报失败：${trackerStatus.lastCollectError}`,
+                detail: `${queueInfo}；${lastSync}`,
+            };
+        }
+
+        return {
+            id: 'reporting',
+            title: '最近上报',
+            status: 'ok',
+            summary: `服务端可达，${lastCollect}。`,
+            detail: `${lastSync}；${queueInfo}。`,
+        };
+    }
+
+    private formatTimestamp(value?: string): string {
+        if (!value) {
+            return '未知时间';
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return value;
+        }
+        return date.toLocaleTimeString('zh-CN', {
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+        });
+    }
+
+    private pickOverallStatus(items: LinkCheckItemData[]): LinkCheckData['overallStatus'] {
+        if (items.some(item => item.status === 'error')) {
+            return 'error';
+        }
+        if (items.some(item => item.status === 'warning')) {
+            return 'warning';
+        }
+        if (items.every(item => item.status === 'ok')) {
+            return 'ok';
+        }
+        if (items.some(item => item.status === 'checking')) {
+            return 'checking';
+        }
+        return 'neutral';
     }
 
     private async refreshDashboard(flushPending = false): Promise<void> {
@@ -306,6 +705,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         console.log('[Dashboard] overview result:', overview ? `tokens=${overview.total_tokens} requests=${overview.total_requests}` : 'null');
         this.postStatsUpdate(overview);
         this.postIdentityStatus(identityStatus);
+        await this.refreshLinkCheck();
     }
 
     private esc(s: string): string {
@@ -1331,6 +1731,160 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         font-size: 11px;
         line-height: 1.6;
     }
+    .link-check-card {
+        display: grid;
+        gap: 12px;
+        padding: 14px;
+        border-radius: 18px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.03);
+    }
+    .link-check-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+    .link-check-title {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--text-main);
+    }
+    .link-check-subtitle {
+        margin-top: 4px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: var(--text-sub);
+    }
+    .link-check-tools {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+    }
+    .link-check-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 9px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text-sub);
+        font-size: 10px;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+    .link-check-badge::before {
+        content: '';
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: currentColor;
+        box-shadow: 0 0 8px currentColor;
+    }
+    .link-check-badge.ok {
+        color: var(--success);
+        border-color: rgba(56, 217, 139, 0.24);
+        background: rgba(56, 217, 139, 0.08);
+    }
+    .link-check-badge.warning {
+        color: #ffb84d;
+        border-color: rgba(255, 184, 77, 0.24);
+        background: rgba(255, 184, 77, 0.08);
+    }
+    .link-check-badge.error {
+        color: var(--error);
+        border-color: rgba(255, 83, 119, 0.26);
+        background: rgba(255, 83, 119, 0.1);
+    }
+    .link-check-badge.checking {
+        color: var(--accent-strong);
+        border-color: rgba(255, 91, 80, 0.26);
+        background: rgba(255, 91, 80, 0.1);
+    }
+    .link-check-badge.checking::before {
+        animation: pulseDot 1.1s ease-in-out infinite;
+    }
+    .link-check-btn {
+        padding: 8px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border-strong);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text-main);
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+    }
+    .link-check-btn:hover {
+        background: rgba(255, 255, 255, 0.08);
+        border-color: rgba(255, 255, 255, 0.22);
+    }
+    .link-check-btn:disabled {
+        opacity: 0.6;
+        cursor: default;
+    }
+    .link-check-meta {
+        font-size: 10px;
+        color: rgba(220, 228, 240, 0.48);
+    }
+    .link-check-list {
+        display: grid;
+        gap: 10px;
+    }
+    .link-check-item {
+        display: grid;
+        gap: 5px;
+        padding: 12px 13px;
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        background: rgba(255, 255, 255, 0.026);
+    }
+    .link-check-item.ok {
+        border-color: rgba(56, 217, 139, 0.18);
+        background: rgba(56, 217, 139, 0.06);
+    }
+    .link-check-item.warning {
+        border-color: rgba(255, 184, 77, 0.18);
+        background: rgba(255, 184, 77, 0.07);
+    }
+    .link-check-item.error {
+        border-color: rgba(255, 83, 119, 0.2);
+        background: rgba(255, 83, 119, 0.08);
+    }
+    .link-check-item.checking {
+        border-color: rgba(255, 91, 80, 0.16);
+        background: rgba(255, 91, 80, 0.07);
+    }
+    .link-check-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+    .link-check-item-title {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--text-main);
+    }
+    .link-check-item-status {
+        font-size: 10px;
+        font-weight: 700;
+        color: var(--text-sub);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    .link-check-item-summary {
+        font-size: 11px;
+        line-height: 1.55;
+        color: var(--text-main);
+    }
+    .link-check-item-detail {
+        font-size: 10px;
+        line-height: 1.55;
+        color: var(--text-sub);
+        word-break: break-word;
+    }
     .empty-state {
         padding: 4px 0;
         color: var(--text-sub);
@@ -1548,11 +2102,15 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 <div class="section-title" id="advancedToggle" data-section="advanced">
                     <div class="section-copy">
                         <div class="section-heading">高级设置</div>
-                        <div class="section-caption">Copilot 组织与本地凭据管理</div>
+                        <div class="section-caption">上游代理、Copilot 组织与本地凭据管理</div>
                     </div>
                     <span class="arrow" id="advancedArrow">▶</span>
                 </div>
                 <div class="config-section" id="advancedSection">
+                    <div class="field field-span-2">
+                        <label>上游代理（可选）</label>
+                        <input id="cfgUpstreamProxy" type="text" data-key="upstreamProxy" value="${this.esc(cfgData.upstreamProxy)}" placeholder="例如：socks5://127.0.0.1:8089 或 http://127.0.0.1:7890" />
+                    </div>
                     <div class="field">
                         <label>Copilot 组织</label>
                         <input id="cfgCopilotOrg" type="text" data-key="copilotOrg" value="${this.esc(cfgData.copilotOrg)}" placeholder="例如：your-org" />
@@ -1562,8 +2120,23 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                         <input id="cfgCopilotPat" type="password" placeholder="例如：ghp_xxxx..." />
                     </div>
                     <div class="info-note field-span-2">
+                        若当前网络依赖系统代理、桌面代理或本地 SOCKS/HTTP 端口，可在这里显式填写上游代理。<br>
                         监控数据通过本地代理采集并上报。<br>
                         PAT 仅保存在本机 SecretStorage，不会显示在面板中。
+                    </div>
+                    <div class="link-check-card field-span-2" id="linkCheckCard">
+                        <div class="link-check-head">
+                            <div>
+                                <div class="link-check-title">链路自检</div>
+                                <div class="link-check-subtitle">检查本地代理、证书安装、上游代理和最近上报是否正常。</div>
+                            </div>
+                            <div class="link-check-tools">
+                                <div class="link-check-badge checking" id="linkCheckBadge">检查中</div>
+                                <button class="link-check-btn" id="runLinkCheckBtn" type="button">立即自检</button>
+                            </div>
+                        </div>
+                        <div class="link-check-meta" id="linkCheckMeta">正在初始化自检结果…</div>
+                        <div class="link-check-list" id="linkCheckList"></div>
                     </div>
                 </div>
             </div>
@@ -1754,6 +2327,16 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             });
         }
 
+        const runLinkCheckBtn = document.getElementById('runLinkCheckBtn');
+        if (runLinkCheckBtn && runLinkCheckBtn.dataset.boundClick !== '1') {
+            runLinkCheckBtn.dataset.boundClick = '1';
+            runLinkCheckBtn.addEventListener('click', () => {
+                if (runLinkCheckBtn.disabled) return;
+                runLinkCheckBtn.disabled = true;
+                vscMsg('runLinkCheck');
+            });
+        }
+
         document.querySelectorAll('.date-btn').forEach(btn => {
             if (btn.dataset.boundClick === '1') return;
             btn.dataset.boundClick = '1';
@@ -1900,6 +2483,61 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         setTimeout(() => t.classList.remove('show'), 2000);
     }
 
+    function linkCheckStatusLabel(status) {
+        switch (status) {
+            case 'ok': return '正常';
+            case 'warning': return '注意';
+            case 'error': return '异常';
+            case 'checking': return '检查中';
+            default: return '未启用';
+        }
+    }
+
+    function formatLinkCheckTime(value) {
+        if (!value) return '尚未完成自检';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        return '上次自检 ' + date.toLocaleTimeString('zh-CN', {
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+    }
+
+    function renderLinkCheck(data) {
+        const badge = document.getElementById('linkCheckBadge');
+        const meta = document.getElementById('linkCheckMeta');
+        const list = document.getElementById('linkCheckList');
+        const btn = document.getElementById('runLinkCheckBtn');
+        if (!badge || !meta || !list || !btn) return;
+
+        const overall = data?.overallStatus || 'neutral';
+        badge.className = 'link-check-badge ' + overall;
+        badge.textContent = linkCheckStatusLabel(overall);
+        meta.textContent = formatLinkCheckTime(data?.checkedAt);
+        btn.disabled = overall === 'checking';
+
+        const items = Array.isArray(data?.items) ? data.items : [];
+        list.innerHTML = items.map(item => {
+            const status = escapeHtml(item.status || 'neutral');
+            const title = escapeHtml(item.title || '');
+            const summary = escapeHtml(item.summary || '');
+            const statusLabel = escapeHtml(linkCheckStatusLabel(item.status || 'neutral'));
+            const detail = item.detail
+                ? '<div class="link-check-item-detail">' + escapeHtml(item.detail) + '</div>'
+                : '';
+            return '<div class="link-check-item ' + status + '">'
+                + '<div class="link-check-row">'
+                + '<div class="link-check-item-title">' + title + '</div>'
+                + '<div class="link-check-item-status">' + statusLabel + '</div>'
+                + '</div>'
+                + '<div class="link-check-item-summary">' + summary + '</div>'
+                + detail
+                + '</div>';
+        }).join('');
+    }
+
     function updateServerAddress(url) {
         const serverAddress = document.getElementById('serverAddress');
         if (!serverAddress) return;
@@ -2042,11 +2680,13 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 const cfgUserIdEl = document.getElementById('cfgUserId');
                 const cfgUserNameEl = document.getElementById('cfgUserName');
                 const cfgDeptEl = document.getElementById('cfgDept');
+                const cfgUpstreamProxyEl = document.getElementById('cfgUpstreamProxy');
                 const cfgCopilotOrgEl = document.getElementById('cfgCopilotOrg');
                 if (cfgServerEl) cfgServerEl.value = msg.data.serverUrl || '';
                 if (cfgUserIdEl) cfgUserIdEl.value = msg.data.userId || '';
                 if (cfgUserNameEl) cfgUserNameEl.value = msg.data.userName || '';
                 if (cfgDeptEl) cfgDeptEl.value = msg.data.department || '';
+                if (cfgUpstreamProxyEl) cfgUpstreamProxyEl.value = msg.data.upstreamProxy || '';
                 if (cfgCopilotOrgEl) cfgCopilotOrgEl.value = msg.data.copilotOrg || '';
                 updateUserCard(msg.data || {});
                 updateServerAddress((msg.data && msg.data.serverUrl) || '');
@@ -2068,14 +2708,17 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 const reloadBtn = document.getElementById('proxyReloadBtn');
                 const running = Boolean(msg.data.proxyRunning);
                 const reloadRequired = Boolean(msg.data.reloadRequired);
+                const blocked = Boolean(msg.data.blocked);
                 if (status) {
-                    status.textContent = reloadRequired
-                        ? (running ? '运行中，待重载' : '待重载')
-                        : (running ? '运行中' : '未启动');
+                    status.textContent = blocked
+                        ? '已阻止接管'
+                        : (reloadRequired
+                            ? (running ? '运行中，待重载' : '待重载')
+                            : (running ? '运行中' : '未启动'));
                     status.classList.toggle('pending', reloadRequired);
                 }
                 if (btn) {
-                    btn.textContent = running ? '停止' : '启动';
+                    btn.textContent = running ? '停止' : (blocked ? '重试' : '启动');
                     btn.disabled = false;
                     btn.classList.toggle('is-active', running);
                 }
@@ -2084,16 +2727,22 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     dot.classList.toggle('pending', reloadRequired);
                 }
                 if (hint) {
-                    hint.textContent = reloadRequired
-                        ? '当前窗口还没有重载，Copilot / AI 请求可能仍走旧连接，所以暂时不会进入 Token 上报。'
-                        : (running
-                            ? '监控代理已运行，新的 AI 请求会通过本地监控链路上报。'
-                            : '监控代理默认关闭；启用时会自动安装当前用户证书，并尽量沿用现有系统或公司代理。');
-                    hint.classList.toggle('warning', reloadRequired);
+                    hint.textContent = blocked
+                        ? (msg.data.blockedReason || '检测到当前代理环境不适合自动接管，已保持原网络链路不变。')
+                        : (reloadRequired
+                            ? '当前窗口还没有重载，Copilot / AI 请求可能仍走旧连接，所以暂时不会进入 Token 上报。'
+                            : (running
+                                ? '监控代理已运行，新的 AI 请求会通过本地监控链路上报。'
+                                : '监控代理默认关闭；启用时会自动安装当前用户证书，并尽量沿用现有系统或公司代理。'));
+                    hint.classList.toggle('warning', reloadRequired || blocked);
                 }
                 if (reloadBtn) {
                     reloadBtn.classList.toggle('hidden', !reloadRequired);
                 }
+            }
+
+            if (msg.type === 'linkCheck') {
+                renderLinkCheck(msg.data || {});
             }
 
         } catch (error) {

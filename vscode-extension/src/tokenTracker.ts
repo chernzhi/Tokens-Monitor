@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as https from 'https';
 import * as http from 'http';
 import * as os from 'os';
-import { MonitorConfig } from './config';
+import { getNormalizedAppName, MonitorConfig } from './config';
 import { EventBus } from './eventBus';
 
 export interface UsageRecord {
@@ -18,6 +18,17 @@ export interface UsageRecord {
     requestId?: string;
     modelFamily?: string;
     modelVersion?: string;
+}
+
+export interface TrackerRuntimeStatus {
+    pendingQueueLength: number;
+    isReporting: boolean;
+    lastCollectSuccessAt?: string;
+    lastCollectError?: string;
+    lastStatsSyncAt?: string;
+    lastStatsSyncError?: string;
+    totalFailed: number;
+    totalReported: number;
 }
 
 interface ApiUsageRecord {
@@ -59,8 +70,13 @@ export class TokenTracker {
     private globalState: vscode.Memento;
     private clientId: string;
     private storageScopeKey: string;
+    private readonly appScopeKey: string;
     private isReporting = false;
     private eventBus?: EventBus;
+    private lastCollectSuccessAt?: string;
+    private lastCollectError?: string;
+    private lastStatsSyncAt?: string;
+    private lastStatsSyncError?: string;
 
     // Stats (observable by StatusBar)
     public todayTokens = 0;
@@ -77,7 +93,8 @@ export class TokenTracker {
     constructor(config: MonitorConfig, globalState: any, eventBus?: EventBus) {
         this.config = config;
         this.globalState = globalState;
-        this.clientId = `${config.userId}@${os.hostname()}`;
+        this.appScopeKey = getNormalizedAppName();
+        this.clientId = this.buildClientId(config);
         this.storageScopeKey = this.getStorageScopeKey(config);
         this.eventBus = eventBus;
 
@@ -87,7 +104,12 @@ export class TokenTracker {
     private getStorageScopeKey(config: MonitorConfig = this.config): string {
         const serverUrl = (config.serverUrl || '').trim().replace(/\/+$/, '') || 'no-server';
         const userId = (config.userId || '').trim() || 'anonymous';
-        return `${serverUrl}::${userId}`;
+        return `${serverUrl}::${userId}::${this.appScopeKey}`;
+    }
+
+    private buildClientId(config: MonitorConfig = this.config): string {
+        const userId = (config.userId || '').trim() || 'anonymous';
+        return `${userId}@${os.hostname()}#${this.appScopeKey}`;
     }
 
     private getOfflineQueueStorageKey(scopeKey: string = this.storageScopeKey): string {
@@ -200,7 +222,7 @@ export class TokenTracker {
     updateConfig(config: MonitorConfig) {
         const nextScopeKey = this.getStorageScopeKey(config);
         this.config = config;
-        this.clientId = `${config.userId}@${os.hostname()}`;
+        this.clientId = this.buildClientId(config);
 
         if (nextScopeKey !== this.storageScopeKey) {
             this.persistOfflineQueue();
@@ -253,6 +275,19 @@ export class TokenTracker {
         };
     }
 
+    public getRuntimeStatus(): TrackerRuntimeStatus {
+        return {
+            pendingQueueLength: this.offlineQueue.length,
+            isReporting: this.isReporting,
+            lastCollectSuccessAt: this.lastCollectSuccessAt,
+            lastCollectError: this.lastCollectError,
+            lastStatsSyncAt: this.lastStatsSyncAt,
+            lastStatsSyncError: this.lastStatsSyncError,
+            totalFailed: this.totalFailed,
+            totalReported: this.totalReported,
+        };
+    }
+
     async flushOfflineQueue(): Promise<void> {
         if (this.isReporting || this.offlineQueue.length === 0) return;
         if (!this.canReport()) {
@@ -283,6 +318,8 @@ export class TokenTracker {
 
         try {
             await this.postJSON(`${this.config.serverUrl}/api/collect`, apiRecords);
+            this.lastCollectSuccessAt = new Date().toISOString();
+            this.lastCollectError = undefined;
             // Clear offline cache on success
             this.persistOfflineQueue();
             
@@ -292,6 +329,7 @@ export class TokenTracker {
             // Put back for retry
             this.offlineQueue.unshift(...batch);
             this.totalFailed += batch.length;
+            this.lastCollectError = err instanceof Error ? err.message : String(err);
             // Persist on failure
             this.persistOfflineQueue();
             console.error('[TokenTracker] Offline queue flush failed:', err);
@@ -315,6 +353,8 @@ export class TokenTracker {
             const url = `${this.config.serverUrl}/api/clients/my-stats?user_id=${encodeURIComponent(this.config.userId)}&user_name=${encodeURIComponent(this.config.userName)}&department=${encodeURIComponent(this.config.department || '')}&days=${this.selectedDays}`;
             const res = await this.getJSON<{ today_tokens: number, today_requests: number }>(url);
             if (res && typeof res.today_tokens === 'number') {
+                this.lastStatsSyncAt = new Date().toISOString();
+                this.lastStatsSyncError = undefined;
                 // 仅查看"今日"时加上本地待发送队列；多日范围不加（pending 只影响今天）
                 const pendingReqs = this.selectedDays === 1 ? this.offlineQueue.length : 0;
                 const pendingTokens = this.selectedDays === 1 ? this.offlineQueue.reduce((sum, r) => sum + r.totalTokens, 0) : 0;
@@ -329,6 +369,7 @@ export class TokenTracker {
                 }
             }
         } catch (e) {
+            this.lastStatsSyncError = e instanceof Error ? e.message : String(e);
             console.error('[TokenTracker] syncStats failed:', e);
         }
     }

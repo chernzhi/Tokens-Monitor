@@ -113,6 +113,22 @@ export async function activate(context: vscode.ExtensionContext) {
         const wasReloadPending = context.globalState.get<boolean>(PROXY_RELOAD_PENDING_KEY, false);
 
         const result = restartProxy ? await proxyManager.restart(config) : await proxyManager.start();
+        if (result.status === 'blocked') {
+            await syncReloadPendingState(false);
+            startInterceptor(config.serverUrl);
+            if (reason === 'config-change') {
+                const message = [
+                    result.diagnosis.summary,
+                    result.diagnosis.recommendedAction || result.diagnosis.detail,
+                ].filter(Boolean).join(' ');
+                const action = await vscode.window.showWarningMessage(message, '打开监控面板');
+                if (action === '打开监控面板') {
+                    void vscode.commands.executeCommand('tokenMonitor.dashboard.focus');
+                }
+            }
+            return result;
+        }
+
         if (result.status === 'off') {
             await syncReloadPendingState(false);
             startInterceptor(config.serverUrl);
@@ -173,6 +189,11 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('tokenMonitor.startProxy', async () => {
             const startCfg = await setTransparentMode(true);
             const result = await applyTransportMode(startCfg, false, 'config-change');
+            if (result.status === 'blocked') {
+                await syncReloadPendingState(false);
+                await dashboardProvider?.notifyProxyStatus();
+                return;
+            }
             if (result.status === 'off') {
                 await syncReloadPendingState(false);
                 startInterceptor(startCfg.serverUrl);

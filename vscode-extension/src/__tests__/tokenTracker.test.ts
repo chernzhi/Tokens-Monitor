@@ -1,5 +1,6 @@
 import { TokenTracker, UsageRecord } from '../tokenTracker';
 import { EventBus } from '../eventBus';
+import * as vscode from 'vscode';
 
 // Mock vscode, http, https at module level
 jest.mock('http');
@@ -23,7 +24,7 @@ describe('TokenTracker', () => {
         upstreamProxy: '',
     };
 
-    const getTodayStatsKey = (userId: string) => `${mockConfig.serverUrl}::${userId}`;
+    const getTodayStatsKey = (userId: string, appKey = 'vscode') => `${mockConfig.serverUrl}::${userId}::${appKey}`;
 
     beforeEach(() => {
         // Reset all mocks
@@ -43,6 +44,7 @@ describe('TokenTracker', () => {
     afterEach(() => {
         tracker.stop();
         consoleErrorSpy.mockRestore();
+        (vscode.env as any).appName = 'Visual Studio Code';
     });
 
     test('should initialize with config and global state', () => {
@@ -163,6 +165,34 @@ describe('TokenTracker', () => {
 
         // Verify config was updated (indirectly by checking it doesn't error)
         expect(tracker.todayTokens).toBe(0);
+    });
+
+    test('should isolate persisted scope by IDE app name for the same user', () => {
+        const todayKey = new Date().toISOString().slice(0, 10);
+        mockGlobalState.get.mockImplementation((key: string, defaultVal: any) => {
+            if (key === `todayStats:${getTodayStatsKey('user123', 'vscode')}`) {
+                return { date: todayKey, tokens: 500, requests: 3 };
+            }
+            if (key === `todayStats:${getTodayStatsKey('user123', 'cursor')}`) {
+                return { date: todayKey, tokens: 120, requests: 2 };
+            }
+            if (key === `offlineQueue:${getTodayStatsKey('user123', 'vscode')}` || key === `offlineQueue:${getTodayStatsKey('user123', 'cursor')}`) {
+                return [];
+            }
+            return defaultVal;
+        });
+
+        (vscode.env as any).appName = 'Visual Studio Code';
+        const vscodeTracker = new TokenTracker(mockConfig, mockGlobalState, eventBus);
+        expect(vscodeTracker.todayTokens).toBe(500);
+        expect(vscodeTracker.todayRequests).toBe(3);
+        vscodeTracker.stop();
+
+        (vscode.env as any).appName = 'Cursor';
+        const cursorTracker = new TokenTracker(mockConfig, mockGlobalState, eventBus);
+        expect(cursorTracker.todayTokens).toBe(120);
+        expect(cursorTracker.todayRequests).toBe(2);
+        cursorTracker.stop();
     });
 
     test('should generate unique request IDs', () => {
