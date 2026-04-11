@@ -215,6 +215,11 @@ SYNC_INTERVAL_MINUTES=10
         # Write to remote
         self.run(f"cat > {self.REMOTE_DIR}/backend/.env << 'EOF'\n{env_content}EOF", print_output=False)
         print("  ✓ Generated backend/.env")
+
+        # docker-compose.yml 引用 ${DB_PASSWORD}，需要项目根目录也有 .env
+        compose_env = f"DB_PASSWORD={db_password}\n"
+        self.run(f"cat > {self.REMOTE_DIR}/.env << 'EOF'\n{compose_env}EOF", print_output=False)
+        print("  ✓ Generated .env (for docker-compose)")
     
     def build_and_start(self):
         """Build and start services."""
