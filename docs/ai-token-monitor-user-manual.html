@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Token 监控使用手册</title>
+  <style>
+    :root {
+      --ink: #1f2937;
+      --muted: #5b6472;
+      --accent: #c53b2c;
+      --paper: #ffffff;
+      --panel: #f6f4ef;
+      --line: #ddd7ca;
+      --code: #f3efe6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #f0ece4 0%, #faf8f3 100%);
+      line-height: 1.75;
+    }
+    .page {
+      width: 210mm;
+      min-height: 297mm;
+      margin: 0 auto;
+      background: var(--paper);
+      padding: 18mm 18mm 22mm;
+      box-shadow: 0 8px 40px rgba(44, 38, 25, 0.12);
+    }
+    .cover {
+      padding: 18mm 0 12mm;
+      border-bottom: 2px solid var(--line);
+      margin-bottom: 10mm;
+    }
+    .eyebrow {
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 12px;
+    }
+    h1 {
+      margin: 8px 0 12px;
+      font-size: 30px;
+      line-height: 1.25;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    h2 {
+      margin-top: 18px;
+      padding-top: 6px;
+      border-top: 1px solid var(--line);
+      font-size: 22px;
+      color: #18202c;
+    }
+    h3 {
+      margin-top: 14px;
+      font-size: 17px;
+      color: #223046;
+    }
+    p { margin: 8px 0; }
+    ul, ol { margin: 8px 0 8px 22px; }
+    li { margin: 4px 0; }
+    code {
+      background: var(--code);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      background: var(--code);
+      border: 1px solid #e5ddcd;
+      border-radius: 8px;
+      padding: 12px 14px;
+      overflow: hidden;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+    th {
+      background: var(--panel);
+      text-align: left;
+    }
+    .callout {
+      border-left: 4px solid var(--accent);
+      background: #fdf5f3;
+      padding: 10px 12px;
+      margin: 12px 0;
+    }
+    .toc {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 28px;
+      background: var(--panel);
+      padding: 14px 16px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      margin-bottom: 18px;
+    }
+    .toc div { font-size: 14px; }
+    @page {
+      size: A4;
+      margin: 12mm;
+    }
+    @media print {
+      body { background: #fff; }
+      .page {
+        width: auto;
+        min-height: auto;
+        margin: 0;
+        padding: 0;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="cover">
+      <div class="eyebrow">TXLY INTERNAL DOCUMENT</div>
+      <h1>AI Token 监控使用手册</h1>
+      <div class="meta">版本：2026-04-13 ｜ 适用版本：扩展 0.1.43 / Windows 内置 client 2.1.1</div>
+      <div class="callout">本文面向员工与管理员，覆盖安装、配置、透明代理、上游代理、链路自检、排障和更新流程。可直接打印或导出为 PDF 分发。</div>
+    </section>
+
+    <section>
+      <h2>目录</h2>
+      <div class="toc">
+        <div>1. 产品说明</div>
+        <div>10. 自动更新说明</div>
+        <div>2. 使用对象</div>
+        <div>11. 本地客户端说明</div>
+        <div>3. 安装前准备</div>
+        <div>12. 常见场景指引</div>
+        <div>4. 安装扩展</div>
+        <div>13. 排障指南</div>
+        <div>5. 首次配置</div>
+        <div>14. 管理员分发建议</div>
+        <div>6. 配置项说明</div>
+        <div>15. 发布与升级说明</div>
+        <div>7. 推荐使用方式</div>
+        <div>16. FAQ</div>
+        <div>8. 日常使用说明</div>
+        <div>17. 快速检查清单</div>
+        <div>9. 监控面板说明</div>
+        <div>18. 文档维护说明</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>1. 产品说明</h2>
+      <p>AI Token 监控用于统计员工在 VS Code、Cursor、Copilot、Continue、Cline 等 AI 工具中的 Token 使用量，并将结果上报到公司服务器统一汇总。</p>
+      <p>系统由三部分组成：扩展负责控制台与状态展示，本地 <code>ai-monitor.exe</code> 负责 MITM 采集，服务端负责汇总与展示。</p>
+    </section>
+
+    <section>
+      <h2>2. 使用对象</h2>
+      <p>普通员工主要关心安装、登录、启用透明代理和查看链路状态。管理员除这些内容外，还需要掌握 <code>upstreamProxy</code>、证书安装、TUN 环境拦截和 Output 日志定位。</p>
+    </section>
+
+    <section>
+      <h2>3. 安装前准备</h2>
+      <ul>
+        <li>Windows 10 或 11</li>
+        <li>已安装 VS Code 或 Cursor</li>
+        <li>能访问公司上报服务</li>
+        <li>若已有公司代理或本地代理，请准备明确的代理地址</li>
+      </ul>
+      <pre>https://otw.tech:59889</pre>
+    </section>
+
+    <section>
+      <h2>4. 安装扩展</h2>
+      <h3>4.1 获取安装包</h3>
+      <pre>ai-token-monitor-win32-x64-0.1.43.vsix</pre>
+      <h3>4.2 在 VS Code 或 Cursor 中安装</h3>
+      <ol>
+        <li>打开命令面板 <code>Ctrl+Shift+P</code></li>
+        <li>执行 <code>Install from VSIX</code></li>
+        <li>选择 VSIX 文件</li>
+        <li>安装完成后重载窗口</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>5. 首次配置</h2>
+      <p>安装完成后，打开左侧“腾轩 AI 监控”面板，配置服务端地址和身份信息。</p>
+      <ul>
+        <li>工号 / 用户 ID</li>
+        <li>姓名</li>
+        <li>部门</li>
+      </ul>
+      <p>如果系统已启用登录注册，建议走登录流程，不要直接手工改写身份。</p>
+    </section>
+
+    <section>
+      <h2>6. 配置项说明</h2>
+      <table>
+        <thead>
+          <tr><th>配置项</th><th>说明</th><th>示例</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>aiTokenMonitor.serverUrl</code></td><td>服务端地址</td><td><code>https://otw.tech:59889</code></td></tr>
+          <tr><td><code>aiTokenMonitor.userId</code></td><td>工号或唯一身份标识</td><td><code>10001</code></td></tr>
+          <tr><td><code>aiTokenMonitor.userName</code></td><td>姓名</td><td><code>张三</code></td></tr>
+          <tr><td><code>aiTokenMonitor.department</code></td><td>部门</td><td><code>研发部</code></td></tr>
+          <tr><td><code>aiTokenMonitor.transparentMode</code></td><td>是否启用透明代理接管</td><td><code>true / false</code></td></tr>
+          <tr><td><code>aiTokenMonitor.proxyPort</code></td><td>本地 MITM 代理端口</td><td><code>18090</code></td></tr>
+          <tr><td><code>aiTokenMonitor.gatewayPort</code></td><td>本地 API 网关端口</td><td><code>18091</code></td></tr>
+          <tr><td><code>aiTokenMonitor.upstreamProxy</code></td><td>上游代理地址</td><td><code>socks5://127.0.0.1:10808</code></td></tr>
+          <tr><td><code>aiTokenMonitor.apiKey</code></td><td>上报 API Key</td><td><code>与服务端一致</code></td></tr>
+        </tbody>
+      </table>
+      <div class="callout">留空的 <code>upstreamProxy</code> 是合法的；只有你明确依赖现有代理出网时，才建议手工填写它。</div>
+    </section>
+
+    <section>
+      <h2>7. 推荐使用方式</h2>
+      <p>无特殊网络环境时，推荐直接在面板中启用透明代理并重载窗口。有现有代理链路时，优先配置明确的 <code>upstreamProxy</code>，再启用透明代理。</p>
+      <p>Claude Code 如果是独立 CLI 运行，推荐先执行 <code>ai-monitor.exe --launch-preset powershell</code>，再在该终端内运行 <code>claude</code>；若 <code>claude</code> 已在 PATH 中，也可直接执行 <code>ai-monitor.exe --launch claude</code>。</p>
+    </section>
+
+    <section>
+      <h2>8. 日常使用说明</h2>
+      <p>配置完成后，通常只需正常使用 AI 工具即可。扩展会在后台采集请求、维护离线队列并同步 my-stats。</p>
+    </section>
+
+    <section>
+      <h2>9. 监控面板说明</h2>
+      <p>面板包含基础设置、身份状态、链路自检与统计概览。链路自检尤其重要，因为它能区分“本地代理未起”“服务端不可达”“身份冲突”“当前窗口未重载”等不同问题。</p>
+    </section>
+
+    <section>
+      <h2>10. 自动更新说明</h2>
+      <p>扩展会从服务端读取最新 VSIX 版本元数据并在发现新版本时提示安装。当前 Windows 最新版本为 <code>0.1.43</code>。</p>
+    </section>
+
+    <section>
+      <h2>11. 本地客户端说明</h2>
+      <p>Windows 发布版内置的 <code>ai-monitor.exe</code> 当前版本为 <code>2.1.1</code>。扩展启用透明代理时，会先把它复制到当前用户数据目录，再从该目录启动，避免直接从扩展目录执行时被拦截。</p>
+      <p>Output 面板中的 <code>AI Token Monitor Proxy</code> 会展示证书安装、启动命令、退出码和最近一次启动错误。</p>
+    </section>
+
+    <section>
+      <h2>12. 常见场景指引</h2>
+      <ul>
+        <li>只想统计，不想动现有网络：先不要开启透明代理。</li>
+        <li>机器依赖公司代理出网：先填 <code>upstreamProxy</code>。</li>
+        <li>同时装了 VS Code 与 Cursor：两边可同时使用，状态隔离。</li>
+        <li>安装了 OpenVPN 但没连接：新版本不会因为未激活网卡误阻断。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>13. 排障指南</h2>
+      <h3>13.1 服务端不可达</h3>
+      <p>检查 <code>serverUrl</code>、网络连通性和服务端 <code>/health</code>。</p>
+      <h3>13.2 身份冲突</h3>
+      <p>同一工号已绑定其他姓名时，collect 会被 409 拒绝，需要管理员处理。</p>
+      <h3>13.3 证书安装失败</h3>
+      <p>查看 Output 是否包含 <code>spawn error code</code>、证书安装输出或本地 client 启动异常。</p>
+      <h3>13.4 Takeover blocked</h3>
+      <p>通常意味着存在真正启用中的高风险 TUN、PAC 环境无明确上游、或上游代理不可达。</p>
+    </section>
+
+    <section>
+      <h2>14. 管理员分发建议</h2>
+      <p>建议统一分发最新 Windows VSIX，并要求问题用户同时提供扩展版本、内置 client 版本、是否启用透明代理以及 Output 最后 30 行。</p>
+    </section>
+
+    <section>
+      <h2>15. 发布与升级说明</h2>
+      <p>服务端通过扫描扩展目录中的文件名来识别最新版本，例如：</p>
+      <pre>ai-token-monitor-win32-x64-0.1.43.vsix</pre>
+      <p>当前最新版本：</p>
+      <ul>
+        <li>扩展：0.1.43</li>
+        <li>内置 client：2.1.1</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>16. FAQ</h2>
+      <p><strong>为什么服务端有数据，不等于链路正确？</strong> 因为计数变化可能来自别的来源应用或旧实例，必须结合 Output 和链路自检判断。</p>
+      <p><strong>为什么切换服务端后登录状态不沿用？</strong> 因为认证会话按服务端地址和身份隔离，防止把旧 token 发到其他服务器。</p>
+    </section>
+
+    <section>
+      <h2>17. 快速检查清单</h2>
+      <ol>
+        <li>确认扩展是不是最新版。</li>
+        <li>确认服务端地址是否正确。</li>
+        <li>确认工号和姓名是否完整。</li>
+        <li>执行链路自检。</li>
+        <li>查看 Output 面板 <code>AI Token Monitor Proxy</code>。</li>
+        <li>必要时把最后 30 行日志发给管理员。</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>18. 文档维护说明</h2>
+      <p>本手册适配当前仓库已发布行为：扩展 0.1.43、Windows client 2.1.1。后续若服务端地址、透明代理策略、证书安装方式或更新链路变化，应同步更新本文。</p>
+    </section>
+  </main>
+</body>
+</html>

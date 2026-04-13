@@ -5,7 +5,7 @@ import { DashboardProvider } from './dashboard';
 import { registerChatParticipant } from './chatParticipant';
 import { registerTools } from './tools';
 import { CopilotMetrics } from './copilotMetrics';
-import { getConfig } from './config';
+import { DEFAULT_SERVER_URL, getConfig } from './config';
 import { EventBus } from './eventBus';
 import { NetworkInterceptor } from './networkInterceptor';
 import { ProxyManager, ProxyStartResult } from './proxyManager';
@@ -16,9 +16,15 @@ import { ContinueCollector } from './collectors/continueCollector';
 import { checkForUpdates } from './updater';
 
 const PROXY_RELOAD_PENDING_KEY = 'aiTokenMonitor.proxyReloadPending';
+const LEGACY_DEFAULT_SERVER_URL = 'http://192.168.0.135:8000';
 
 export async function activate(context: vscode.ExtensionContext) {
     const cfgSection = vscode.workspace.getConfiguration('aiTokenMonitor');
+
+    const currentServerUrl = (cfgSection.get<string>('serverUrl', '') || '').replace(/\/+$/, '');
+    if (!currentServerUrl || currentServerUrl === LEGACY_DEFAULT_SERVER_URL) {
+        await cfgSection.update('serverUrl', DEFAULT_SERVER_URL, vscode.ConfigurationTarget.Global);
+    }
 
     const cfg = getConfig();
 

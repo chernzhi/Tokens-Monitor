@@ -24,6 +24,8 @@ interface IdentityInfo {
 
 let _identityCache: IdentityInfo | null | undefined; // undefined = not yet loaded
 
+export const DEFAULT_SERVER_URL = 'https://otw.tech:59889';
+
 function loadIdentity(): IdentityInfo | null {
     if (_identityCache !== undefined) { return _identityCache; }
     try {
@@ -49,7 +51,7 @@ export function getConfig(): MonitorConfig {
     const cfg = vscode.workspace.getConfiguration('aiTokenMonitor');
     const identity = loadIdentity();
     return {
-        serverUrl: cfg.get<string>('serverUrl', 'http://192.168.0.135:8000').replace(/\/+$/, ''),
+        serverUrl: cfg.get<string>('serverUrl', DEFAULT_SERVER_URL).replace(/\/+$/, ''),
         userId: cfg.get<string>('userId', '') || identity?.user_id || '',
         userName: cfg.get<string>('userName', '') || identity?.user_name || '',
         department: cfg.get<string>('department', '') || identity?.department || '',

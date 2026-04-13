@@ -49,7 +49,6 @@ function App() {
   const [providerBreakdown, setProviderBreakdown] = useState<BreakdownItem[]>([]);
   const [sourceBreakdown, setSourceBreakdown] = useState<BreakdownItem[]>([]);
   const [sourceAppBreakdown, setSourceAppBreakdown] = useState<BreakdownItem[]>([]);
-  const [endpointBreakdown, setEndpointBreakdown] = useState<BreakdownItem[]>([]);
   const [onlineClients, setOnlineClients] = useState(0);
 
   const activeSourceApp = selectedSourceApp === "all" ? undefined : selectedSourceApp;
@@ -62,7 +61,7 @@ function App() {
     }
     setLoadError(null);
     try {
-      const [ov, tr, usr, dept, mdl, prov, src, srcApp, endpoint, clients] = await Promise.all([
+      const [ov, tr, usr, dept, mdl, prov, src, srcApp, clients] = await Promise.all([
         api.getOverview(trendDays, activeSourceApp),
         api.getTrend(trendDays, activeSourceApp),
         api.getByUser(trendDays, 10, activeSourceApp),
@@ -71,7 +70,6 @@ function App() {
         api.getByProvider(trendDays, activeSourceApp),
         api.getBySource(trendDays, activeSourceApp),
         api.getBySourceApp(trendDays),
-        api.getByEndpoint(trendDays, activeSourceApp),
         api.getOnlineClients(),
       ]);
       setOverview(ov);
@@ -82,7 +80,6 @@ function App() {
       setProviderBreakdown(prov.items || []);
       setSourceBreakdown(src.items || []);
       setSourceAppBreakdown(srcApp.items || []);
-      setEndpointBreakdown(endpoint.items || []);
       setOnlineClients(clients.online_count);
       setLastUpdatedAt(new Intl.DateTimeFormat("zh-CN", {
         hour: "2-digit",
@@ -111,7 +108,6 @@ function App() {
   const estimatedRequestPct = overview.total_requests > 0 ? (overview.estimated_requests / overview.total_requests) * 100 : 0;
   const topSource = sourceBreakdown.length > 0 ? sourceBreakdown[0] : null;
   const topSourceApp = sourceAppBreakdown.length > 0 ? sourceAppBreakdown[0] : null;
-  const topEndpoint = endpointBreakdown.length > 0 ? endpointBreakdown[0] : null;
   const sourceAppOptions = [{ label: "全部应用", value: "all" }].concat(
     sourceAppBreakdown.map((item) => ({
       label: item.name,
@@ -346,7 +342,7 @@ function App() {
 
       {/* Rankings + Insights — scrollable lists */}
       <div className="rankings-section">
-        <div className="ranking-card">
+        <div className="ranking-card ranking-card-user-wide">
           <h3>👤 用户 Token 消耗 Top {userRanking.length}</h3>
           <AutoScroll speed={18}>
             {userRanking.length > 0 ? (
@@ -354,11 +350,14 @@ function App() {
                 {userRanking.map((u, i) => (
                   <div className="rank-row" key={u.id}>
                     <span className="rank-idx" style={{ color: i < 3 ? COLORS.yellow : "#8b949e" }}>{i + 1}</span>
-                    <span className="rank-name" title={u.employee_id ? `${u.name}(${u.employee_id})` : u.name}>{u.name}{u.employee_id ? `(${u.employee_id})` : ""}</span>
+                    <span className="rank-name rank-name-user" title={u.employee_id ? `${u.name}(${u.employee_id})` : u.name}>{u.name}{u.employee_id ? `(${u.employee_id})` : ""}</span>
                     <div className="rank-bar-bg">
                       <div className="rank-bar" style={{ width: `${(u.total_tokens / maxUserTokens) * 100}%`, background: BAR_COLORS[i % BAR_COLORS.length] }} />
                     </div>
-                    <span className="rank-val">{formatTokens(u.total_tokens)}</span>
+                    <span className="rank-user-metrics">
+                      <span className="rank-val rank-val-token">{formatTokens(u.total_tokens)}</span>
+                      <span className="rank-val rank-val-cost">{formatCNY(u.cost_cny)}</span>
+                    </span>
                   </div>
                 ))}
               </div>
@@ -432,10 +431,6 @@ function App() {
                 <span style={{ color: COLORS.cyan }}>●</span>
                 <span>当前应用筛选：<b style={{ color: COLORS.cyan }}>{currentSourceAppLabel}</b>{selectedSourceApp === "all" && topSourceApp ? `；主来源 ${topSourceApp.name} (${topSourceApp.percentage}%)` : ""}</span>
               </div>
-              <div className="insight-item">
-                <span style={{ color: COLORS.blue }}>●</span>
-                <span>主要接口：<b style={{ color: COLORS.blue }}>{topEndpoint ? topEndpoint.name : "--"}</b>{topEndpoint ? ` (${topEndpoint.percentage}%)` : ""}</span>
-              </div>
             </div>
           </AutoScroll>
         </div>
@@ -488,25 +483,6 @@ function App() {
                 })()}
               </div>
             ) : renderEmptyState("暂无应用来源排行数据")}
-          </AutoScroll>
-        </div>
-        <div className="ranking-card">
-          <h3>🔌 接口维度排行</h3>
-          <AutoScroll speed={18}>
-            {endpointBreakdown.length > 0 ? (
-              <div className="rank-list">
-                {endpointBreakdown.map((item, i) => (
-                  <div className="rank-row" key={item.name}>
-                    <span className="rank-idx" style={{ color: i < 3 ? COLORS.yellow : "#8b949e" }}>{i + 1}</span>
-                    <span className="rank-name rank-name-endpoint">{item.name}</span>
-                    <div className="rank-bar-bg">
-                      <div className="rank-bar" style={{ width: `${item.percentage}%`, background: BAR_COLORS[i % BAR_COLORS.length] }} />
-                    </div>
-                    <span className="rank-val rank-val-wide">{item.percentage}%</span>
-                  </div>
-                ))}
-              </div>
-            ) : renderEmptyState("暂无接口维度排行数据")}
           </AutoScroll>
         </div>
       </div>

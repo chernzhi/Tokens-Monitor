@@ -2378,7 +2378,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 <div class="config-section" id="basicSection">
                     <div class="field field-span-2">
                         <label>上报地址</label>
-                        <input id="cfgServer" type="text" data-key="serverUrl" value="${this.esc(cfgData.serverUrl)}" placeholder="例如：http://192.168.0.135:8000" />
+                        <input id="cfgServer" type="text" data-key="serverUrl" value="${this.esc(cfgData.serverUrl)}" placeholder="例如：https://otw.tech:59889" />
                     </div>
 
                     <!-- 已登录状态 -->

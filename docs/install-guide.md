@@ -15,7 +15,13 @@
 向管理员获取扩展安装包文件（`.vsix` 格式），例如：
 
 ```
-ai-token-monitor-win32-x64.vsix
+ai-token-monitor-win32-x64-0.1.43.vsix
+```
+
+默认上报地址为：
+
+```text
+https://otw.tech:59889
 ```
 
 ### 第二步：安装到编辑器
@@ -66,6 +72,8 @@ ai-token-monitor-win32-x64.vsix
 - 左下角状态栏显示当天累计 Token 数
 - 点击左侧监控图标可查看详细使用统计
 - 所有 AI 请求（Copilot 补全、Chat 对话等）自动被记录
+
+如果你在终端里使用 Claude Code 等 CLI 工具，需要让 CLI 流量经过本地 `ai-monitor.exe` 才能统计。推荐先执行 `ai-monitor.exe --launch-preset powershell`，再在该终端里运行 `claude`。
 
 ---
 

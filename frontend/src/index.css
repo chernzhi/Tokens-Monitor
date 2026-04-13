@@ -259,10 +259,14 @@ body {
 /* Rankings */
 .rankings-section {
   display: grid;
-  grid-template-columns: 1.05fr 1.05fr 1fr 1fr 1fr 1fr;
+  grid-template-columns: 1.1fr 1.1fr 1fr 1fr 1fr 1fr;
   gap: clamp(4px, 0.5vw, 10px);
   flex: 1 1 0;
   min-height: 0;
+}
+
+.ranking-card-user-wide {
+  grid-column: span 2;
 }
 
 .ranking-card {
@@ -378,6 +382,10 @@ body {
   width: clamp(70px, 6.5vw, 100px);
 }
 
+.rank-name-user {
+  width: clamp(100px, 11vw, 180px);
+}
+
 .rank-name-endpoint {
   width: clamp(90px, 9vw, 160px);
 }
@@ -407,6 +415,24 @@ body {
 
 .rank-val-wide {
   width: clamp(36px, 3.5vw, 50px);
+}
+
+.rank-user-metrics {
+  width: clamp(118px, 9.5vw, 160px);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: clamp(8px, 0.7vw, 14px);
+  flex-shrink: 0;
+}
+
+.rank-val-token,
+.rank-val-cost {
+  width: auto;
+}
+
+.rank-val-cost {
+  color: #3fb950;
 }
 
 @media (max-width: 1600px) {
@@ -480,6 +506,10 @@ body {
     gap: 12px;
   }
 
+  .ranking-card-user-wide {
+    grid-column: span 2;
+  }
+
   .stat-card,
   .chart-card,
   .ranking-card {
@@ -496,6 +526,10 @@ body {
 @media (max-width: 1100px) {
   .rankings-section {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .ranking-card-user-wide {
+    grid-column: span 2;
   }
 }
 
@@ -548,6 +582,10 @@ body {
   .charts-row-4,
   .rankings-section {
     grid-template-columns: 1fr;
+  }
+
+  .ranking-card-user-wide {
+    grid-column: auto;
   }
 
   .stat-card,
@@ -617,6 +655,7 @@ body {
 
   .rank-name,
   .rank-name-wide,
+  .rank-name-user,
   .rank-name-endpoint {
     grid-column: 2;
     grid-row: 1;
@@ -630,12 +669,17 @@ body {
     grid-row: 2;
   }
 
-  .rank-val,
-  .rank-val-wide {
+  .rank-user-metrics {
     grid-column: 3;
     grid-row: 1;
     width: auto;
-    min-width: 52px;
+    min-width: 120px;
+    justify-self: end;
+  }
+
+  .rank-val,
+  .rank-val-wide {
+    width: auto;
     font-size: 11px;
   }
 }
@@ -690,6 +734,7 @@ body {
 
   .rank-name,
   .rank-name-wide,
+  .rank-name-user,
   .rank-name-endpoint {
     grid-column: 2;
     grid-row: 1;
@@ -702,12 +747,16 @@ body {
     margin-top: 0;
   }
 
-  .rank-val,
-  .rank-val-wide {
+  .rank-user-metrics {
     grid-column: 2;
     grid-row: 2;
     justify-self: start;
     min-width: 0;
+    gap: 10px;
+  }
+
+  .rank-val,
+  .rank-val-wide {
     font-size: 12px;
   }
 
