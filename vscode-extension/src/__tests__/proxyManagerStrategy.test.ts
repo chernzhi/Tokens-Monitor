@@ -1,4 +1,24 @@
-import { buildProxyEnvironmentDiagnosis } from '../proxyManager';
+import { buildProxyEnvironmentDiagnosis, selectHighRiskTunAdapters } from '../proxyManager';
+
+describe('selectHighRiskTunAdapters', () => {
+    test('ignores high-risk adapters that are not active', () => {
+        const adapters = selectHighRiskTunAdapters([
+            { Name: 'OpenVPN Wintun', InterfaceDescription: 'Wintun Userspace Tunnel', Status: 'Disconnected' },
+            { Name: 'OpenVPN TAP-Windows6', InterfaceDescription: 'TAP-Windows Adapter V9', Status: 'Disabled' },
+        ]);
+
+        expect(adapters).toEqual([]);
+    });
+
+    test('keeps active high-risk adapters', () => {
+        const adapters = selectHighRiskTunAdapters([
+            { Name: 'corp-tun', InterfaceDescription: 'Wintun Userspace Tunnel', Status: 'Up' },
+            { Name: 'Ethernet', InterfaceDescription: 'Intel Ethernet', Status: 'Up' },
+        ]);
+
+        expect(adapters).toEqual(['corp-tun (Wintun Userspace Tunnel)']);
+    });
+});
 
 describe('buildProxyEnvironmentDiagnosis', () => {
     test('prefers configured upstream proxy when provided', () => {

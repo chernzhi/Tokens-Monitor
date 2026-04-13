@@ -32,6 +32,12 @@ export interface ProxyEnvironmentSignals {
     tunAdapters?: string[];
 }
 
+interface WindowsNetworkAdapterSnapshot {
+    Name?: string;
+    InterfaceDescription?: string;
+    Status?: string;
+}
+
 export interface ProxyEnvironmentDiagnosis {
     kind: ProxyEnvironmentKind;
     level: 'ok' | 'warning' | 'neutral';
@@ -272,6 +278,33 @@ export interface ProxyStartResult {
     diagnosis: ProxyEnvironmentDiagnosis;
 }
 
+export function selectHighRiskTunAdapters(
+    adapters: WindowsNetworkAdapterSnapshot[],
+): string[] {
+    const keywords = ['wintun', 'sing-box', 'tap-windows', 'wireguard', 'clash', 'nekoray'];
+    return adapters
+        .map(adapter => {
+            const status = (adapter.Status ?? '').trim().toLowerCase();
+            if (status !== 'up') {
+                return '';
+            }
+
+            const name = (adapter.Name ?? '').trim();
+            const description = (adapter.InterfaceDescription ?? '').trim();
+            const combined = `${name} ${description}`.toLowerCase();
+            if (!combined || !keywords.some(keyword => combined.includes(keyword))) {
+                return '';
+            }
+            return description ? `${name || '未知适配器'} (${description})` : (name || '未知适配器');
+        })
+        .filter(Boolean);
+}
+
+interface LocalBinaryCandidate {
+    path: string;
+    kind: 'bundled' | 'workspace' | 'global';
+}
+
 export interface LocalProxyStatusSnapshot {
     status?: string;
     version?: string;
@@ -309,6 +342,7 @@ export class ProxyManager {
     /** When set, overrides config.proxyPort — used when we discover an existing instance on a different port */
     private activePort?: number;
     private certificatePrepared = false;
+    private lastStartupError?: string;
     private lastEnvironmentDiagnosis?: { fetchedAt: number; data: ProxyEnvironmentDiagnosis };
     private environmentDiagnosisInFlight?: Promise<ProxyEnvironmentDiagnosis>;
 
@@ -410,7 +444,8 @@ export class ProxyManager {
             return { status: 'blocked', routingChanged: false, diagnosis };
         }
 
-        const binaryPath = this.findBinaryPath();
+        this.lastStartupError = undefined;
+        const binaryPath = await this.resolveBinaryPath();
         const configPath = path.join(this.context.globalStorageUri.fsPath, 'proxy-config.json');
         await fs.promises.mkdir(path.dirname(configPath), { recursive: true });
 
@@ -527,6 +562,19 @@ export class ProxyManager {
         });
         this.process = proc;
 
+        proc.on('error', (error: NodeJS.ErrnoException) => {
+            const message = error.message || String(error);
+            this.lastStartupError = message;
+            this.appendOutputLine(`[proxy] Failed to start local proxy process: ${message}`);
+            if (error.code) {
+                this.appendOutputLine(`[proxy] spawn error code: ${error.code}`);
+            }
+            this.process = null;
+            this.activePort = undefined;
+            this.stopHealthCheck();
+            void this.restoreHttpProxyIfMitmUnavailable();
+        });
+
         proc.stdout?.on('data', (data: Buffer) => {
             this.appendOutput(data.toString());
         });
@@ -544,6 +592,9 @@ export class ProxyManager {
         const ready = await this.waitForProxyReady(8_000);
         if (!ready) {
             this.appendOutputLine('[proxy] Local proxy did not become ready.');
+            if (this.lastStartupError) {
+                this.appendOutputLine(`[proxy] Last startup error: ${this.lastStartupError}`);
+            }
             await this.restoreHttpProxyIfMitmUnavailable();
             return { status: 'off', routingChanged: false, diagnosis };
         }
@@ -721,38 +772,77 @@ export class ProxyManager {
     }
 
     public findBinaryPath(): string | null {
+        return this.findBinaryCandidate()?.path ?? null;
+    }
+
+    private findBinaryCandidate(): LocalBinaryCandidate | null {
         const ext = process.platform === 'win32' ? '.exe' : '';
         const binaryName = `ai-monitor${ext}`;
 
         const bundledPath = path.join(this.context.extensionPath, 'bin', binaryName);
         if (fs.existsSync(bundledPath)) {
-            return bundledPath;
+            return { path: bundledPath, kind: 'bundled' };
         }
 
         const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
         for (const folder of workspaceFolders) {
             const workspaceBin = path.join(folder.uri.fsPath, 'bin', binaryName);
             if (fs.existsSync(workspaceBin)) {
-                return workspaceBin;
+                return { path: workspaceBin, kind: 'workspace' };
             }
 
             const siblingClient = path.resolve(folder.uri.fsPath, '..', 'client', binaryName);
             if (fs.existsSync(siblingClient)) {
-                return siblingClient;
+                return { path: siblingClient, kind: 'workspace' };
             }
 
             const nestedClient = path.join(folder.uri.fsPath, 'client', binaryName);
             if (fs.existsSync(nestedClient)) {
-                return nestedClient;
+                return { path: nestedClient, kind: 'workspace' };
             }
         }
 
         const globalPath = path.join(this.context.globalStorageUri.fsPath, 'bin', binaryName);
         if (fs.existsSync(globalPath)) {
-            return globalPath;
+            return { path: globalPath, kind: 'global' };
         }
 
         return null;
+    }
+
+    private async resolveBinaryPath(): Promise<string | null> {
+        const candidate = this.findBinaryCandidate();
+        if (!candidate) {
+            return null;
+        }
+        if (candidate.kind !== 'bundled') {
+            return candidate.path;
+        }
+
+        const ext = process.platform === 'win32' ? '.exe' : '';
+        const binaryName = `ai-monitor${ext}`;
+        const globalPath = path.join(this.context.globalStorageUri.fsPath, 'bin', binaryName);
+        try {
+            await fs.promises.mkdir(path.dirname(globalPath), { recursive: true });
+            const sourceStat = await fs.promises.stat(candidate.path);
+            let shouldCopy = true;
+            try {
+                const targetStat = await fs.promises.stat(globalPath);
+                shouldCopy = targetStat.size !== sourceStat.size || targetStat.mtimeMs < sourceStat.mtimeMs - 2000;
+            } catch {
+                shouldCopy = true;
+            }
+
+            if (shouldCopy) {
+                await fs.promises.copyFile(candidate.path, globalPath);
+                this.appendOutputLine(`[proxy] Prepared local binary: ${globalPath}`);
+            }
+            return globalPath;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.appendOutputLine(`[proxy] Failed to stage bundled ai-monitor binary, falling back to extension copy: ${message}`);
+            return candidate.path;
+        }
     }
 
     /**
@@ -1106,20 +1196,9 @@ export class ProxyManager {
                 return [];
             }
 
-            const adapters = JSON.parse(output) as Array<{ Name?: string; InterfaceDescription?: string; Status?: string }> | { Name?: string; InterfaceDescription?: string; Status?: string };
+            const adapters = JSON.parse(output) as WindowsNetworkAdapterSnapshot[] | WindowsNetworkAdapterSnapshot;
             const list = Array.isArray(adapters) ? adapters : [adapters];
-            const keywords = ['wintun', 'sing-box', 'tap-windows', 'wireguard', 'clash', 'nekoray'];
-            return list
-                .map(adapter => {
-                    const name = (adapter.Name ?? '').trim();
-                    const description = (adapter.InterfaceDescription ?? '').trim();
-                    const combined = `${name} ${description}`.toLowerCase();
-                    if (!combined || !keywords.some(keyword => combined.includes(keyword))) {
-                        return '';
-                    }
-                    return description ? `${name || '未知适配器'} (${description})` : (name || '未知适配器');
-                })
-                .filter(Boolean);
+            return selectHighRiskTunAdapters(list);
         } catch {
             return [];
         }
@@ -1198,6 +1277,14 @@ export class ProxyManager {
         }
 
         return new Promise(resolve => {
+            let settled = false;
+            const finish = (value: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                resolve(value);
+            };
             const proc = spawn(binaryPath, ['--install', '--install-cert-only', '--config', configPath], {
                 stdio: ['ignore', 'pipe', 'pipe'],
                 detached: false,
@@ -1217,12 +1304,19 @@ export class ProxyManager {
             proc.stderr?.on('data', (data: Buffer) => {
                 output += data.toString();
             });
+            proc.on('error', error => {
+                clearTimeout(timeout);
+                output += `\nspawn error: ${error.message || String(error)}`;
+                this.appendOutputLine('[proxy] Failed to launch certificate installer');
+                this.appendOutputLine(output.trim());
+                finish(false);
+            });
             proc.on('exit', code => {
                 clearTimeout(timeout);
                 if (code === 0) {
                     this.certificatePrepared = true;
                     this.appendOutputLine('[proxy] Ensured current-user CA certificate is installed');
-                    resolve(true);
+                    finish(true);
                     return;
                 }
 
@@ -1234,7 +1328,7 @@ export class ProxyManager {
                 void vscode.window.showWarningMessage(
                     'AI Token 监控无法自动安装当前用户证书，已停止接管网络。请先允许证书安装后再启用监控代理。',
                 );
-                resolve(false);
+                finish(false);
             });
         });
     }

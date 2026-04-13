@@ -53,9 +53,29 @@ $targetSpecs = [ordered]@{
 
 function Resolve-ClientBinary($name) {
     $spec = $targetSpecs[$name]
+    $shouldBuild = $false
+    $existingCandidate = $null
+
     foreach ($candidate in $spec.SourceCandidates) {
         if (Test-Path -LiteralPath $candidate) {
-            return $candidate
+            $existingCandidate = $candidate
+            break
+        }
+    }
+
+    if ($existingCandidate) {
+        $sourceFiles = Get-ChildItem -Path $CLIENT -Recurse -File | Where-Object {
+            $_.FullName -notlike '*\dist\*' -and $_.Name -ne 'ai-monitor.exe'
+        }
+        if ($sourceFiles.Count -gt 0) {
+            $latestSourceWrite = ($sourceFiles | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+            $candidateWrite = (Get-Item -LiteralPath $existingCandidate).LastWriteTimeUtc
+            if ($latestSourceWrite -gt $candidateWrite) {
+                $shouldBuild = $true
+            }
+        }
+        if (-not $shouldBuild) {
+            return $existingCandidate
         }
     }
 
