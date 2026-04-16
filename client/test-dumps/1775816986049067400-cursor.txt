@@ -1,1 +1,0 @@
-{"model":"cursor-small","usage":{"prompt_tokens":100,"completion_tokens":200,"total_tokens":300}}

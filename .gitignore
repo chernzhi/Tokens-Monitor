@@ -71,6 +71,9 @@ dist-ssr/
 .cleanup-backup/
 *.backup
 
+# Local traffic / tool capture dumps (accidental bulk)
+client/test-dumps/
+
 # Local environment files
 .env.local
 .env.*.local
