@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/url"
 	"os"
@@ -8,7 +9,7 @@ import (
 )
 
 // detectUpstreamProxy discovers the user's existing proxy before ai-monitor sets itself up.
-// Priority: explicit config > Windows system proxy registry > environment variables.
+// Priority: explicit config > Windows system proxy registry > environment variables > install_state saved proxy.
 // Returns "" if no upstream proxy is found or all candidates are self-referential.
 func detectUpstreamProxy(cfg *Config) string {
 	// 1. Explicit config takes highest priority (already validated by LoadConfig)
@@ -43,7 +44,52 @@ func detectUpstreamProxy(cfg *Config) string {
 		return v
 	}
 
+	// 4. Fallback: install_state.json saved the upstream before install overwrote everything.
+	// This handles the case where system proxy + env vars now all point to ai-monitor.
+	if state := loadInstallState(); state != nil && state.PreviousUpstreamProxy != "" {
+		if !isSelfProxy(state.PreviousUpstreamProxy) {
+			log.Printf("[upstream] recovered from install_state: %s", state.PreviousUpstreamProxy)
+			return state.PreviousUpstreamProxy
+		}
+	}
+
 	return ""
+}
+
+// snapshotProxyEnvVars captures the current proxy-related environment variables
+// BEFORE installation overwrites them. Used for restoration on uninstall.
+func snapshotProxyEnvVars() map[string]string {
+	snapshot := make(map[string]string)
+	for _, key := range []string{
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+		"ALL_PROXY", "all_proxy",
+		"NODE_EXTRA_CA_CERTS",
+	} {
+		if v := os.Getenv(key); v != "" && !isSelfProxy(v) {
+			snapshot[key] = v
+		}
+	}
+	return snapshot
+}
+
+// patchConfigUpstreamProxy reads config.json, sets upstream_proxy, and writes it back.
+// Preserves all other fields and formatting.
+func patchConfigUpstreamProxy(configPath, upstream string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	raw["upstream_proxy"] = upstream
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, out, 0644)
 }
 
 // isSelfProxy returns true if the proxy URL points to ai-monitor's own listening range.

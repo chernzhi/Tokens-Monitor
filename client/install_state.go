@@ -15,6 +15,11 @@ type InstallState struct {
 	PreviousProxyEnabled bool   `json:"previous_proxy_enabled"`
 	IDESettingsPatched   bool   `json:"ide_settings_patched"`
 	Timestamp            string `json:"timestamp"`
+	// PreviousUpstreamProxy is the upstream proxy detected BEFORE install overwrote
+	// system proxy / env vars. Used at runtime as a fallback in detectUpstreamProxy
+	// so that the proxy chain is not broken after installation.
+	PreviousUpstreamProxy string            `json:"previous_upstream_proxy,omitempty"`
+	PreviousEnvVars       map[string]string `json:"previous_env_vars,omitempty"`
 }
 
 func installStatePath() string {

@@ -7,6 +7,7 @@ set -e
 PLATFORM="${1:-all}"
 EXT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$EXT_DIR/dist"
+VERSION="$(node -p "require('$EXT_DIR/package.json').version")"
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════╗"
@@ -52,11 +53,11 @@ for platform in "${PLATFORMS[@]}"; do
 
     echo "  → $platform ($target)"
     npm run vscode:prepublish > /dev/null 2>&1
-    npx vsce package --target "$target" --out "$DIST_DIR/ai-token-monitor-$target.vsix" > /dev/null 2>&1
+    npx vsce package --target "$target" --out "$DIST_DIR/ai-token-monitor-$target-$VERSION.vsix" > /dev/null 2>&1
 
-    if [ -f "$DIST_DIR/ai-token-monitor-$target.vsix" ]; then
-        size=$(du -h "$DIST_DIR/ai-token-monitor-$target.vsix" | cut -f1)
-        echo "     ✅ ai-token-monitor-$target.vsix ($size)"
+    if [ -f "$DIST_DIR/ai-token-monitor-$target-$VERSION.vsix" ]; then
+        size=$(du -h "$DIST_DIR/ai-token-monitor-$target-$VERSION.vsix" | cut -f1)
+        echo "     ✅ ai-token-monitor-$target-$VERSION.vsix ($size)"
     else
         echo "     ❌ 打包失败"
         exit 1

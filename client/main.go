@@ -50,6 +50,8 @@ func main() {
 	installFull := flag.Bool("install-full", false, "与 --install 合用: 强制系统代理(覆盖 config 中 install_system_proxy=false)")
 	installCertOnly := flag.Bool("install-cert-only", false, "与 --install 合用: 仅安装 CA，不改系统代理(与 Proxifier 共存时用)")
 	installIDE := flag.Bool("install-ide", false, "与 --install 合用: 强制写入 VS Code/Cursor 的 http.proxy（默认不写，仅用系统代理）")
+	globalInstall := flag.Bool("global-install", false, "全局安装: 安装 CA + 设用户级 HTTP_PROXY 环境变量 + 注册开机自启（推荐，一键覆盖所有开发工具）")
+	globalUninstall := flag.Bool("global-uninstall", false, "全局卸载: 移除 CA + 清除环境变量 + 移除开机自启")
 	launch := flag.Bool("launch", false, "启动本地 MITM，并仅对子进程注入代理环境变量；不修改系统代理或用户环境变量")
 	launchPreset := flag.String("launch-preset", "", "按预设启动受管应用，例如 vscode、cursor、powershell、cmd")
 	listLaunchPresets := flag.Bool("list-launch-presets", false, "列出可用的受管应用启动预设")
@@ -84,11 +86,37 @@ func main() {
 		return
 	}
 
+	if *globalUninstall {
+		doGlobalUninstall(certMgr)
+		return
+	}
+
+	if *globalInstall {
+		cfg, err := LoadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("  加载配置失败: %v", err)
+		}
+		doGlobalInstall(certMgr, cfg, *configPath)
+		return
+	}
+
 	if *setup {
 		if err := runSetupWizard(*configPath, certMgr); err != nil {
 			log.Fatalf("  %v", err)
 		}
 		return
+	}
+
+	// When no config exists and no explicit flags are given, launch the web wizard automatically.
+	// This handles the "double-click ai-monitor.exe" scenario for first-time users.
+	if !*install && !*launch && strings.TrimSpace(*launchPreset) == "" && !*listLaunchPresets {
+		if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+			fmt.Println("  未找到 config.json，正在打开安装向导...")
+			if err := runWebWizard(*configPath, certMgr); err != nil {
+				log.Fatalf("  安装向导出错: %v", err)
+			}
+			return
+		}
 	}
 
 	if *listLaunchPresets {
@@ -101,8 +129,8 @@ func main() {
 		log.Fatalf("  加载配置失败: %v", err)
 	}
 
-	bypass := buildProxyBypass()
-	noProxy := buildNoProxyEnv()
+	bypass := buildProxyBypassWithConfig(cfg)
+	noProxy := buildNoProxyEnvWithConfig(cfg)
 
 	if *install {
 		// Resolve actual port: reuse running instance or probe available port.
@@ -227,13 +255,27 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 		return
 	}
 
-	// Save current proxy state BEFORE overwriting so we can restore on uninstall
+	// Detect existing upstream BEFORE overwriting so we can chain through it
+	detectedUpstream := detectUpstreamProxy(cfg)
 	previousProxy := readCurrentSystemProxy()
+	previousEnvVars := snapshotProxyEnvVars()
+
+	if detectedUpstream != "" {
+		fmt.Printf("    ℹ 检测到已有代理: %s（将作为上游保留）\n", detectedUpstream)
+		if strings.TrimSpace(cfg.UpstreamProxy) == "" {
+			cfg.UpstreamProxy = detectedUpstream
+			// Best-effort write to config file
+			patchConfigUpstreamProxy(filepath.Join(filepath.Dir(os.Args[0]), "config.json"), detectedUpstream)
+		}
+	}
+
 	saveInstallState(&InstallState{
-		SystemProxySet:       true,
-		PreviousProxyAddr:    previousProxy,
-		PreviousProxyEnabled: previousProxy != "",
-		IDESettingsPatched:   patchIDE,
+		SystemProxySet:        true,
+		PreviousProxyAddr:     previousProxy,
+		PreviousProxyEnabled:  previousProxy != "",
+		IDESettingsPatched:    patchIDE,
+		PreviousUpstreamProxy: detectedUpstream,
+		PreviousEnvVars:       previousEnvVars,
 	})
 
 	fmt.Println("  [2/4] 设置系统代理...")
@@ -301,12 +343,13 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 }
 
 func doUninstall(certMgr *CertManager) {
+	state := loadInstallState()
+
 	fmt.Println("  [1/4] 移除 CA 证书...")
 	certMgr.UninstallCA()
 	fmt.Println("    ✓ done")
 
 	fmt.Println("  [2/4] 清除系统代理...")
-	state := loadInstallState()
 	if state != nil && state.PreviousProxyEnabled && state.PreviousProxyAddr != "" {
 		fmt.Printf("    ℹ 恢复之前的系统代理: %s\n", state.PreviousProxyAddr)
 		EnableSystemProxy(state.PreviousProxyAddr, "")
@@ -315,8 +358,8 @@ func doUninstall(certMgr *CertManager) {
 	}
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [3/4] 清除环境变量...")
-	ClearEnvProxy(proxyEnvKeys)
+	fmt.Println("  [3/4] 恢复环境变量...")
+	restoreOrClearEnvVars(state)
 	fmt.Println("    ✓ done")
 
 	fmt.Println("  [4/4] 清除 IDE 代理配置...")
@@ -329,6 +372,221 @@ func doUninstall(certMgr *CertManager) {
 
 	fmt.Println()
 	fmt.Println("  ✓ 卸载完成! 重新打开终端窗口和 IDE 使更改生效。")
+}
+
+func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
+	fmt.Println("  ══════════════════════════════════════════")
+	fmt.Println("  全局安装模式")
+	fmt.Println("  效果: 所有新启动的开发工具自动走 ai-monitor 监控")
+	fmt.Println("  ══════════════════════════════════════════")
+	fmt.Println()
+
+	actualPort := resolveActualPort(cfg)
+	proxyAddr := fmt.Sprintf("localhost:%d", actualPort)
+	httpProxy := "http://" + proxyAddr
+
+	// ── Step 0: Detect existing upstream proxy BEFORE overwriting anything ──
+	// This is critical: once we overwrite system proxy and env vars, we can
+	// no longer distinguish the user's original proxy from our own.
+	detectedUpstream := detectUpstreamProxy(cfg)
+	previousSysProxy := readCurrentSystemProxy()
+	previousEnvVars := snapshotProxyEnvVars()
+
+	if detectedUpstream != "" {
+		fmt.Printf("  ℹ 检测到已有代理: %s\n", detectedUpstream)
+		fmt.Println("    ai-monitor 将作为中间层，非 AI 流量继续走原代理，不影响外网访问")
+		fmt.Println()
+	}
+
+	// Auto-persist detected upstream into config so runtime always finds it
+	if detectedUpstream != "" && strings.TrimSpace(cfg.UpstreamProxy) == "" {
+		cfg.UpstreamProxy = detectedUpstream
+		if err := patchConfigUpstreamProxy(configPath, detectedUpstream); err != nil {
+			log.Printf("    ⚠ 写入 upstream_proxy 到 config.json 失败: %v", err)
+		} else {
+			fmt.Printf("    ✓ 已将上游代理写入 config.json: upstream_proxy=%s\n", detectedUpstream)
+		}
+	}
+
+	// Step 1: Install CA certificate
+	fmt.Println("  [1/4] 安装 CA 证书到用户信任存储...")
+	if err := certMgr.InstallCA(); err != nil {
+		log.Printf("    ✗ CA 证书安装失败: %v", err)
+		fmt.Printf("    手动安装: %s\n", manualCAInstallHint(certMgr.CACertPath()))
+	} else {
+		fmt.Printf("    ✓ CA 证书已安装: %s\n", certMgr.CACertPath())
+	}
+
+	// Step 2: Set user-level environment variables
+	fmt.Println("  [2/4] 设置用户级环境变量...")
+	noProxy := buildNoProxyEnvWithConfig(cfg)
+	envVars := map[string]string{
+		"HTTP_PROXY":          httpProxy,
+		"HTTPS_PROXY":         httpProxy,
+		"NO_PROXY":            noProxy,
+		"NODE_EXTRA_CA_CERTS": certMgr.CACertPath(),
+	}
+	if err := SetEnvProxy(envVars); err != nil {
+		log.Printf("    ✗ 环境变量设置失败: %v", err)
+	} else {
+		fmt.Println("    ✓ 已设置 HTTP_PROXY / HTTPS_PROXY / NO_PROXY / NODE_EXTRA_CA_CERTS")
+		fmt.Println("      → VS Code/Cursor/JetBrains/Claude Code/Aider/Codex 等 CLI 工具自动走监控")
+	}
+
+	// Step 3: Set Windows system proxy (for Visual Studio, .NET apps, etc.)
+	fmt.Println("  [3/4] 设置 Windows 系统代理（覆盖 Visual Studio 等 .NET 应用）...")
+	bypass := buildProxyBypassWithConfig(cfg)
+	if previousSysProxy != "" && !isSelfProxy(previousSysProxy) {
+		fmt.Printf("    ℹ 检测到现有系统代理: %s（已备份，卸载时将恢复）\n", previousSysProxy)
+	}
+	saveInstallState(&InstallState{
+		SystemProxySet:        true,
+		PreviousProxyAddr:     previousSysProxy,
+		PreviousProxyEnabled:  previousSysProxy != "" && !isSelfProxy(previousSysProxy),
+		PreviousUpstreamProxy: detectedUpstream,
+		PreviousEnvVars:       previousEnvVars,
+	})
+	if err := EnableSystemProxy(proxyAddr, bypass); err != nil {
+		log.Printf("    ✗ 系统代理设置失败: %v", err)
+		fmt.Println("      Visual Studio 中的 GitHub Copilot 可能无法被监控")
+	} else {
+		fmt.Printf("    ✓ 系统代理: %s\n", proxyAddr)
+		fmt.Println("      → Visual Studio / .NET 应用的 Copilot 请求自动走监控")
+		fmt.Println("      → 浏览器/Outlook 等经系统代理的非 AI 流量走纯隧道透传，不受影响")
+		fmt.Println("      → 所有内网地址(10.*/172.16-31.*/192.168.*)已在 bypass 列表中直连")
+	}
+
+	// Step 4: Register auto-start
+	fmt.Println("  [4/4] 注册开机自启...")
+	if err := installAutoStart(configPath); err != nil {
+		log.Printf("    ✗ 注册失败: %v", err)
+		fmt.Println("    可手动将 ai-monitor.exe 快捷方式放入「启动」文件夹")
+	} else {
+		fmt.Println("    ✓ 已注册: 每次登录自动在后台启动 ai-monitor")
+	}
+
+	// Start background instance now if not already running
+	if _, alive := checkExistingInstance(); !alive {
+		fmt.Println()
+		fmt.Println("  正在启动后台服务...")
+		if err := startBackgroundInstance(configPath); err != nil {
+			log.Printf("    ✗ 后台启动失败: %v", err)
+			fmt.Println("    请手动运行 ai-monitor.exe")
+		} else {
+			fmt.Println("    ✓ ai-monitor 已在后台运行")
+		}
+	} else {
+		fmt.Println()
+		fmt.Println("  ✓ ai-monitor 已在运行中")
+	}
+
+	fmt.Println()
+	fmt.Println("  ══════════════════════════════════════════")
+	fmt.Println("  ✓ 全局安装完成!")
+	fmt.Println()
+	fmt.Println("  覆盖范围:")
+	fmt.Println("    ✓ VS Code / Cursor / Windsurf / Kiro / Trae  (环境变量)")
+	fmt.Println("    ✓ JetBrains IDEA / WebStorm / PyCharm / GoLand  (环境变量)")
+	fmt.Println("    ✓ Visual Studio 2022 + GitHub Copilot  (系统代理)")
+	fmt.Println("    ✓ Claude Code / Codex / Aider / OpenCode 等 CLI  (环境变量)")
+	if detectedUpstream != "" {
+		fmt.Println()
+		fmt.Printf("  代理兼容: 已有代理 %s 保留为上游，外网访问不受影响\n", detectedUpstream)
+	}
+	fmt.Println()
+	fmt.Println("  重要: 需重新打开终端窗口和 IDE，环境变量才对新进程生效。")
+	fmt.Println("  已打开的程序不受影响，关闭后再打开即可。")
+	fmt.Printf("  卸载: %s --global-uninstall\n", selfBinaryName())
+	fmt.Println("  ══════════════════════════════════════════")
+}
+
+func doGlobalUninstall(certMgr *CertManager) {
+	fmt.Println("  ══════════════════════════════════════════")
+	fmt.Println("  全局卸载")
+	fmt.Println("  ══════════════════════════════════════════")
+	fmt.Println()
+
+	state := loadInstallState()
+
+	fmt.Println("  [1/4] 移除 CA 证书...")
+	certMgr.UninstallCA()
+	fmt.Println("    ✓ done")
+
+	fmt.Println("  [2/4] 恢复用户级环境变量...")
+	restoreOrClearEnvVars(state)
+	fmt.Println("    ✓ done")
+
+	fmt.Println("  [3/4] 恢复系统代理...")
+	if state != nil && state.SystemProxySet {
+		if state.PreviousProxyEnabled && state.PreviousProxyAddr != "" {
+			fmt.Printf("    ℹ 恢复之前的系统代理: %s\n", state.PreviousProxyAddr)
+			EnableSystemProxy(state.PreviousProxyAddr, "")
+		} else {
+			DisableSystemProxy()
+		}
+	} else {
+		DisableSystemProxy()
+	}
+	fmt.Println("    ✓ done")
+
+	fmt.Println("  [4/4] 移除开机自启...")
+	if err := uninstallAutoStart(); err != nil {
+		log.Printf("    ⚠ %v", err)
+	} else {
+		fmt.Println("    ✓ done")
+	}
+
+	clearInstallState()
+	removeInstanceInfo()
+
+	fmt.Println()
+	fmt.Println("  ✓ 全局卸载完成! 重新打开终端窗口和 IDE 使更改生效。")
+}
+
+// restoreOrClearEnvVars restores previously saved environment variables, or
+// clears ai-monitor's env vars if no previous state was saved.
+func restoreOrClearEnvVars(state *InstallState) {
+	keysToManage := []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS"}
+
+	if state != nil && len(state.PreviousEnvVars) > 0 {
+		// Restore previous values for keys that had values before install
+		restored := make(map[string]string)
+		for _, key := range keysToManage {
+			if prev, ok := state.PreviousEnvVars[key]; ok && prev != "" {
+				restored[key] = prev
+			}
+		}
+		// Also check lowercase variants
+		for _, key := range []string{"http_proxy", "https_proxy", "no_proxy"} {
+			if prev, ok := state.PreviousEnvVars[key]; ok && prev != "" {
+				restored[key] = prev
+			}
+		}
+
+		if len(restored) > 0 {
+			fmt.Println("    ℹ 恢复之前的环境变量:")
+			if err := SetEnvProxy(restored); err != nil {
+				log.Printf("    ⚠ 恢复环境变量失败: %v", err)
+			} else {
+				for k, v := range restored {
+					fmt.Printf("      %s=%s\n", k, v)
+				}
+			}
+		}
+
+		// Clear keys that had no previous value (were set by ai-monitor for the first time)
+		var toClear []string
+		for _, key := range keysToManage {
+			if _, ok := state.PreviousEnvVars[key]; !ok {
+				toClear = append(toClear, key)
+			}
+		}
+		if len(toClear) > 0 {
+			ClearEnvProxy(toClear)
+		}
+	} else {
+		ClearEnvProxy(keysToManage)
+	}
 }
 
 // resolveActualPort determines the port that IDE settings should point to.

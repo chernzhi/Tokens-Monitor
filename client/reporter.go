@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,12 +63,102 @@ type Reporter struct {
 	heartbeatOK sync.Once
 }
 
-func newHTTPClientForReporter() *http.Client {
+// resolveReportProxy determines the proxy function for the Reporter HTTP client.
+// Priority: config.report_proxy > smart detection (private=direct, otherwise upstream).
+func resolveReportProxy(cfg *Config) func(*http.Request) (*url.URL, error) {
+	directProxy := func(*http.Request) (*url.URL, error) { return nil, nil }
+
+	if cfg == nil {
+		return directProxy
+	}
+
+	mode := strings.TrimSpace(strings.ToLower(cfg.ReportProxy))
+
+	switch mode {
+	case "direct":
+		log.Println("[reporter] 上报路由: 直连 (report_proxy=direct)")
+		return directProxy
+
+	case "upstream":
+		upstream := strings.TrimSpace(cfg.UpstreamProxy)
+		if upstream == "" {
+			upstream = detectUpstreamProxy(cfg)
+		}
+		if upstream != "" {
+			if u, err := url.Parse(upstream); err == nil {
+				log.Printf("[reporter] 上报路由: 走上游代理 %s (report_proxy=upstream)", u.Redacted())
+				return http.ProxyURL(u)
+			}
+		}
+		log.Println("[reporter] 上报路由: report_proxy=upstream 但未找到上游代理，回退直连")
+		return directProxy
+
+	case "", "auto":
+		if isPrivateServerURL(cfg.ServerURL) {
+			log.Println("[reporter] 上报路由: 直连 (server_url 为内网地址)")
+			return directProxy
+		}
+		upstream := strings.TrimSpace(cfg.UpstreamProxy)
+		if upstream == "" {
+			upstream = detectUpstreamProxy(cfg)
+		}
+		if upstream != "" {
+			if u, err := url.Parse(upstream); err == nil {
+				log.Printf("[reporter] 上报路由: 走上游代理 %s (server_url 为外网，自动检测)", u.Redacted())
+				return http.ProxyURL(u)
+			}
+		}
+		log.Println("[reporter] 上报路由: 直连 (未检测到上游代理)")
+		return directProxy
+
+	default:
+		if u, err := url.Parse(mode); err == nil && u.Host != "" {
+			log.Printf("[reporter] 上报路由: 走指定代理 %s", u.Redacted())
+			return http.ProxyURL(u)
+		}
+		log.Printf("[reporter] 上报路由: report_proxy=%q 无法解析，回退直连", mode)
+		return directProxy
+	}
+}
+
+// isPrivateServerURL checks if the server URL points to a private/intranet address.
+func isPrivateServerURL(serverURL string) bool {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	privateRanges := []struct{ start, end net.IP }{
+		{net.ParseIP("10.0.0.0"), net.ParseIP("10.255.255.255")},
+		{net.ParseIP("172.16.0.0"), net.ParseIP("172.31.255.255")},
+		{net.ParseIP("192.168.0.0"), net.ParseIP("192.168.255.255")},
+		{net.ParseIP("127.0.0.0"), net.ParseIP("127.255.255.255")},
+		{net.ParseIP("169.254.0.0"), net.ParseIP("169.254.255.255")},
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	for _, r := range privateRanges {
+		if bytes.Compare(ip4, r.start.To4()) >= 0 && bytes.Compare(ip4, r.end.To4()) <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func newHTTPClientForReporter(cfg *Config) *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
-			// 生产环境：连接池与超时，避免长时间运行后连接僵死
+			Proxy:                 resolveReportProxy(cfg),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
@@ -83,7 +175,7 @@ func NewReporter(cfg *Config) *Reporter {
 	return &Reporter{
 		cfg:      cfg,
 		clientID: clientID,
-		client:   newHTTPClientForReporter(),
+		client:   newHTTPClientForReporter(cfg),
 	}
 }
 

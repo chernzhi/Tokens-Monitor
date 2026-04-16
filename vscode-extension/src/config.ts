@@ -8,10 +8,6 @@ export interface MonitorConfig {
     userName: string;
     department: string;
     copilotOrg: string;
-    transparentMode: boolean;
-    proxyPort: number;
-    gatewayPort: number;
-    upstreamProxy: string;
     apiKey: string;
 }
 
@@ -23,6 +19,11 @@ interface IdentityInfo {
 }
 
 let _identityCache: IdentityInfo | null | undefined; // undefined = not yet loaded
+
+/** Reset the identity cache (for testing only). */
+export function _resetIdentityCache(): void {
+    _identityCache = undefined;
+}
 
 export const DEFAULT_SERVER_URL = 'https://otw.tech:59889';
 
@@ -40,13 +41,6 @@ function loadIdentity(): IdentityInfo | null {
     return _identityCache;
 }
 
-function getPort(value: number | undefined, fallback: number): number {
-    if (typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65535) {
-        return value;
-    }
-    return fallback;
-}
-
 export function getConfig(): MonitorConfig {
     const cfg = vscode.workspace.getConfiguration('aiTokenMonitor');
     const identity = loadIdentity();
@@ -56,10 +50,6 @@ export function getConfig(): MonitorConfig {
         userName: cfg.get<string>('userName', '') || identity?.user_name || '',
         department: cfg.get<string>('department', '') || identity?.department || '',
         copilotOrg: cfg.get<string>('copilotOrg', ''),
-        transparentMode: cfg.get<boolean>('transparentMode', false),
-        proxyPort: getPort(cfg.get<number>('proxyPort', 18090), 18090),
-        gatewayPort: getPort(cfg.get<number>('gatewayPort', 18091), 18091),
-        upstreamProxy: cfg.get<string>('upstreamProxy', '').trim(),
         apiKey: cfg.get<string>('apiKey', '') || identity?.api_key || '',
     };
 }

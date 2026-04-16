@@ -1,13 +1,7 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
-import { getWindowsCertificateTrustStatus, WindowsCertificateTrustStatus } from './certificateTrust';
 import { AUTH_SESSION_SECRET_KEY, authSessionMatchesConfig, parseAuthSession, serializeAuthSession } from './authSession';
-import { TokenTracker, TrackerRuntimeStatus } from './tokenTracker';
+import { TokenTracker } from './tokenTracker';
 import { MonitorConfig, getConfig } from './config';
-import { LocalProxyStatusSnapshot, ProxyEnvironmentDiagnosis, ProxyManager } from './proxyManager';
-
-const PROXY_RELOAD_PENDING_KEY = 'aiTokenMonitor.proxyReloadPending';
 
 interface IdentityStatusData {
     status: string;
@@ -17,13 +11,6 @@ interface IdentityStatusData {
     known_apps?: string[];
 }
 
-interface ProxyStatusData {
-    proxyRunning: boolean;
-    reloadRequired: boolean;
-    blocked: boolean;
-    blockedReason?: string;
-}
-
 interface UpdateCheckResultData {
     status: string;
     message: string;
@@ -31,26 +18,10 @@ interface UpdateCheckResultData {
     currentVersion?: string;
 }
 
-interface LinkCheckItemData {
-    id: string;
-    title: string;
-    status: 'ok' | 'warning' | 'error' | 'neutral' | 'checking';
-    summary: string;
-    detail?: string;
-}
-
-interface LinkCheckData {
-    overallStatus: 'ok' | 'warning' | 'error' | 'neutral' | 'checking';
-    checkedAt?: string;
-    items: LinkCheckItemData[];
-}
-
 export class DashboardProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
     private refreshTimer?: ReturnType<typeof setInterval>;
     private config: MonitorConfig;
-    private lastLinkCheck?: { fetchedAt: number; data: LinkCheckData };
-    private linkCheckInFlight?: Promise<LinkCheckData>;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -58,7 +29,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         initialConfig: MonitorConfig,
         private readonly globalState: vscode.Memento,
         private readonly secrets: vscode.SecretStorage,
-        private readonly proxyManager?: ProxyManager,
+        _proxyManager?: unknown,
         private readonly extensionVersion: string = '0.0.0',
     ) {
         this.config = initialConfig;
@@ -81,13 +52,10 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this.getHtml(webviewView.webview);
         void this.refreshDashboard();
-        void this.notifyProxyStatus();
 
-        // Update every 10 seconds
         this.refreshTimer = setInterval(() => {
             if (this.view?.visible) {
                 void this.refreshDashboard();
-                void this.notifyProxyStatus();
             }
         }, 10_000);
 
@@ -108,10 +76,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 }
             } else if (msg.type === 'newChat') {
                 vscode.commands.executeCommand('tokenMonitor.newChat');
-            } else if (msg.type === 'startProxy') {
-                await vscode.commands.executeCommand('tokenMonitor.startProxy');
-            } else if (msg.type === 'stopProxy') {
-                await vscode.commands.executeCommand('tokenMonitor.stopProxy');
             } else if (msg.type === 'reloadWindow') {
                 await vscode.commands.executeCommand('workbench.action.reloadWindow');
             } else if (msg.type === 'changeDays') {
@@ -134,23 +98,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                         data: { checking: false, result: { status: 'error', message: `检查更新失败：${message}` } }
                     });
                 }
-            } else if (msg.type === 'runLinkCheck') {
-                this.postLinkCheck({
-                    overallStatus: 'checking',
-                    items: [
-                        { id: 'identity', title: '身份校验', status: 'checking', summary: '正在检查当前工号与姓名是否可写入服务器…' },
-                        { id: 'local-proxy', title: '本地代理', status: 'checking', summary: '正在检查本地代理与当前路由…' },
-                        { id: 'environment', title: '代理环境', status: 'checking', summary: '正在检查当前代理环境与接管策略…' },
-                        { id: 'certificate', title: '证书安装', status: 'checking', summary: '正在检查当前用户证书信任状态…' },
-                        { id: 'upstream', title: '上游代理', status: 'checking', summary: '正在检查外网转发链路…' },
-                        { id: 'reporting', title: '最近上报', status: 'checking', summary: '正在检查最近上报与服务端连通性…' },
-                    ],
-                });
-                await this.refreshLinkCheck(true);
             } else if (msg.type === 'authLogin') {
                 await this.handleLogin(msg.data);
-            } else if (msg.type === 'authRegister') {
-                await this.handleRegister(msg.data);
             } else if (msg.type === 'authSetPassword') {
                 await this.handleSetPassword(msg.data);
             } else if (msg.type === 'authLogout') {
@@ -169,7 +118,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             totalReported: this.tracker.totalReported,
             totalFailed: this.tracker.totalFailed,
             breakdown,
-            proxyRunning: false, // will be updated async
             selectedDays: this.selectedDays,
         };
     }
@@ -213,15 +161,13 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             userId: this.config.userId,
             userName: this.config.userName,
             department: this.config.department,
-            upstreamProxy: this.config.upstreamProxy,
             copilotOrg: this.config.copilotOrg,
-            // copilotPat is stored in SecretStorage and never sent to the webview
         };
     }
 
     private async saveConfig(data: Record<string, unknown>): Promise<void> {
         const cfg = vscode.workspace.getConfiguration('aiTokenMonitor');
-        const stringKeys = ['serverUrl', 'userId', 'userName', 'department', 'upstreamProxy', 'copilotOrg'] as const;
+        const stringKeys = ['serverUrl', 'userId', 'userName', 'department', 'copilotOrg'] as const;
         for (const key of stringKeys) {
             if (key in data) {
                 await cfg.update(key, String(data[key] ?? ''), vscode.ConfigurationTarget.Global);
@@ -272,7 +218,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
     }
 
     private async handleLogin(data: { employeeId: string; password: string }): Promise<void> {
-        const result = await this.authFetch('login', { employee_id: data.employeeId, password: data.password });
+        const result = await this.authFetch('login', { email: data.employeeId, password: data.password });
         if (result.ok) {
             await this.applyAuthResult(result.data);
             this.view?.webview.postMessage({ type: 'authSuccess', data: { ...result.data, mode: 'login' } });
@@ -280,25 +226,13 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         } else if (result.status === 403 && result.data?.detail === 'password_not_set') {
             this.view?.webview.postMessage({ type: 'authNeedSetPassword', data: { employeeId: data.employeeId } });
         } else {
-            const msg = result.status === 401 ? '工号或密码错误' : (result.data?.detail ?? '登录失败');
-            this.view?.webview.postMessage({ type: 'authError', data: { message: msg } });
-        }
-    }
-
-    private async handleRegister(data: { name: string; department: string; password: string }): Promise<void> {
-        const result = await this.authFetch('register', { name: data.name, department: data.department, password: data.password });
-        if (result.ok) {
-            await this.applyAuthResult(result.data);
-            this.view?.webview.postMessage({ type: 'authSuccess', data: { ...result.data, mode: 'register' } });
-            await this.refreshDashboard(true);
-        } else {
-            const msg = result.data?.detail ?? '注册失败';
+            const msg = result.status === 401 ? '邮箱或密码错误' : (result.data?.detail ?? '登录失败');
             this.view?.webview.postMessage({ type: 'authError', data: { message: msg } });
         }
     }
 
     private async handleSetPassword(data: { employeeId: string; name: string; password: string }): Promise<void> {
-        const result = await this.authFetch('set-password', { employee_id: data.employeeId, name: data.name, password: data.password });
+        const result = await this.authFetch('set-password', { email: data.employeeId, name: data.name, password: data.password });
         if (result.ok) {
             await this.applyAuthResult(result.data);
             this.view?.webview.postMessage({ type: 'authSuccess', data: { ...result.data, mode: 'setPassword' } });
@@ -349,19 +283,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private postLinkCheck(data: LinkCheckData): void {
-        this.view?.webview.postMessage({
-            type: 'linkCheck',
-            data,
-        });
-    }
-
-
-    private normalizeValue(value: string | undefined | null): string {
-        return (value || '').trim().replace(/\/+$/, '');
-    }
-
-
     private getDefaultIdentityStatus(): IdentityStatusData {
         const userId = this.config.userId.trim();
         const userName = this.config.userName.trim();
@@ -369,27 +290,27 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         if (!userId && !userName) {
             return {
                 status: 'incomplete',
-                message: '填写工号和姓名后会自动检查是否与服务器已有身份冲突。同一工号可在 VS Code、Cursor、PowerShell 等多个应用共用。',
+                message: '填写邮箱和姓名后会自动检查是否与服务器已有身份冲突。同一邮箱可在 VS Code、Cursor、PowerShell 等多个应用共用。',
             };
         }
 
         if (!userId || !userName) {
             return {
                 status: 'incomplete',
-                message: '请同时填写工号和姓名。系统会自动检查重复编号；同一工号可以在多个应用共用。',
+                message: '请同时填写邮箱和姓名。系统会自动检查重复；同一邮箱可以在多个应用共用。',
             };
         }
 
         if (!this.config.serverUrl.trim()) {
             return {
                 status: 'unavailable',
-                message: '请先配置上报地址，之后面板会自动检查工号是否已被其他姓名占用。',
+                message: '请先配置上报地址，之后面板会自动检查邮箱是否已被其他姓名占用。',
             };
         }
 
         return {
             status: 'checking',
-            message: '正在检查当前工号是否已存在。同一工号在多个应用共用属于正常情况。',
+            message: '正在检查当前邮箱是否已存在。同一邮箱在多个应用共用属于正常情况。',
         };
     }
 
@@ -432,181 +353,22 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 return {
                     status: 'unavailable',
                     message: response.status === 404
-                        ? '服务器暂未部署身份检查接口，暂时无法自动识别重复工号。'
-                        : '服务器暂时无法完成工号校验，请稍后重试。',
+                        ? '服务器暂未部署身份检查接口，暂时无法自动识别重复邮箱。'
+                        : '服务器暂时无法完成邮箱校验，请稍后重试。',
                 };
             }
             return await response.json() as IdentityStatusData;
         } catch {
             return {
                 status: 'unavailable',
-                message: '无法连接上报服务器或校验超时，暂时不能检查工号是否重复。',
+                message: '无法连接上报服务器或校验超时，暂时不能检查邮箱是否重复。',
             };
         }
     }
 
-    public async notifyProxyStatus(): Promise<void> {
-        const running = this.proxyManager ? await this.proxyManager.isProxyAvailable() : false;
-        const diagnosis = this.proxyManager ? await this.proxyManager.getEnvironmentDiagnosis() : null;
-        const reloadRequired = this.globalState.get<boolean>(PROXY_RELOAD_PENDING_KEY, false);
-        const blocked = Boolean(this.config.transparentMode && diagnosis && !diagnosis.allowTakeover);
-        const blockedReason = blocked && diagnosis
-            ? [diagnosis.summary, diagnosis.recommendedAction || diagnosis.detail].filter(Boolean).join(' ')
-            : undefined;
-        this.view?.webview.postMessage({
-            type: 'proxyStatus',
-            data: {
-                proxyRunning: running,
-                reloadRequired,
-                blocked,
-                blockedReason,
-            } satisfies ProxyStatusData,
-        });
-    }
-
-    private async refreshLinkCheck(force = false): Promise<void> {
-        const data = await this.fetchLinkCheck(force);
-        this.postLinkCheck(data);
-    }
-
-    private async fetchLinkCheck(force = false): Promise<LinkCheckData> {
-        const cacheTtlMs = 20_000;
-        if (!force && this.lastLinkCheck && (Date.now() - this.lastLinkCheck.fetchedAt) < cacheTtlMs) {
-            return this.lastLinkCheck.data;
-        }
-        if (this.linkCheckInFlight) {
-            return this.linkCheckInFlight;
-        }
-
-        this.linkCheckInFlight = this.buildLinkCheckData()
-            .then(data => {
-                this.lastLinkCheck = { fetchedAt: Date.now(), data };
-                return data;
-            })
-            .finally(() => {
-                this.linkCheckInFlight = undefined;
-            });
-
-        return this.linkCheckInFlight;
-    }
-
-    private async buildLinkCheckData(): Promise<LinkCheckData> {
-        const [localStatus, serverHealth, diagnosis, identityStatus] = await Promise.all([
-            this.proxyManager?.getLocalStatus() ?? Promise.resolve(null),
-            this.checkServerHealth(),
-            this.proxyManager?.getEnvironmentDiagnosis() ?? Promise.resolve(this.getDefaultDiagnosis()),
-            this.fetchIdentityStatus(),
-        ]);
-        const trackerStatus = this.tracker.getRuntimeStatus();
-        const items = [
-            this.buildIdentityItem(identityStatus),
-            this.buildLocalProxyItem(localStatus, diagnosis),
-            this.buildEnvironmentItem(diagnosis),
-            this.buildCertificateItem(),
-            this.buildUpstreamItem(localStatus, diagnosis),
-            this.buildReportingItem(localStatus, trackerStatus, serverHealth, identityStatus),
-        ];
-
-        return {
-            overallStatus: this.pickOverallStatus(items),
-            checkedAt: new Date().toISOString(),
-            items,
-        };
-    }
-
-    private getDefaultDiagnosis(): ProxyEnvironmentDiagnosis {
-        return {
-            kind: 'direct',
-            level: 'neutral',
-            allowTakeover: true,
-            summary: '当前未检测到需要特殊处理的代理环境。',
-            detail: '如果机器依赖公司代理或桌面代理，请先配置明确的上游代理。',
-            detectedDesktopProcesses: [],
-            detectedTunAdapters: [],
-            checkedAt: new Date().toISOString(),
-        };
-    }
-
-    private async checkServerHealth(): Promise<{ ok: boolean; detail: string }> {
-        if (!this.config.serverUrl.trim()) {
-            return { ok: false, detail: '未配置上报地址' };
-        }
-        try {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 5000);
-            const response = await fetch(`${this.config.serverUrl}/health`, { signal: controller.signal });
-            clearTimeout(timer);
-            if (!response.ok) {
-                return { ok: false, detail: `服务端返回 ${response.status}` };
-            }
-            return { ok: true, detail: '服务端健康检查正常' };
-        } catch (error) {
-            return {
-                ok: false,
-                detail: error instanceof Error ? error.message : '服务端不可达',
-            };
-        }
-    }
-
-    private buildLocalProxyItem(localStatus: LocalProxyStatusSnapshot | null, diagnosis: ProxyEnvironmentDiagnosis): LinkCheckItemData {
-        const reloadRequired = this.globalState.get<boolean>(PROXY_RELOAD_PENDING_KEY, false);
-        const recentLogs = this.proxyManager?.getRecentOutputLines(3) ?? [];
-        if (!this.config.transparentMode) {
-            return {
-                id: 'local-proxy',
-                title: '本地代理',
-                status: 'neutral',
-                summary: '当前未启用监控代理；只有启用后，Copilot / AI 请求才会经过本地监控链路。',
-                detail: '如需开始采集，点击上方“启动”即可。',
-            };
-        }
-        if (!diagnosis.allowTakeover) {
-            return {
-                id: 'local-proxy',
-                title: '本地代理',
-                status: 'warning',
-                summary: '当前已启用监控代理，但为了保护现有网络环境，本次没有覆盖 VS Code 代理设置。',
-                detail: [diagnosis.summary, diagnosis.recommendedAction || diagnosis.detail].filter(Boolean).join(' '),
-            };
-        }
-        if (!localStatus || localStatus.status !== 'running') {
-            return {
-                id: 'local-proxy',
-                title: '本地代理',
-                status: 'error',
-                summary: '监控代理已启用，但本地 ai-monitor 当前不可用。',
-                detail: recentLogs.length > 0 ? recentLogs.join(' | ') : '请检查 Output 面板 AI Token Monitor Proxy。',
-            };
-        }
-        if (reloadRequired) {
-            return {
-                id: 'local-proxy',
-                title: '本地代理',
-                status: 'warning',
-                summary: `ai-monitor 正在端口 ${localStatus.port || this.config.proxyPort} 运行，但当前窗口仍待重载。`,
-                detail: '未重载前，现有 Copilot 连接可能还在走旧链路。',
-            };
-        }
-        return {
-            id: 'local-proxy',
-            title: '本地代理',
-            status: 'ok',
-            summary: `ai-monitor 正在端口 ${localStatus.port || this.config.proxyPort} 运行，当前窗口路由已接通。`,
-            detail: `版本 ${localStatus.version || '未知'}；本地累计已上报 ${localStatus.stats?.total_reported ?? 0} 条请求。`,
-        };
-    }
-
-    private buildEnvironmentItem(diagnosis: ProxyEnvironmentDiagnosis): LinkCheckItemData {
-        return {
-            id: 'environment',
-            title: '代理环境',
-            status: diagnosis.level,
-            summary: diagnosis.summary,
-            detail: [diagnosis.detail, diagnosis.recommendedAction].filter(Boolean).join(' '),
-        };
-    }
-
-    private buildIdentityItem(identityStatus: IdentityStatusData): LinkCheckItemData {
+    private buildIdentityItem(identityStatus: IdentityStatusData): {
+        id: string; title: string; status: string; summary: string; detail?: string;
+    } {
         const knownApps = Array.isArray(identityStatus.known_apps) && identityStatus.known_apps.length > 0
             ? `已记录应用：${identityStatus.known_apps.join('、')}`
             : '';
@@ -616,8 +378,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 id: 'identity',
                 title: '身份校验',
                 status: 'warning',
-                summary: '工号或姓名未填写完整，服务端无法稳定归属当前账号。',
-                detail: '请先填写工号和姓名，再检查是否与服务器已有身份冲突。',
+                summary: '邮箱或姓名未填写完整，服务端无法稳定归属当前账号。',
+                detail: '请先填写邮箱和姓名，再检查是否与服务器已有身份冲突。',
             };
         }
 
@@ -627,7 +389,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     id: 'identity',
                     title: '身份校验',
                     status: 'ok',
-                    summary: '当前工号与服务器记录一致，可在多个应用共用。',
+                    summary: '当前邮箱与服务器记录一致，可在多个应用共用。',
                     detail: knownApps || identityStatus.message,
                 };
             case 'new':
@@ -635,7 +397,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     id: 'identity',
                     title: '身份校验',
                     status: 'ok',
-                    summary: '服务器尚无该工号记录，首次上报时会按新用户创建。',
+                    summary: '服务器尚无该邮箱记录，首次上报时会按新用户创建。',
                     detail: identityStatus.message,
                 };
             case 'warning':
@@ -644,14 +406,14 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     title: '身份校验',
                     status: 'warning',
                     summary: identityStatus.message,
-                    detail: knownApps || '请再次确认工号和姓名，再继续观察 collect 是否成功。',
+                    detail: knownApps || '请再次确认邮箱和姓名，再继续观察 collect 是否成功。',
                 };
             case 'conflict':
                 return {
                     id: 'identity',
                     title: '身份校验',
                     status: 'error',
-                    summary: '当前工号与服务器已有姓名不一致，collect 会被服务器拒绝。',
+                    summary: '当前邮箱与服务器已有姓名不一致，collect 会被服务器拒绝。',
                     detail: knownApps ? `${identityStatus.message} ${knownApps}` : identityStatus.message,
                 };
             case 'unavailable':
@@ -680,293 +442,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private buildCertificateItem(): LinkCheckItemData {
-        const appData = process.env.APPDATA;
-        const certPath = appData ? path.join(appData, 'ai-monitor', 'ca.crt') : '';
-        const fileExists = certPath ? fs.existsSync(certPath) : false;
-
-        if (process.platform !== 'win32') {
-            return {
-                id: 'certificate',
-                title: '证书安装',
-                status: fileExists ? 'warning' : 'neutral',
-                summary: fileExists ? '本地 CA 文件已生成；非 Windows 环境需手动确认系统是否已信任。' : '当前平台未提供自动证书检查。',
-                detail: certPath || '未找到 CA 文件路径。',
-            };
-        }
-
-        const trustStatus = this.getWindowsCertificateTrustStatus(certPath, fileExists);
-        if (trustStatus.trusted === true) {
-            return {
-                id: 'certificate',
-                title: '证书安装',
-                status: 'ok',
-                summary: 'AI Monitor Local CA 已安装到当前用户信任存储。',
-                detail: trustStatus.trustSource === 'certutil'
-                    ? `${certPath}；已通过 certutil 指纹校验确认受信任。`
-                    : (fileExists ? certPath : '证书已在系统信任存储中。'),
-            };
-        }
-        if (fileExists) {
-            return {
-                id: 'certificate',
-                title: '证书安装',
-                status: 'warning',
-                summary: '本地 CA 文件存在，但当前用户信任存储里未检测到受信任证书。',
-                detail: trustStatus.detail || certPath,
-            };
-        }
-        return {
-            id: 'certificate',
-            title: '证书安装',
-            status: 'error',
-            summary: '未找到本地 CA 证书文件，HTTPS MITM 可能无法正常工作。',
-            detail: '启用监控代理时会自动尝试安装当前用户证书。',
-        };
-    }
-
-    private getWindowsCertificateTrustStatus(certPath: string, fileExists: boolean): WindowsCertificateTrustStatus {
-        return getWindowsCertificateTrustStatus(certPath, {
-            platform: process.platform,
-            fileExists: () => fileExists,
-            logger: {
-                info: message => console.info(`[dashboard] ${message}`),
-                warn: message => console.warn(`[dashboard] ${message}`),
-            },
-        });
-    }
-
-    private buildUpstreamItem(localStatus: LocalProxyStatusSnapshot | null, diagnosis: ProxyEnvironmentDiagnosis): LinkCheckItemData {
-        const configured = this.normalizeValue(this.config.upstreamProxy);
-        const upstream = this.normalizeValue(localStatus?.upstream_proxy ?? diagnosis.upstreamProxy ?? configured);
-        const sourceLabel: Record<NonNullable<ProxyEnvironmentDiagnosis['upstreamSource']>, string> = {
-            config: '扩展设置',
-            vscode: 'VS Code 代理',
-            previous: '历史 VS Code 代理',
-            system: '系统代理',
-            env: '环境变量',
-            'local-discovery': '本机自动发现',
-        };
-        if (upstream && upstream !== '(direct)') {
-            return {
-                id: 'upstream',
-                title: '上游代理',
-                status: 'ok',
-                summary: `当前外网转发会继续走上游代理：${upstream}`,
-                detail: diagnosis.upstreamSource
-                    ? `来源：${sourceLabel[diagnosis.upstreamSource]}。这能兼容已有商业桌面代理或公司代理链路。`
-                    : '这能兼容已有商业桌面代理或公司代理链路。',
-            };
-        }
-        if (diagnosis.kind === 'system-pac') {
-            return {
-                id: 'upstream',
-                title: '上游代理',
-                status: 'warning',
-                summary: '系统当前走 PAC 自动代理，扩展不会直接把 PAC 作为上游。',
-                detail: diagnosis.recommendedAction || diagnosis.detail,
-            };
-        }
-        if (diagnosis.kind === 'desktop-proxy' && diagnosis.detectedDesktopProcesses.length > 0) {
-            return {
-                id: 'upstream',
-                title: '上游代理',
-                status: diagnosis.allowTakeover ? 'neutral' : 'warning',
-                summary: diagnosis.allowTakeover
-                    ? `当前依赖桌面代理进程 ${diagnosis.detectedDesktopProcesses.join('、')} 维持外网链路。`
-                    : '当前桌面代理未暴露可复用上游，扩展已停止接管。',
-                detail: diagnosis.recommendedAction || diagnosis.detail,
-            };
-        }
-        if (localStatus?.upstream_proxy === '(direct)') {
-            return {
-                id: 'upstream',
-                title: '上游代理',
-                status: 'neutral',
-                summary: '当前外网请求为直连模式，没有额外上游代理。',
-                detail: '如果你的环境依赖桌面代理，请检查系统代理是否已开启。',
-            };
-        }
-        if (configured) {
-            return {
-                id: 'upstream',
-                title: '上游代理',
-                status: 'warning',
-                summary: `已配置上游代理 ${configured}，但本地代理尚未返回运行中的上游信息。`,
-                detail: '启动监控代理后会再次自动探测。',
-            };
-        }
-        return {
-            id: 'upstream',
-            title: '上游代理',
-            status: 'neutral',
-            summary: '暂未检测到额外上游代理配置。',
-            detail: '如果当前网络本来就是直连，这属于正常情况。',
-        };
-    }
-
-    private buildReportingItem(
-        localStatus: LocalProxyStatusSnapshot | null,
-        trackerStatus: TrackerRuntimeStatus,
-        serverHealth: { ok: boolean; detail: string },
-        identityStatus: IdentityStatusData,
-    ): LinkCheckItemData {
-        if (!this.config.serverUrl.trim() || !this.config.userId.trim() || !this.config.userName.trim()) {
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'warning',
-                summary: '上报地址或身份信息未填写完整，当前无法完成服务器侧校验。',
-                detail: '请先在基础设置里填写上报地址、工号和姓名。',
-            };
-        }
-
-        const queueInfo = `待发送 ${trackerStatus.pendingQueueLength} 条`;
-        const lastAttempt = trackerStatus.lastCollectAttemptAt
-            ? `最近尝试 ${this.formatTimestamp(trackerStatus.lastCollectAttemptAt)}`
-            : '当前会话还没有新的 collect 尝试';
-        const lastCollect = trackerStatus.lastCollectSuccessAt
-            ? `最近 collect 成功 ${this.formatTimestamp(trackerStatus.lastCollectSuccessAt)}`
-            : (localStatus?.stats?.total_reported
-                ? `本地代理累计已上报 ${localStatus.stats.total_reported} 条请求`
-                : '当前会话还没有新的 collect 成功记录');
-        const lastSync = trackerStatus.lastStatsSyncAt
-            ? `my-stats 同步 ${this.formatTimestamp(trackerStatus.lastStatsSyncAt)}`
-            : '尚未拿到最近一次 my-stats 同步时间';
-
-        if (!serverHealth.ok) {
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'error',
-                summary: `服务端检查失败：${serverHealth.detail}`,
-                detail: `${queueInfo}；${lastCollect}`,
-            };
-        }
-
-        if (identityStatus.status === 'conflict' || trackerStatus.lastCollectErrorCategory === 'identity_conflict') {
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'error',
-                summary: '服务器已拒绝当前上报，原因是工号与姓名冲突。',
-                detail: `${trackerStatus.lastCollectError || identityStatus.message}；${queueInfo}`,
-            };
-        }
-
-        if (trackerStatus.lastCollectError) {
-            if (trackerStatus.lastCollectErrorCategory === 'server_unreachable' || trackerStatus.lastCollectErrorCategory === 'timeout') {
-                return {
-                    id: 'reporting',
-                    title: '最近上报',
-                    status: 'error',
-                    summary: '本地已经产生上报请求，但服务器暂时不可达或请求超时。',
-                    detail: `${trackerStatus.lastCollectError}；${queueInfo}；${lastAttempt}`,
-                };
-            }
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: trackerStatus.pendingQueueLength > 0 ? 'error' : 'warning',
-                summary: `最近一次上报失败：${trackerStatus.lastCollectError}`,
-                detail: `${queueInfo}；${lastSync}`,
-            };
-        }
-
-        if (trackerStatus.lastStatsSyncError && !trackerStatus.lastCollectSuccessAt && trackerStatus.pendingQueueLength === 0) {
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'warning',
-                summary: '当前还没拿到服务器侧统计，暂时无法确认本账号是否已经成功写入。',
-                detail: `${trackerStatus.lastStatsSyncError}；${lastAttempt}`,
-            };
-        }
-
-        const reloadRequired = this.globalState.get<boolean>(PROXY_RELOAD_PENDING_KEY, false);
-        if (reloadRequired) {
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'warning',
-                summary: '当前窗口仍待重载，新的 Copilot / AI 请求可能还没进入监控链路。',
-                detail: `${lastCollect}；${queueInfo}`,
-            };
-        }
-
-        if (trackerStatus.pendingQueueLength > 0) {
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'warning',
-                summary: '本地已经采集到请求，但这些记录还在待发送队列里。',
-                detail: `${queueInfo}；${lastAttempt}；${lastSync}`,
-            };
-        }
-
-        const hasAnyReported = Boolean(trackerStatus.lastCollectSuccessAt || localStatus?.stats?.total_reported);
-        if (!hasAnyReported) {
-            if (this.config.transparentMode && localStatus?.status === 'running') {
-                return {
-                    id: 'reporting',
-                    title: '最近上报',
-                    status: 'warning',
-                    summary: '链路已经就绪，但当前会话还没捕获到新的 AI 请求。',
-                    detail: '请在当前窗口实际发起一次 Copilot / AI 请求，再观察 collect 是否出现。',
-                };
-            }
-            return {
-                id: 'reporting',
-                title: '最近上报',
-                status: 'neutral',
-                summary: '当前还没有新的上报记录。',
-                detail: this.config.transparentMode
-                    ? '请先发起一次新的 AI 请求，系统才会产生 collect。'
-                    : '当前未启用透明代理时，只有部分来源会产生可见上报。',
-            };
-        }
-
-        return {
-            id: 'reporting',
-            title: '最近上报',
-            status: 'ok',
-            summary: `服务端可达，${lastCollect}。`,
-            detail: `${lastSync}；${queueInfo}。`,
-        };
-    }
-
-    private formatTimestamp(value?: string): string {
-        if (!value) {
-            return '未知时间';
-        }
-        const date = new Date(value);
-        if (Number.isNaN(date.getTime())) {
-            return value;
-        }
-        return date.toLocaleTimeString('zh-CN', {
-            hour12: false,
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-        });
-    }
-
-    private pickOverallStatus(items: LinkCheckItemData[]): LinkCheckData['overallStatus'] {
-        if (items.some(item => item.status === 'error')) {
-            return 'error';
-        }
-        if (items.some(item => item.status === 'warning')) {
-            return 'warning';
-        }
-        if (items.every(item => item.status === 'ok')) {
-            return 'ok';
-        }
-        if (items.some(item => item.status === 'checking')) {
-            return 'checking';
-        }
-        return 'neutral';
-    }
-
     private async refreshDashboard(flushPending = false): Promise<void> {
         const identityStatus = await this.fetchIdentityStatus();
         if (identityStatus.status !== 'conflict') {
@@ -979,7 +454,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         console.log('[Dashboard] overview result:', overview ? `tokens=${overview.total_tokens} requests=${overview.total_requests}` : 'null');
         this.postStatsUpdate(overview);
         this.postIdentityStatus(identityStatus);
-        await this.refreshLinkCheck();
     }
 
     private esc(s: string): string {
@@ -1384,158 +858,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         gap: 14px;
         padding: 14px;
     }
-    .toolbar-main {
-        flex: 1;
-        min-width: 0;
-        display: grid;
-        grid-template-columns: minmax(0, 1fr);
-        gap: 0;
-    }
-    .toolbar-item {
-        min-width: 0;
-        padding: 12px 14px;
-        border-radius: 16px;
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        background:
-            linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.012)),
-            rgba(255, 255, 255, 0.015);
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
-    }
-    .toolbar-label {
-        font-size: 10px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.14em;
-        color: rgba(255, 255, 255, 0.46);
-    }
-    .toolbar-value {
-        margin-top: 6px;
-        font-size: 12px;
-        font-weight: 600;
-        line-height: 1.45;
-        color: var(--text-main);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    .proxy-control {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        min-width: 0;
-        font-size: 12px;
-        min-height: 88px;
-    }
-    .proxy-summary {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        min-width: 0;
-    }
-    .proxy-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: var(--error);
-        box-shadow: 0 0 6px var(--error);
-        transition: all 0.3s ease;
-    }
-    .proxy-dot.on {
-        background: var(--success);
-        box-shadow: 0 0 6px var(--success);
-    }
-    .proxy-status-text {
-        font-weight: 600;
-        color: var(--text-main);
-    }
-    .proxy-status-text.pending {
-        color: #ffb84d;
-    }
-    .proxy-dot.pending {
-        background: #ffb84d;
-        box-shadow: 0 0 8px rgba(255, 184, 77, 0.7);
-    }
-    .auth-btn {
-        padding: 8px 14px;
-        font-size: 12px;
-        font-weight: 600;
-        color: #fff;
-        background: var(--accent-strong, #FF8C57);
-        border: 1px solid transparent;
-        border-radius: 8px;
-        cursor: pointer;
-        transition: background 0.2s ease, opacity 0.2s ease;
-    }
-    .auth-btn:hover {
-        opacity: 0.88;
-    }
-    .auth-btn:disabled {
-        opacity: 0.5;
-        cursor: default;
-    }
-    .auth-btn-secondary {
-        color: var(--text-main);
-        background: rgba(255, 255, 255, 0.06);
-        border: 1px solid var(--border-strong);
-    }
-    .auth-btn-secondary:hover {
-        background: rgba(255, 255, 255, 0.1);
-    }
-    .btn-proxy {
-        min-width: 72px;
-        padding: 9px 14px;
-        font-size: 11px;
-        font-weight: 700;
-        color: var(--text-main);
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid var(--border-strong);
-        cursor: pointer;
-        border-radius: 12px;
-        transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
-        flex-shrink: 0;
-    }
-    .btn-proxy:hover {
-        transform: translateY(-1px);
-        background: rgba(255, 255, 255, 0.07);
-        border-color: rgba(255, 255, 255, 0.22);
-        box-shadow: 0 10px 16px rgba(0, 0, 0, 0.16);
-    }
-    .btn-proxy.is-active {
-        color: rgba(223, 255, 238, 0.96);
-        border-color: rgba(56, 217, 139, 0.24);
-        background: linear-gradient(135deg, rgba(56, 217, 139, 0.16), rgba(56, 217, 139, 0.08));
-        box-shadow: 0 10px 18px rgba(56, 217, 139, 0.12);
-    }
-    .btn-proxy:disabled {
-        opacity: 0.5;
-        cursor: default;
-    }
-    .proxy-hint {
-        margin-top: 7px;
-        font-size: 11px;
-        line-height: 1.5;
-        color: var(--text-sub);
-    }
-    .proxy-hint.warning {
-        color: rgba(255, 235, 204, 0.92);
-    }
-    .proxy-reload-btn {
-        margin-top: 8px;
-        padding: 0;
-        border: 0;
-        background: transparent;
-        color: var(--accent-strong);
-        font-size: 11px;
-        font-weight: 600;
-        cursor: pointer;
-    }
-    .proxy-reload-btn:hover {
-        color: #ffab7d;
-    }
-    .proxy-reload-btn.hidden {
-        display: none;
-    }
     .toolbar-actions {
         display: flex;
         flex-direction: column;
@@ -1609,6 +931,32 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         border: 2px solid rgba(255, 255, 255, 0.2);
         border-top-color: rgba(255, 255, 255, 0.92);
         animation: spin 0.75s linear infinite;
+    }
+    .auth-btn {
+        padding: 8px 14px;
+        font-size: 12px;
+        font-weight: 600;
+        color: #fff;
+        background: var(--accent-strong, #FF8C57);
+        border: 1px solid transparent;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: background 0.2s ease, opacity 0.2s ease;
+    }
+    .auth-btn:hover {
+        opacity: 0.88;
+    }
+    .auth-btn:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+    .auth-btn-secondary {
+        color: var(--text-main);
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border-strong);
+    }
+    .auth-btn-secondary:hover {
+        background: rgba(255, 255, 255, 0.1);
     }
 
     .date-range-bar {
@@ -2031,160 +1379,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         font-size: 11px;
         line-height: 1.6;
     }
-    .link-check-card {
-        display: grid;
-        gap: 12px;
-        padding: 14px;
-        border-radius: 18px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        background: rgba(255, 255, 255, 0.03);
-    }
-    .link-check-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-    }
-    .link-check-title {
-        font-size: 12px;
-        font-weight: 700;
-        color: var(--text-main);
-    }
-    .link-check-subtitle {
-        margin-top: 4px;
-        font-size: 11px;
-        line-height: 1.5;
-        color: var(--text-sub);
-    }
-    .link-check-tools {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-shrink: 0;
-    }
-    .link-check-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 9px;
-        border-radius: 999px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        background: rgba(255, 255, 255, 0.04);
-        color: var(--text-sub);
-        font-size: 10px;
-        font-weight: 700;
-        white-space: nowrap;
-    }
-    .link-check-badge::before {
-        content: '';
-        width: 6px;
-        height: 6px;
-        border-radius: 999px;
-        background: currentColor;
-        box-shadow: 0 0 8px currentColor;
-    }
-    .link-check-badge.ok {
-        color: var(--success);
-        border-color: rgba(56, 217, 139, 0.24);
-        background: rgba(56, 217, 139, 0.08);
-    }
-    .link-check-badge.warning {
-        color: #ffb84d;
-        border-color: rgba(255, 184, 77, 0.24);
-        background: rgba(255, 184, 77, 0.08);
-    }
-    .link-check-badge.error {
-        color: var(--error);
-        border-color: rgba(255, 83, 119, 0.26);
-        background: rgba(255, 83, 119, 0.1);
-    }
-    .link-check-badge.checking {
-        color: var(--accent-strong);
-        border-color: rgba(255, 91, 80, 0.26);
-        background: rgba(255, 91, 80, 0.1);
-    }
-    .link-check-badge.checking::before {
-        animation: pulseDot 1.1s ease-in-out infinite;
-    }
-    .link-check-btn {
-        padding: 8px 12px;
-        border-radius: 12px;
-        border: 1px solid var(--border-strong);
-        background: rgba(255, 255, 255, 0.04);
-        color: var(--text-main);
-        font-size: 11px;
-        font-weight: 700;
-        cursor: pointer;
-    }
-    .link-check-btn:hover {
-        background: rgba(255, 255, 255, 0.08);
-        border-color: rgba(255, 255, 255, 0.22);
-    }
-    .link-check-btn:disabled {
-        opacity: 0.6;
-        cursor: default;
-    }
-    .link-check-meta {
-        font-size: 10px;
-        color: rgba(220, 228, 240, 0.48);
-    }
-    .link-check-list {
-        display: grid;
-        gap: 10px;
-    }
-    .link-check-item {
-        display: grid;
-        gap: 5px;
-        padding: 12px 13px;
-        border-radius: 16px;
-        border: 1px solid rgba(255, 255, 255, 0.07);
-        background: rgba(255, 255, 255, 0.026);
-    }
-    .link-check-item.ok {
-        border-color: rgba(56, 217, 139, 0.18);
-        background: rgba(56, 217, 139, 0.06);
-    }
-    .link-check-item.warning {
-        border-color: rgba(255, 184, 77, 0.18);
-        background: rgba(255, 184, 77, 0.07);
-    }
-    .link-check-item.error {
-        border-color: rgba(255, 83, 119, 0.2);
-        background: rgba(255, 83, 119, 0.08);
-    }
-    .link-check-item.checking {
-        border-color: rgba(255, 91, 80, 0.16);
-        background: rgba(255, 91, 80, 0.07);
-    }
-    .link-check-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-    }
-    .link-check-item-title {
-        font-size: 11px;
-        font-weight: 700;
-        color: var(--text-main);
-    }
-    .link-check-item-status {
-        font-size: 10px;
-        font-weight: 700;
-        color: var(--text-sub);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-    }
-    .link-check-item-summary {
-        font-size: 11px;
-        line-height: 1.55;
-        color: var(--text-main);
-    }
-    .link-check-item-detail {
-        font-size: 10px;
-        line-height: 1.55;
-        color: var(--text-sub);
-        word-break: break-word;
-    }
+
     .empty-state {
         padding: 4px 0;
         color: var(--text-sub);
@@ -2253,9 +1448,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             flex-direction: column;
             align-items: stretch;
         }
-        .toolbar-main {
-            grid-template-columns: 1fr;
-        }
         .toolbar-actions {
             width: 100%;
             justify-content: stretch;
@@ -2305,7 +1497,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                         <span class="identity-pill-value" id="identityDept">${this.esc(cfgData.department || '未填写')}</span>
                     </div>
                     <div class="identity-pill${cfgData.userId ? '' : ' is-empty'}" id="identityUserIdPill">
-                        <span class="identity-pill-label">工号</span>
+                        <span class="identity-pill-label">邮箱</span>
                         <span class="identity-pill-value" id="identityUserId">${this.esc(cfgData.userId || '未填写')}</span>
                     </div>
                 </div>
@@ -2316,22 +1508,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
     <div class="content">
         <div class="toolbar glass-panel">
-            <div class="toolbar-main">
-                <div class="toolbar-item">
-                    <div class="toolbar-label">监控代理</div>
-                    <div class="proxy-control">
-                        <div>
-                            <div class="proxy-summary">
-                                <div class="proxy-dot" id="proxyDot"></div>
-                                <span class="proxy-status-text" id="proxyStatus">检测中…</span>
-                            </div>
-                            <div class="proxy-hint" id="proxyHint">启动后若收到重载提示，请立即重载窗口。</div>
-                            <button class="proxy-reload-btn hidden" id="proxyReloadBtn" type="button">立即重载窗口</button>
-                        </div>
-                        <button class="btn-proxy" id="proxyBtn" type="button">启动</button>
-                    </div>
-                </div>
-            </div>
             <div class="toolbar-actions">
                 <div class="refresh-meta" id="refreshMeta">等待同步</div>
                 <button class="btn btn-secondary refresh-btn" id="refreshBtn" type="button">刷新数据</button>
@@ -2384,7 +1560,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     <!-- 已登录状态 -->
                     <div id="authLoggedIn" class="field-span-2" style="display:${cfgData.userId ? 'block' : 'none'}">
                         <div class="identity-check-panel ok field-span-2" style="margin-bottom:8px;">
-                            <div>已登录：<strong id="authDisplayName">${this.esc(cfgData.userName)}</strong>（工号 <strong id="authDisplayId">${this.esc(cfgData.userId)}</strong>）</div>
+                            <div>已登录：<strong id="authDisplayName">${this.esc(cfgData.userName)}</strong>（<strong id="authDisplayId">${this.esc(cfgData.userId)}</strong>）</div>
                             <div style="font-size:11px;opacity:0.7;margin-top:2px;" id="authDisplayDept">${cfgData.department ? '部门：' + this.esc(cfgData.department) : ''}</div>
                         </div>
                         <button class="auth-btn auth-btn-secondary" id="authLogoutBtn" style="width:100%">退出登录</button>
@@ -2393,53 +1569,25 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     <!-- 登录表单 -->
                     <div id="authLoginForm" class="field-span-2" style="display:${cfgData.userId ? 'none' : 'block'}">
                         <div class="field">
-                            <label>工号</label>
-                            <input id="authLoginId" type="text" placeholder="输入工号" />
+                            <label>邮箱</label>
+                            <input id="authLoginId" type="text" placeholder="输入邮箱" />
                         </div>
                         <div class="field">
                             <label>密码</label>
                             <input id="authLoginPwd" type="password" placeholder="输入密码" />
                         </div>
-                        <div class="field field-span-2" style="display:flex;gap:8px;">
-                            <button class="auth-btn" id="authLoginBtn" style="flex:1">登录</button>
-                            <button class="auth-btn auth-btn-secondary" id="authShowRegister" style="flex:1">注册新账号</button>
+                        <div class="field field-span-2">
+                            <button class="auth-btn" id="authLoginBtn" style="width:100%">登录</button>
                         </div>
                         <div class="identity-check-panel subtle field-span-2" id="authLoginMsg" style="display:none">
                             <div id="authLoginMsgText"></div>
                         </div>
                     </div>
 
-                    <!-- 注册表单 -->
-                    <div id="authRegisterForm" class="field-span-2" style="display:none">
-                        <div class="field">
-                            <label>姓名</label>
-                            <input id="authRegName" type="text" placeholder="真实姓名" />
-                        </div>
-                        <div class="field">
-                            <label>部门</label>
-                            <input id="authRegDept" type="text" placeholder="例如：公共技术部" />
-                        </div>
-                        <div class="field">
-                            <label>密码</label>
-                            <input id="authRegPwd" type="password" placeholder="至少4位" />
-                        </div>
-                        <div class="field">
-                            <label>确认密码</label>
-                            <input id="authRegPwd2" type="password" placeholder="再次输入密码" />
-                        </div>
-                        <div class="field field-span-2" style="display:flex;gap:8px;">
-                            <button class="auth-btn" id="authRegBtn" style="flex:1">注册</button>
-                            <button class="auth-btn auth-btn-secondary" id="authShowLogin" style="flex:1">返回登录</button>
-                        </div>
-                        <div class="identity-check-panel subtle field-span-2" id="authRegMsg" style="display:none">
-                            <div id="authRegMsgText"></div>
-                        </div>
-                    </div>
-
                     <!-- 设置密码表单（老用户迁移） -->
                     <div id="authSetPwdForm" class="field-span-2" style="display:none">
                         <div class="identity-check-panel warning field-span-2" style="margin-bottom:8px">
-                            <div>该工号尚未设置密码，请验证姓名并设置密码。</div>
+                            <div>该账号尚未设置密码，请验证姓名并设置密码。</div>
                         </div>
                         <div class="field" style="display:none">
                             <input id="authSetPwdId" type="hidden" />
@@ -2462,7 +1610,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                     </div>
 
                     <div class="identity-check-panel subtle field-span-2" id="identityCheckPanel">
-                        <div id="identityCheckText">登录或注册后即可开始上报数据。注册后系统自动分配工号。</div>
+                        <div id="identityCheckText">请使用 ai-monitor 客户端注册的账号登录。首次使用请先运行 ai-monitor.exe 完成注册。</div>
                     </div>
                 </div>
             </div>
@@ -2470,16 +1618,12 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             <div class="section-block glass-panel">
                 <div class="section-title" id="advancedToggle" data-section="advanced">
                     <div class="section-copy">
-                        <div class="section-heading">高级设置</div>
-                        <div class="section-caption">上游代理、Copilot 组织与本地凭据管理</div>
+                        <div class="section-heading">Copilot 设置</div>
+                        <div class="section-caption">Copilot 组织与本地凭据管理</div>
                     </div>
                     <span class="arrow" id="advancedArrow">▶</span>
                 </div>
                 <div class="config-section" id="advancedSection">
-                    <div class="field field-span-2">
-                        <label>上游代理（可选）</label>
-                        <input id="cfgUpstreamProxy" type="text" data-key="upstreamProxy" value="${this.esc(cfgData.upstreamProxy)}" placeholder="例如：socks5://127.0.0.1:8089 或 http://127.0.0.1:7890" />
-                    </div>
                     <div class="field">
                         <label>Copilot 组织</label>
                         <input id="cfgCopilotOrg" type="text" data-key="copilotOrg" value="${this.esc(cfgData.copilotOrg)}" placeholder="例如：your-org" />
@@ -2489,23 +1633,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                         <input id="cfgCopilotPat" type="password" placeholder="例如：ghp_xxxx..." />
                     </div>
                     <div class="info-note field-span-2">
-                        若当前网络依赖系统代理、桌面代理或本地 SOCKS/HTTP 端口，可在这里显式填写上游代理。<br>
-                        监控数据通过本地代理采集并上报。<br>
                         PAT 仅保存在本机 SecretStorage，不会显示在面板中。
-                    </div>
-                    <div class="link-check-card field-span-2" id="linkCheckCard">
-                        <div class="link-check-head">
-                            <div>
-                                <div class="link-check-title">链路自检</div>
-                                <div class="link-check-subtitle">检查本地代理、证书安装、上游代理和最近上报是否正常。</div>
-                            </div>
-                            <div class="link-check-tools">
-                                <div class="link-check-badge checking" id="linkCheckBadge">检查中</div>
-                                <button class="link-check-btn" id="runLinkCheckBtn" type="button">立即自检</button>
-                            </div>
-                        </div>
-                        <div class="link-check-meta" id="linkCheckMeta">正在初始化自检结果…</div>
-                        <div class="link-check-list" id="linkCheckList"></div>
                     </div>
                 </div>
             </div>
@@ -2639,23 +1767,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    function toggleProxy() {
-        const btn = document.getElementById('proxyBtn');
-        const status = document.getElementById('proxyStatus');
-        if (!btn || !status) return;
-        const running = btn.classList.contains('is-active') || status.textContent.startsWith('运行中');
-        if (running) {
-            vscMsg('stopProxy');
-        } else {
-            vscMsg('startProxy');
-        }
-        btn.disabled = true;
-    }
-
-    function reloadWindow() {
-        vscode.postMessage({ type: 'reloadWindow' });
-    }
-
     function bindUiActions() {
         document.querySelectorAll('[data-section]').forEach(el => {
             if (el.dataset.boundClick === '1') return;
@@ -2674,18 +1785,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             refreshBtn.addEventListener('click', triggerManualRefresh);
         }
 
-        const proxyBtn = document.getElementById('proxyBtn');
-        if (proxyBtn && proxyBtn.dataset.boundClick !== '1') {
-            proxyBtn.dataset.boundClick = '1';
-            proxyBtn.addEventListener('click', toggleProxy);
-        }
-
-        const reloadBtn = document.getElementById('proxyReloadBtn');
-        if (reloadBtn && reloadBtn.dataset.boundClick !== '1') {
-            reloadBtn.dataset.boundClick = '1';
-            reloadBtn.addEventListener('click', reloadWindow);
-        }
-
         const checkUpdateBtn = document.getElementById('checkUpdateBtn');
         if (checkUpdateBtn && checkUpdateBtn.dataset.boundClick !== '1') {
             checkUpdateBtn.dataset.boundClick = '1';
@@ -2693,16 +1792,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 if (checkUpdateBtn.disabled) return;
                 setUpdateButtonState(true);
                 vscMsg('checkUpdate');
-            });
-        }
-
-        const runLinkCheckBtn = document.getElementById('runLinkCheckBtn');
-        if (runLinkCheckBtn && runLinkCheckBtn.dataset.boundClick !== '1') {
-            runLinkCheckBtn.dataset.boundClick = '1';
-            runLinkCheckBtn.addEventListener('click', () => {
-                if (runLinkCheckBtn.disabled) return;
-                runLinkCheckBtn.disabled = true;
-                vscMsg('runLinkCheck');
             });
         }
 
@@ -2762,7 +1851,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
         panel.className = 'identity-check-panel field-span-2';
         const status = data?.status || 'incomplete';
-        text.textContent = data?.message || '填写工号和姓名后会自动检查是否与服务器已有身份冲突。';
+        text.textContent = data?.message || '填写邮箱和姓名后会自动检查是否与服务器已有身份冲突。';
 
         if (status === 'matched' || status === 'new') {
             panel.classList.add('ok');
@@ -2777,7 +1866,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             panel.classList.add('warning');
             setIdentityInputsState('warning');
             if (hintEl && hasUserName) {
-                hintEl.textContent = '请确认工号信息';
+                hintEl.textContent = '请确认邮箱信息';
             }
             return;
         }
@@ -2786,7 +1875,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             panel.classList.add('error');
             setIdentityInputsState('error');
             if (hintEl) {
-                hintEl.textContent = '工号冲突，请修改基础设置';
+                hintEl.textContent = '邮箱冲突，请修改基础设置';
             }
             return;
         }
@@ -2810,7 +1899,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         }
         updateIdentityCheck({
             status: 'checking',
-            message: '身份信息已修改，正在自动保存并检查。若工号已存在且姓名一致，可继续在多个应用共用。'
+            message: '身份信息已修改，正在自动保存并检查。若邮箱已存在且姓名一致，可继续在多个应用共用。'
         });
     }
 
@@ -2850,7 +1939,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
     // ── Auth UI logic ──────────────────────────────
 
     function showAuthForm(formId) {
-        ['authLoginForm', 'authRegisterForm', 'authSetPwdForm', 'authLoggedIn'].forEach(id => {
+        ['authLoginForm', 'authSetPwdForm', 'authLoggedIn'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.style.display = (id === formId) ? 'block' : 'none';
         });
@@ -2877,41 +1966,11 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         authLoginBtn.addEventListener('click', () => {
             const id = document.getElementById('authLoginId')?.value?.trim();
             const pwd = document.getElementById('authLoginPwd')?.value;
-            if (!id || !pwd) { showAuthMsg('authLoginMsg', 'authLoginMsgText', '请填写工号和密码', 'warning'); return; }
+            if (!id || !pwd) { showAuthMsg('authLoginMsg', 'authLoginMsgText', '请填写邮箱和密码', 'warning'); return; }
             hideAuthMsg('authLoginMsg');
             authLoginBtn.disabled = true;
             authLoginBtn.textContent = '登录中…';
             vscode.postMessage({ type: 'authLogin', data: { employeeId: id, password: pwd } });
-        });
-    }
-
-    // Show register
-    const authShowRegister = document.getElementById('authShowRegister');
-    if (authShowRegister) {
-        authShowRegister.addEventListener('click', () => { showAuthForm('authRegisterForm'); hideAuthMsg('authRegMsg'); });
-    }
-
-    // Show login
-    const authShowLogin = document.getElementById('authShowLogin');
-    if (authShowLogin) {
-        authShowLogin.addEventListener('click', () => { showAuthForm('authLoginForm'); hideAuthMsg('authLoginMsg'); });
-    }
-
-    // Register button
-    const authRegBtn = document.getElementById('authRegBtn');
-    if (authRegBtn) {
-        authRegBtn.addEventListener('click', () => {
-            const name = document.getElementById('authRegName')?.value?.trim();
-            const dept = document.getElementById('authRegDept')?.value?.trim() || '';
-            const pwd = document.getElementById('authRegPwd')?.value;
-            const pwd2 = document.getElementById('authRegPwd2')?.value;
-            if (!name) { showAuthMsg('authRegMsg', 'authRegMsgText', '请填写姓名', 'warning'); return; }
-            if (!pwd || pwd.length < 4) { showAuthMsg('authRegMsg', 'authRegMsgText', '密码至少4位', 'warning'); return; }
-            if (pwd !== pwd2) { showAuthMsg('authRegMsg', 'authRegMsgText', '两次密码不一致', 'warning'); return; }
-            hideAuthMsg('authRegMsg');
-            authRegBtn.disabled = true;
-            authRegBtn.textContent = '注册中…';
-            vscode.postMessage({ type: 'authRegister', data: { name, department: dept, password: pwd } });
         });
     }
 
@@ -2950,61 +2009,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         t.textContent = text;
         t.classList.add('show');
         setTimeout(() => t.classList.remove('show'), 2000);
-    }
-
-    function linkCheckStatusLabel(status) {
-        switch (status) {
-            case 'ok': return '正常';
-            case 'warning': return '注意';
-            case 'error': return '异常';
-            case 'checking': return '检查中';
-            default: return '未启用';
-        }
-    }
-
-    function formatLinkCheckTime(value) {
-        if (!value) return '尚未完成自检';
-        const date = new Date(value);
-        if (Number.isNaN(date.getTime())) return value;
-        return '上次自检 ' + date.toLocaleTimeString('zh-CN', {
-            hour12: false,
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit'
-        });
-    }
-
-    function renderLinkCheck(data) {
-        const badge = document.getElementById('linkCheckBadge');
-        const meta = document.getElementById('linkCheckMeta');
-        const list = document.getElementById('linkCheckList');
-        const btn = document.getElementById('runLinkCheckBtn');
-        if (!badge || !meta || !list || !btn) return;
-
-        const overall = data?.overallStatus || 'neutral';
-        badge.className = 'link-check-badge ' + overall;
-        badge.textContent = linkCheckStatusLabel(overall);
-        meta.textContent = formatLinkCheckTime(data?.checkedAt);
-        btn.disabled = overall === 'checking';
-
-        const items = Array.isArray(data?.items) ? data.items : [];
-        list.innerHTML = items.map(item => {
-            const status = escapeHtml(item.status || 'neutral');
-            const title = escapeHtml(item.title || '');
-            const summary = escapeHtml(item.summary || '');
-            const statusLabel = escapeHtml(linkCheckStatusLabel(item.status || 'neutral'));
-            const detail = item.detail
-                ? '<div class="link-check-item-detail">' + escapeHtml(item.detail) + '</div>'
-                : '';
-            return '<div class="link-check-item ' + status + '">'
-                + '<div class="link-check-row">'
-                + '<div class="link-check-item-title">' + title + '</div>'
-                + '<div class="link-check-item-status">' + statusLabel + '</div>'
-                + '</div>'
-                + '<div class="link-check-item-summary">' + summary + '</div>'
-                + detail
-                + '</div>';
-        }).join('');
     }
 
     function updateServerAddress(url) {
@@ -3137,10 +2141,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
             if (msg.type === 'configUpdated') {
                 const cfgServerEl = document.getElementById('cfgServer');
-                const cfgUpstreamProxyEl = document.getElementById('cfgUpstreamProxy');
                 const cfgCopilotOrgEl = document.getElementById('cfgCopilotOrg');
                 if (cfgServerEl) cfgServerEl.value = msg.data.serverUrl || '';
-                if (cfgUpstreamProxyEl) cfgUpstreamProxyEl.value = msg.data.upstreamProxy || '';
                 if (cfgCopilotOrgEl) cfgCopilotOrgEl.value = msg.data.copilotOrg || '';
                 updateUserCard(msg.data || {});
                 updateServerAddress((msg.data && msg.data.serverUrl) || '');
@@ -3167,51 +2169,6 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 setUpdateButtonState(Boolean(msg.data && msg.data.checking), msg.data && msg.data.result);
             }
 
-            if (msg.type === 'proxyStatus') {
-                const status = document.getElementById('proxyStatus');
-                const btn = document.getElementById('proxyBtn');
-                const dot = document.getElementById('proxyDot');
-                const hint = document.getElementById('proxyHint');
-                const reloadBtn = document.getElementById('proxyReloadBtn');
-                const running = Boolean(msg.data.proxyRunning);
-                const reloadRequired = Boolean(msg.data.reloadRequired);
-                const blocked = Boolean(msg.data.blocked);
-                if (status) {
-                    status.textContent = blocked
-                        ? '已阻止接管'
-                        : (reloadRequired
-                            ? (running ? '运行中，待重载' : '待重载')
-                            : (running ? '运行中' : '未启动'));
-                    status.classList.toggle('pending', reloadRequired);
-                }
-                if (btn) {
-                    btn.textContent = running ? '停止' : (blocked ? '重试' : '启动');
-                    btn.disabled = false;
-                    btn.classList.toggle('is-active', running);
-                }
-                if (dot) {
-                    if (running) { dot.classList.add('on'); } else { dot.classList.remove('on'); }
-                    dot.classList.toggle('pending', reloadRequired);
-                }
-                if (hint) {
-                    hint.textContent = blocked
-                        ? (msg.data.blockedReason || '检测到当前代理环境不适合自动接管，已保持原网络链路不变。')
-                        : (reloadRequired
-                            ? '当前窗口还没有重载，Copilot / AI 请求可能仍走旧连接，所以暂时不会进入 Token 上报。'
-                            : (running
-                                ? '监控代理已运行，新的 AI 请求会通过本地监控链路上报。'
-                                : '监控代理默认关闭；启用时会自动安装当前用户证书，并尽量沿用现有系统或公司代理。'));
-                    hint.classList.toggle('warning', reloadRequired || blocked);
-                }
-                if (reloadBtn) {
-                    reloadBtn.classList.toggle('hidden', !reloadRequired);
-                }
-            }
-
-            if (msg.type === 'linkCheck') {
-                renderLinkCheck(msg.data || {});
-            }
-
             if (msg.type === 'authSuccess') {
                 const d = msg.data || {};
                 showAuthForm('authLoggedIn');
@@ -3222,19 +2179,14 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
                 if (idEl) idEl.textContent = d.employee_id || '';
                 if (deptEl) deptEl.textContent = d.department ? '部门：' + d.department : '';
                 updateUserCard({ userName: d.name || '', userId: d.employee_id || '', department: d.department || '' });
-                if (d.mode === 'register') {
-                    showToast('注册成功，工号：' + (d.employee_id || ''));
-                } else if (d.mode === 'setPassword') {
+                if (d.mode === 'setPassword') {
                     showToast('密码设置成功');
                 } else {
                     showToast('登录成功');
                 }
-                // Re-enable buttons
                 const loginBtn = document.getElementById('authLoginBtn');
-                const regBtn = document.getElementById('authRegBtn');
                 const setPwdBtn = document.getElementById('authSetPwdBtn');
                 if (loginBtn) { loginBtn.disabled = false; loginBtn.textContent = '登录'; }
-                if (regBtn) { regBtn.disabled = false; regBtn.textContent = '注册'; }
                 if (setPwdBtn) { setPwdBtn.disabled = false; setPwdBtn.textContent = '确认设置'; }
                 // 登录成功后折叠账号设置区
                 var basicSec = document.getElementById('basicSection');
@@ -3246,17 +2198,11 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
             if (msg.type === 'authError') {
                 const errMsg = (msg.data && msg.data.message) || '操作失败';
                 // Show error on whichever form is visible
-                const loginForm = document.getElementById('authLoginForm');
-                const regForm = document.getElementById('authRegisterForm');
                 const setPwdForm = document.getElementById('authSetPwdForm');
                 if (setPwdForm && setPwdForm.style.display !== 'none') {
                     showAuthMsg('authSetPwdMsg', 'authSetPwdMsgText', errMsg, 'error');
                     const btn = document.getElementById('authSetPwdBtn');
                     if (btn) { btn.disabled = false; btn.textContent = '确认设置'; }
-                } else if (regForm && regForm.style.display !== 'none') {
-                    showAuthMsg('authRegMsg', 'authRegMsgText', errMsg, 'error');
-                    const btn = document.getElementById('authRegBtn');
-                    if (btn) { btn.disabled = false; btn.textContent = '注册'; }
                 } else {
                     showAuthMsg('authLoginMsg', 'authLoginMsgText', errMsg, 'error');
                     const btn = document.getElementById('authLoginBtn');

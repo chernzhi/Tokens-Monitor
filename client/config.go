@@ -46,6 +46,12 @@ type Config struct {
 	GatewayPort int `json:"gateway_port,omitempty"`
 	// APIKey 上报数据时附加的认证 Key，对应服务端 COLLECT_API_KEY 配置。为空时不发送 X-API-Key 头。
 	APIKey string `json:"api_key,omitempty"`
+	// ExtraBypassDomains 企业管理员可添加的额外直连域名/通配，与内置 bypassDomains 合并。
+	// 适合公司内网域名（如 "*.corp.company.com"）、VPN 地址等。
+	ExtraBypassDomains []string `json:"extra_bypass_domains,omitempty"`
+	// ReportProxy 上报服务器流量使用的代理。"auto" 或空值 = 智能判断（内网直连，外网走上游代理）；
+	// "direct" = 强制直连；"upstream" = 强制走 upstream_proxy；也可填具体代理地址。
+	ReportProxy string `json:"report_proxy,omitempty"`
 }
 
 // EffectiveInstallSystemProxy 是否写入系统代理与环境变量。省略字段时默认 false，优先保持本机网络环境不变。

@@ -15,6 +15,9 @@ $DIST = Join-Path $EXT 'dist'
 $BIN = Join-Path $EXT 'bin'
 $CLIENT = Join-Path $REPO 'client'
 $CLIENT_BUILD = Join-Path $CLIENT 'build.ps1'
+$PACKAGE_JSON = Join-Path $EXT 'package.json'
+$NPM = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'npm.cmd' } else { 'npm' }
+$NPX = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'npx.cmd' } else { 'npx' }
 
 $targetSpecs = [ordered]@{
     'win' = @{
@@ -108,11 +111,41 @@ function Clear-StagedBinaries() {
     }
 }
 
+function Get-ExtensionVersion() {
+    if (-not (Test-Path -LiteralPath $PACKAGE_JSON)) {
+        throw "Extension manifest not found: $PACKAGE_JSON"
+    }
+
+    $manifest = Get-Content -LiteralPath $PACKAGE_JSON -Raw | ConvertFrom-Json
+    $version = [string]$manifest.version
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw "Missing version in $PACKAGE_JSON"
+    }
+
+    return $version.Trim()
+}
+
+function Clear-OldPackages([string]$vsceTarget, [string]$version) {
+    $patterns = @(
+        "ai-token-monitor-$vsceTarget.vsix",
+        "ai-token-monitor-$vsceTarget-*.vsix",
+        "ai-token-monitor-$version.vsix",
+        "otw-token-monitor-*.vsix"
+    )
+
+    foreach ($pattern in $patterns) {
+        Get-ChildItem -LiteralPath $DIST -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force
+        }
+    }
+}
+
 function Build-Extension($name) {
     $spec = $targetSpecs[$name]
     $vsceTarget = $spec.VsceTarget
     $sourceBinary = Resolve-ClientBinary $name
-    $outputPath = Join-Path $DIST "ai-token-monitor-$vsceTarget.vsix"
+    $version = Get-ExtensionVersion
+    $outputPath = Join-Path $DIST "ai-token-monitor-$vsceTarget-$version.vsix"
     $oldSource = $env:AI_MONITOR_SOURCE_PATH
     $oldBinaryName = $env:AI_MONITOR_BINARY_NAME
     $pushedLocation = $false
@@ -122,13 +155,14 @@ function Build-Extension($name) {
 
     try {
         New-Item -ItemType Directory -Path $BIN -Force | Out-Null
+        Clear-OldPackages $vsceTarget $version
         Clear-StagedBinaries
         $env:AI_MONITOR_SOURCE_PATH = $sourceBinary
         $env:AI_MONITOR_BINARY_NAME = $spec.PackagedBinary
 
         Push-Location $EXT
         $pushedLocation = $true
-        npx vsce package --target $vsceTarget --out $outputPath | Out-Host
+        & $NPX vsce package --target $vsceTarget --out $outputPath | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "vsce package failed for $vsceTarget" }
         Write-Host "    ✓ $outputPath" -ForegroundColor Green
         return $outputPath
@@ -160,7 +194,7 @@ New-Item -ItemType Directory -Path $DIST -Force | Out-Null
 Write-Host "  Compiling TypeScript..." -ForegroundColor Cyan
 Push-Location $EXT
 try {
-    npm run compile
+    & $NPM run compile
     if ($LASTEXITCODE -ne 0) { throw "TypeScript compilation failed" }
 } finally {
     Pop-Location
@@ -171,7 +205,7 @@ Write-Host "    ✓ out/" -ForegroundColor Green
 Write-Host "  Running tests..." -ForegroundColor Cyan
 Push-Location $EXT
 try {
-    npm test
+    & $NPM test
     if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
 } finally {
     Pop-Location

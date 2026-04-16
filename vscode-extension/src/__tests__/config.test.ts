@@ -5,7 +5,11 @@
  */
 
 import * as vscode from 'vscode';
-import { getConfig, getAppName, getNormalizedAppName } from '../config';
+import { getConfig, getAppName, getNormalizedAppName, _resetIdentityCache } from '../config';
+
+jest.mock('fs', () => ({
+    readFileSync: jest.fn(() => { throw new Error('ENOENT'); }),
+}));
 
 // Helper: cast the mocked workspace.getConfiguration to a jest.Mock
 const mockGetConfiguration = vscode.workspace.getConfiguration as jest.Mock;
@@ -13,6 +17,7 @@ const mockGetConfiguration = vscode.workspace.getConfiguration as jest.Mock;
 describe('config', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        _resetIdentityCache();
     });
 
     // -------------------------------------------------------------------
@@ -32,10 +37,7 @@ describe('config', () => {
             expect(cfg.userName).toBe('');
             expect(cfg.department).toBe('');
             expect(cfg.copilotOrg).toBe('');
-            expect(cfg.transparentMode).toBe(false);
-            expect(cfg.proxyPort).toBe(18090);
-            expect(cfg.gatewayPort).toBe(18091);
-            expect(cfg.upstreamProxy).toBe('');
+            expect(cfg.apiKey).toBe('');
         });
 
         test('strips trailing slashes from serverUrl', () => {
@@ -57,14 +59,11 @@ describe('config', () => {
                 userName: 'Alice',
                 department: 'Dev',
                 copilotOrg: 'my-org',
-                upstreamProxy: 'http://127.0.0.1:8089',
+                apiKey: 'test-key-123',
             };
 
             mockGetConfiguration.mockReturnValue({
                 get: jest.fn((key: string, defaultVal: any) => {
-                    if (key === 'transparentMode') return false;
-                    if (key === 'proxyPort') return 28090;
-                    if (key === 'gatewayPort') return 28091;
                     return key in values ? values[key] : defaultVal;
                 }),
             });
@@ -75,24 +74,7 @@ describe('config', () => {
             expect(cfg.userName).toBe('Alice');
             expect(cfg.department).toBe('Dev');
             expect(cfg.copilotOrg).toBe('my-org');
-            expect(cfg.transparentMode).toBe(false);
-            expect(cfg.proxyPort).toBe(28090);
-            expect(cfg.gatewayPort).toBe(28091);
-            expect(cfg.upstreamProxy).toBe('http://127.0.0.1:8089');
-        });
-
-        test('falls back to default ports when configured values are invalid', () => {
-            mockGetConfiguration.mockReturnValue({
-                get: jest.fn((key: string, defaultVal: any) => {
-                    if (key === 'proxyPort') return -1;
-                    if (key === 'gatewayPort') return 70000;
-                    return defaultVal;
-                }),
-            });
-
-            const cfg = getConfig();
-            expect(cfg.proxyPort).toBe(18090);
-            expect(cfg.gatewayPort).toBe(18091);
+            expect(cfg.apiKey).toBe('test-key-123');
         });
     });
 
