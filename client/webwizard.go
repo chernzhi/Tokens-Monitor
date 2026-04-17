@@ -97,6 +97,7 @@ const webWizardHTML = `<!DOCTYPE html>
       <div class="tab" onclick="switchTab('login')">登录</div>
       <div class="tab" onclick="switchTab('bind')">绑定已有账号</div>
       <div class="tab" onclick="switchTab('changepwd')">修改密码</div>
+      <div class="tab" onclick="switchTab('resetpwd')">忘记密码</div>
     </div>
 
     <!-- 注册表单 -->
@@ -138,6 +139,7 @@ const webWizardHTML = `<!DOCTYPE html>
         <input id="loginPwd" type="password" placeholder="密码" />
       </div>
       <button class="btn-primary" id="loginBtn" onclick="doLogin()">登录</button>
+      <div style="text-align:right;margin-top:8px;"><a style="color:#64748b;font-size:12px;cursor:pointer;" onclick="switchTab('resetpwd')">忘记密码？</a></div>
       <div class="auth-msg" id="loginMsg"></div>
     </div>
 
@@ -195,6 +197,33 @@ const webWizardHTML = `<!DOCTYPE html>
       <button class="btn-primary" id="cpBtn" onclick="doChangePassword()">修改密码</button>
       <div class="auth-msg" id="cpMsg"></div>
     </div>
+
+    <!-- 忘记密码表单 -->
+    <div class="auth-form" id="resetpwdForm">
+      <div class="hint" style="margin-bottom:16px;color:#94a3b8;">忘记密码？输入你的邮箱和注册时的姓名验证身份，即可设置新密码。</div>
+      <div class="row">
+        <div class="field">
+          <label>邮箱 *</label>
+          <input id="rpEmail" type="text" placeholder="注册时使用的邮箱" />
+        </div>
+        <div class="field">
+          <label>姓名 *</label>
+          <input id="rpName" type="text" placeholder="与账号对应的姓名" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>新密码 *</label>
+          <input id="rpNewPwd" type="password" placeholder="至少6位" />
+        </div>
+        <div class="field">
+          <label>确认新密码 *</label>
+          <input id="rpNewPwd2" type="password" placeholder="再次输入" />
+        </div>
+      </div>
+      <button class="btn-primary" id="rpBtn" onclick="doResetPassword()">重置密码</button>
+      <div class="auth-msg" id="rpMsg"></div>
+    </div>
   </div>
 
   <!-- ========== Step 2: 安装 ========== -->
@@ -240,11 +269,14 @@ function switchTab(tab) {
   } else if (tab === 'bind') {
     tabs[2].classList.add('active');
     document.getElementById('bindForm').classList.add('active');
-  } else {
+  } else if (tab === 'changepwd') {
     tabs[3].classList.add('active');
     document.getElementById('changepwdForm').classList.add('active');
+  } else {
+    tabs[4].classList.add('active');
+    document.getElementById('resetpwdForm').classList.add('active');
   }
-  hideMsg('regMsg'); hideMsg('loginMsg'); hideMsg('bindMsg'); hideMsg('cpMsg');
+  hideMsg('regMsg'); hideMsg('loginMsg'); hideMsg('bindMsg'); hideMsg('cpMsg'); hideMsg('rpMsg');
 }
 
 function showMsg(id, text, level) {
@@ -409,6 +441,44 @@ async function doChangePassword() {
     showMsg('cpMsg', '网络错误: ' + err.message, 'error');
   }
   btn.disabled = false; btn.textContent = '修改密码';
+}
+
+async function doResetPassword() {
+  var email = document.getElementById('rpEmail').value.trim();
+  var name = document.getElementById('rpName').value.trim();
+  var newPwd = document.getElementById('rpNewPwd').value;
+  var newPwd2 = document.getElementById('rpNewPwd2').value;
+  if (!email) { showMsg('rpMsg', '请填写邮箱', 'error'); return; }
+  if (!name) { showMsg('rpMsg', '请填写姓名', 'error'); return; }
+  if (!newPwd || newPwd.length < 6) { showMsg('rpMsg', '新密码至少6位', 'error'); return; }
+  if (newPwd !== newPwd2) { showMsg('rpMsg', '两次新密码不一致', 'error'); return; }
+  if (!getServerUrl()) { showMsg('rpMsg', '请填写上报服务器地址', 'error'); return; }
+
+  var btn = document.getElementById('rpBtn');
+  btn.disabled = true; btn.textContent = '重置中…';
+  hideMsg('rpMsg');
+
+  try {
+    var resp = await fetch(basePath + '/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_url: getServerUrl(), email: email, name: name, new_password: newPwd }),
+    });
+    var data = await resp.json();
+    if (resp.ok && data.employee_id) {
+      authUser = { employee_id: data.employee_id, name: data.name || '', department: data.department || '', auth_token: data.auth_token || '' };
+      showMsg('rpMsg', '密码重置成功！', 'success');
+      setTimeout(function(){ goToStep2(); }, 800);
+    } else {
+      var msg = data.detail || data.message || '重置失败';
+      if (resp.status === 404) msg = '未找到该邮箱对应的账号';
+      if (resp.status === 403) msg = '姓名与该账号记录不匹配';
+      showMsg('rpMsg', msg, 'error');
+    }
+  } catch(err) {
+    showMsg('rpMsg', '网络错误: ' + err.message, 'error');
+  }
+  btn.disabled = false; btn.textContent = '重置密码';
 }
 
 function goToStep2() {

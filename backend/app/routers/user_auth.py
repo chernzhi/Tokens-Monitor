@@ -48,6 +48,12 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6, max_length=128)
 
 
+class ResetPasswordRequest(BaseModel):
+    email: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1, description="姓名（用于验证身份）")
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+
 class AuthResponse(BaseModel):
     employee_id: str
     name: str
@@ -281,6 +287,26 @@ async def change_password(body: ChangePasswordRequest, db: AsyncSession = Depend
 
     if body.old_password == body.new_password:
         raise HTTPException(400, "新密码不能与旧密码相同")
+
+    user.password_hash = _hash_password(body.new_password)
+    user.auth_token = _generate_token()
+    user.auth_token_created_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    dept_name = await _get_department_name(db, user.department_id)
+    return _build_response(user, dept_name)
+
+
+@router.post("/reset-password", response_model=AuthResponse)
+async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """忘记密码：通过邮箱 + 姓名验证身份后重置密码。"""
+    user = await _find_user_by_email(db, body.email)
+
+    if not user:
+        raise HTTPException(404, "user_not_found")
+
+    if not _same_name(user.name, body.name):
+        raise HTTPException(403, "name_mismatch")
 
     user.password_hash = _hash_password(body.new_password)
     user.auth_token = _generate_token()
