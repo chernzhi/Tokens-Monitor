@@ -143,7 +143,7 @@ func main() {
 	}
 
 	if *launch || strings.TrimSpace(*launchPreset) != "" {
-		if err := runManagedProcess(cfg, certMgr, flag.Args(), *launchPreset); err != nil {
+		if err := runManagedProcess(cfg, certMgr, flag.Args(), *launchPreset, *configPath); err != nil {
 			log.Fatalf("  启动目标应用失败: %v", err)
 		}
 		return
@@ -159,7 +159,7 @@ func main() {
 	}
 	removeInstanceInfo() // clean up any stale PID file
 
-	runtime, err := startMonitorRuntime(cfg, certMgr, "")
+	runtime, err := startMonitorRuntime(cfg, certMgr, "", *configPath)
 	if err != nil {
 		log.Fatalf("  %v", err)
 	}
@@ -207,6 +207,7 @@ func main() {
 	if runtime.gatewayPort > 0 {
 		fmt.Printf("  API Gateway (无 MITM): localhost:%d  ← 工具可设 OPENAI_BASE_URL=http://localhost:%d/openai/v1\n", runtime.gatewayPort, runtime.gatewayPort)
 	}
+	fmt.Printf("  配置页面: http://localhost:%d/wizard\n", runtime.listenPort)
 	fmt.Println()
 	fmt.Println("  等待 AI 请求中... (Ctrl+C 退出)")
 	fmt.Println("  " + strings.Repeat("─", 55))

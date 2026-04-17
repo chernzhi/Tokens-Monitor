@@ -221,6 +221,7 @@ var legacyRoutes = map[string]string{
 // and backward-compatible reverse proxy for /vendor/path routes.
 type ProxyServer struct {
 	cfg              *Config
+	configPath       string    // path to config.json (for runtime wizard updates)
 	reporter         *Reporter
 	certMgr          *CertManager
 	transport        *http.Transport
@@ -231,7 +232,7 @@ type ProxyServer struct {
 	copilotDiscounts map[string]float64
 }
 
-func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager) *ProxyServer {
+func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager, configPath string) *ProxyServer {
 	// Auto-detect upstream proxy (config > system proxy > env vars)
 	upstreamAddr := detectUpstreamProxy(cfg)
 	proxyFunc := func(*http.Request) (*url.URL, error) { return nil, nil }
@@ -250,6 +251,7 @@ func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager) *Prox
 	}
 	return &ProxyServer{
 		cfg:              cfg,
+		configPath:       configPath,
 		reporter:         reporter,
 		certMgr:          certMgr,
 		upstreamProxy:    upstreamURL,
@@ -275,6 +277,12 @@ func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Status page
 	if (r.URL.Host == "" || r.URL.Host == r.Host) && (r.URL.Path == "/" || r.URL.Path == "/status") {
 		s.statusPage(w, r)
+		return
+	}
+
+	// Wizard management page (accessible while monitoring is running)
+	if (r.URL.Host == "" || r.URL.Host == r.Host) && strings.HasPrefix(r.URL.Path, "/wizard") {
+		s.serveWizard(w, r)
 		return
 	}
 
@@ -808,6 +816,7 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 		"mode":                   "transparent-mitm",
 		"pid":                    os.Getpid(),
 		"port":                   s.listenPort,
+		"wizard_url":             fmt.Sprintf("http://localhost:%d/wizard", s.listenPort),
 		"uptime_seconds":         int(time.Since(s.startedAt).Seconds()),
 		"upstream_proxy":         upstreamLabel,
 		"user":                   s.cfg.UserName,

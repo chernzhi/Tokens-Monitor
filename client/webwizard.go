@@ -225,6 +225,7 @@ const webWizardHTML = `<!DOCTYPE html>
 
 <script>
 var authUser = null;
+var basePath = '{{.BasePath}}';
 
 function switchTab(tab) {
   document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
@@ -279,7 +280,7 @@ async function doRegister() {
   hideMsg('regMsg');
 
   try {
-    var resp = await fetch('/api/auth/register', {
+    var resp = await fetch(basePath + '/api/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ server_url: getServerUrl(), name: name, email: email, department: dept, password: pwd }),
@@ -309,7 +310,7 @@ async function doLogin() {
   hideMsg('loginMsg');
 
   try {
-    var resp = await fetch('/api/auth/login', {
+    var resp = await fetch(basePath + '/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ server_url: getServerUrl(), email: id, password: pwd }),
@@ -348,7 +349,7 @@ async function doBind() {
   hideMsg('bindMsg');
 
   try {
-    var resp = await fetch('/api/auth/bind-email', {
+    var resp = await fetch(basePath + '/api/auth/bind-email', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ server_url: getServerUrl(), employee_id: eid, name: name, email: email, password: pwd }),
@@ -388,7 +389,7 @@ async function doChangePassword() {
   hideMsg('cpMsg');
 
   try {
-    var resp = await fetch('/api/auth/change-password', {
+    var resp = await fetch(basePath + '/api/auth/change-password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ server_url: getServerUrl(), email: email, old_password: oldPwd, new_password: newPwd }),
@@ -446,7 +447,7 @@ async function doInstall() {
   status.textContent = '正在安装证书、配置环境变量、注册开机自启...';
 
   try {
-    var resp = await fetch('/api/setup', {
+    var resp = await fetch(basePath + '/api/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -519,9 +520,11 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		data := struct {
 			UserName  string
 			ServerURL string
+			BasePath  string
 		}{
 			UserName:  getOSUserName(),
 			ServerURL: DefaultServerURL,
+			BasePath:  "",
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		tmpl.Execute(w, data)
@@ -774,6 +777,134 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 	server.Shutdown(ctx)
 
 	return setupErr
+}
+
+// serveWizard handles wizard requests on the running MITM proxy (path: /wizard/*).
+// Unlike runWebWizard which runs during initial setup, this is always available while monitoring.
+func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
+	// Strip /wizard prefix to get the sub-path
+	subPath := strings.TrimPrefix(r.URL.Path, "/wizard")
+	if subPath == "" || subPath == "/" {
+		// Serve the wizard HTML page
+		tmpl, err := template.New("wizard").Parse(webWizardHTML)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		data := struct {
+			UserName  string
+			ServerURL string
+			BasePath  string
+		}{
+			UserName:  s.cfg.UserName,
+			ServerURL: s.cfg.ServerURL,
+			BasePath:  "/wizard",
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		tmpl.Execute(w, data)
+		return
+	}
+
+	// Proxy auth requests to the remote server
+	if strings.HasPrefix(subPath, "/api/auth/") && r.Method == http.MethodPost {
+		var reqBody struct {
+			ServerURL string `json:"server_url"`
+		}
+		bodyBytes, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		json.Unmarshal(bodyBytes, &reqBody)
+
+		serverURL := strings.TrimRight(strings.TrimSpace(reqBody.ServerURL), "/")
+		if serverURL == "" {
+			serverURL = s.cfg.ServerURL
+		}
+
+		authPath := strings.TrimPrefix(subPath, "/api/auth/")
+		targetURL := serverURL + "/api/auth/" + authPath
+
+		client := &http.Client{Timeout: 15 * time.Second}
+		proxyReq, err := http.NewRequest("POST", targetURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"detail": "请求构建失败: " + err.Error()})
+			return
+		}
+		proxyReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(proxyReq)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"detail": "无法连接服务器: " + err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+		return
+	}
+
+	// Handle setup submission (runtime mode: only update config, no install steps)
+	if subPath == "/api/setup" && r.Method == http.MethodPost {
+		var req setupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "请求格式错误: " + err.Error()})
+			return
+		}
+
+		// Update config fields
+		if name := strings.TrimSpace(req.UserName); name != "" {
+			s.cfg.UserName = name
+		}
+		if uid := strings.TrimSpace(req.UserID); uid != "" {
+			s.cfg.UserID = uid
+		}
+		if dept := strings.TrimSpace(req.Department); dept != "" {
+			s.cfg.Department = dept
+		}
+		if surl := strings.TrimRight(strings.TrimSpace(req.ServerURL), "/"); surl != "" {
+			s.cfg.ServerURL = surl
+		}
+		if proxy := strings.TrimSpace(req.UpstreamProxy); proxy != "" {
+			s.cfg.UpstreamProxy = proxy
+		}
+		if token := strings.TrimSpace(req.AuthToken); token != "" {
+			s.cfg.AuthToken = token
+		}
+		if req.Port > 0 && req.Port <= 65535 {
+			s.cfg.Port = req.Port
+		}
+
+		// Save config.json
+		absConfigPath, _ := filepath.Abs(s.configPath)
+		data, err := json.MarshalIndent(s.cfg, "", "  ")
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "配置序列化失败: " + err.Error()})
+			return
+		}
+		if err := os.WriteFile(absConfigPath, data, 0644); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "保存配置失败: " + err.Error()})
+			return
+		}
+
+		log.Printf("[wizard] 配置已更新: %s", absConfigPath)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(setupResponse{
+			Success: true,
+			Message: "✓ 配置已更新并保存到 " + absConfigPath + "\n\n部分配置（如端口、上游代理）需重启 ai-monitor 后生效。",
+		})
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
 func openBrowser(url string) {

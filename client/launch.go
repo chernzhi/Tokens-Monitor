@@ -152,7 +152,7 @@ type monitorRuntime struct {
 	gatewayPort    int
 }
 
-func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string) (*monitorRuntime, error) {
+func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, configPath string) (*monitorRuntime, error) {
 	reporter := NewReporter(cfg)
 	reporter.sourceApp = sourceApp
 	reporterCtx, reporterCancel := context.WithCancel(context.Background())
@@ -168,7 +168,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string) (*
 		}
 	}()
 
-	proxy := NewProxyServer(cfg, reporter, certMgr)
+	proxy := NewProxyServer(cfg, reporter, certMgr, configPath)
 	ln, listenPort, err := tryListenMitmPort(cfg.Port)
 	if err != nil {
 		return nil, err
@@ -219,7 +219,7 @@ func (m *monitorRuntime) Shutdown(ctx context.Context) error {
 	return m.server.Shutdown(ctx)
 }
 
-func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetName string) error {
+func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetName string, configPath string) error {
 	commandArgs, preset, err := resolveLaunchCommand(args, presetName, exec.LookPath)
 	if err != nil {
 		return err
@@ -244,7 +244,7 @@ func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetN
 	}
 
 	sourceApp := inferSourceApp(commandArgs, preset)
-	runtime, err := startMonitorRuntime(cfg, certMgr, sourceApp)
+	runtime, err := startMonitorRuntime(cfg, certMgr, sourceApp, configPath)
 	if err != nil {
 		return err
 	}
