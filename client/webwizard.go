@@ -745,7 +745,7 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 
 		// 2. Set user-level env vars + system proxy
 		actualPort := resolveActualPort(cfg)
-		proxyAddr := fmt.Sprintf("localhost:%d", actualPort)
+		proxyAddr := fmt.Sprintf("127.0.0.1:%d", actualPort)
 		httpProxy := "http://" + proxyAddr
 		noProxy := buildNoProxyEnvWithConfig(cfg)
 		envVars := map[string]string{

@@ -16,6 +16,7 @@ from app.canonical import dashboard_tz, canonical_provider_key, source_app_displ
 from app.config import settings
 from app.database import get_db
 from app.models import Client, Department, ModelPricing, TokenUsageLog, User
+from app.user_merge import resolve_user_ids_for_personal_stats
 from app.pricing import calc_cost_usd
 from app.schemas import TokscaleSubmitRequest
 
@@ -148,6 +149,39 @@ def _same_person_name(left: str | None, right: str | None) -> bool:
     normalized_left = _normalize_person_name(left)
     normalized_right = _normalize_person_name(right)
     return bool(normalized_left and normalized_right and normalized_left == normalized_right)
+
+
+async def _resolve_existing_user_id(
+    db: AsyncSession, user_id: str, user_name: str
+) -> int | None:
+    """只读解析 token_usage_logs.user_id：按 email / employee_id 在已有 User 中匹配。
+
+    用于 my-stats / my-daily-usage 这类只读查询，避免在 _get_or_create_user 里
+    为 email 形式的 user_id 新建一个与真实用户不同 id 的僵尸账号，导致查询返回 0。
+    """
+    normalized_id = _normalize_identity_value(user_id)
+    normalized_name = _normalize_identity_value(user_name)
+    if not normalized_id:
+        return None
+
+    # 优先按 email 精确匹配活跃用户
+    result = await db.execute(
+        select(User).where(User.email == normalized_id, User.is_active == True)  # noqa: E712
+    )
+    user = result.scalar_one_or_none()
+    if user is None:
+        # 回退到 employee_id（兼容老用户用工号登录）
+        result = await db.execute(
+            select(User).where(User.employee_id == normalized_id, User.is_active == True)  # noqa: E712
+        )
+        user = result.scalar_one_or_none()
+
+    if user is None:
+        return None
+    # 防止同邮箱碰撞导致归错人：如果提供了姓名，必须与库内一致。
+    if normalized_name and not _same_person_name(user.name, normalized_name):
+        return None
+    return user.id
 
 
 
@@ -697,14 +731,34 @@ async def client_heartbeat(
 
 from app.routers.dashboard import ESTIMATE_SOURCE, _request_local_date_column, _ts_range
 
-@router.get("/clients/my-stats", response_model=MyStatsResponse, dependencies=[Depends(require_api_key_or_user_token)])
+@router.get("/clients/my-stats", response_model=MyStatsResponse)
 async def get_my_stats(
     user_id: str,
     user_name: str,
     department: str | None = None,
     days: int = Query(1, ge=1, le=365),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    auth_user: User | None = Depends(require_api_key_or_user_token),
 ):
+    # 认证用户存在时直接使用其 user.id：上报路径（/api/collect）同样会把 tokens
+    # 归到 auth_user.id，这里必须保持一致，否则会因为 user_id 字段在 User 表里
+    # 是数值工号、而客户端传的是 email，导致查询命中一个新建的空用户而返回 0。
+    if auth_user is not None:
+        merged_ids = await resolve_user_ids_for_personal_stats(db, auth_user)
+        start_ts, end_ts = _ts_range(days)
+        stmt = select(
+            func.coalesce(func.sum(TokenUsageLog.total_tokens), 0),
+            func.coalesce(func.sum(func.coalesce(TokenUsageLog.request_count, 1)), 0),
+        ).where(
+            TokenUsageLog.user_id.in_(merged_ids),
+            TokenUsageLog.request_at.between(start_ts, end_ts),
+        )
+        result = await db.execute(stmt)
+        row = result.first()
+        today_tokens = int(row[0]) if row else 0
+        today_requests = int(row[1]) if row else 0
+        return MyStatsResponse(today_tokens=today_tokens, today_requests=today_requests)
+
     normalized_user_id = _normalize_identity_value(user_id)
     normalized_user_name = _normalize_identity_value(user_name)
     normalized_department = _normalize_department_value(department)
@@ -712,11 +766,15 @@ async def get_my_stats(
     if not _has_complete_identity(normalized_user_id, normalized_user_name):
         return MyStatsResponse(today_tokens=0, today_requests=0)
 
-    try:
-        internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
-    except IdentityConflictError as exc:
-        _raise_identity_conflict(exc)
-    await db.commit()
+    # 只读解析：优先按 email/employee_id 匹配已有 User。找不到才降级走
+    # _get_or_create_user（只会在对应的用户有上报记录时才存在）。
+    internal_user_id = await _resolve_existing_user_id(db, normalized_user_id, normalized_user_name)
+    if internal_user_id is None:
+        try:
+            internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
+        except IdentityConflictError as exc:
+            _raise_identity_conflict(exc)
+        await db.commit()
     start_ts, end_ts = _ts_range(days)
     
     stmt = select(
@@ -734,7 +792,7 @@ async def get_my_stats(
     return MyStatsResponse(today_tokens=int(today_tokens), today_requests=int(today_requests))
 
 
-@router.get("/clients/my-daily-usage", response_model=MyDailyUsageResponse, dependencies=[Depends(require_api_key_or_user_token)])
+@router.get("/clients/my-daily-usage", response_model=MyDailyUsageResponse)
 async def get_my_daily_usage(
     user_id: str,
     user_name: str,
@@ -744,25 +802,34 @@ async def get_my_daily_usage(
     end_date: date | None = None,
     include_tokscale: bool = False,
     db: AsyncSession = Depends(get_db),
+    auth_user: User | None = Depends(require_api_key_or_user_token),
 ):
-    normalized_user_id = _normalize_identity_value(user_id)
-    normalized_user_name = _normalize_identity_value(user_name)
-    normalized_department = _normalize_department_value(department)
+    # 与 /api/collect 对齐：认证用户存在时合并同一邮箱下的多条 User（历史重复账号）。
+    if auth_user is not None:
+        internal_user_ids = await resolve_user_ids_for_personal_stats(db, auth_user)
+    else:
+        normalized_user_id = _normalize_identity_value(user_id)
+        normalized_user_name = _normalize_identity_value(user_name)
+        normalized_department = _normalize_department_value(department)
 
-    if not _has_complete_identity(normalized_user_id, normalized_user_name):
-        return MyDailyUsageResponse(
-            points=[],
-            total_tokens=0,
-            total_cost_usd=0.0,
-            total_cost_cny=0.0,
-            total_requests=0,
-        )
+        if not _has_complete_identity(normalized_user_id, normalized_user_name):
+            return MyDailyUsageResponse(
+                points=[],
+                total_tokens=0,
+                total_cost_usd=0.0,
+                total_cost_cny=0.0,
+                total_requests=0,
+            )
 
-    try:
-        internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
-    except IdentityConflictError as exc:
-        _raise_identity_conflict(exc)
-    await db.commit()
+        internal_user_id = await _resolve_existing_user_id(db, normalized_user_id, normalized_user_name)
+        if internal_user_id is None:
+            try:
+                internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
+            except IdentityConflictError as exc:
+                _raise_identity_conflict(exc)
+            await db.commit()
+
+        internal_user_ids = [internal_user_id]
 
     start_ts, end_ts = _ts_range(days, start_date, end_date)
     local_day = _request_local_date_column()
@@ -781,7 +848,7 @@ async def get_my_daily_usage(
             func.coalesce(func.sum(case((TokenUsageLog.source == ESTIMATE_SOURCE, request_count_expr), else_=0)), 0),
         )
         .where(
-            TokenUsageLog.user_id == internal_user_id,
+            TokenUsageLog.user_id.in_(internal_user_ids),
             TokenUsageLog.request_at.between(start_ts, end_ts),
         )
         .group_by(local_day)

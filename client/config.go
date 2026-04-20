@@ -87,7 +87,7 @@ func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("未找到配置文件 %s\n  请双击「开始使用.bat」，或在本目录执行: ai-monitor.exe --setup", path)
+			return nil, fmt.Errorf("未找到配置文件 %s\n  %s", path, userFacingSetupHint())
 		}
 		return nil, err
 	}

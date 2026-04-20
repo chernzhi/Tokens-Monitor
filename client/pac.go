@@ -52,7 +52,7 @@ func removePACFile() {
 //
 // The fallback chain is:
 //
-//	PROXY localhost:<port>; [PROXY <upstream>; ] DIRECT
+//	PROXY 127.0.0.1:<port>; [PROXY <upstream>; ] DIRECT
 //
 // When the MITM is unreachable, WinINet automatically skips to the next entry,
 // ultimately falling through to DIRECT — providing zero-latency crash recovery.
@@ -95,7 +95,9 @@ func generatePACContent(listenPort int, bypassDomains []string, upstreamProxy st
 	}
 
 	// ── Fallback chain ──
-	fallback := fmt.Sprintf("PROXY localhost:%d", listenPort)
+	// 使用 127.0.0.1 而非 localhost，避免 IPv6 栈上 localhost 先解析到 ::1
+	// 而本地 MITM 只监听 IPv4 回环导致客户端偶发失败。
+	fallback := fmt.Sprintf("PROXY 127.0.0.1:%d", listenPort)
 	if up := normalizeUpstreamForPAC(upstreamProxy); up != "" {
 		fallback += "; " + up
 	}

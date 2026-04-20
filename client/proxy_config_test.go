@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestMatchAIDomainBuiltinDevTools(t *testing.T) {
-	s := NewProxyServer(&Config{}, nil, nil)
+	s := NewProxyServer(&Config{}, nil, nil, "")
 	cases := []struct {
 		host, wantVendor string
 	}{
@@ -38,7 +38,7 @@ func TestMatchAIDomainExtraConfig(t *testing.T) {
 			{Suffix: ".corp.llm", Vendor: "corp-llm"},
 		},
 	}
-	s := NewProxyServer(cfg, nil, nil)
+	s := NewProxyServer(cfg, nil, nil, "")
 
 	v, ok := s.matchAIDomain("custom.api.example.com")
 	if !ok || v != "my-vendor" {

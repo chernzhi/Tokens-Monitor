@@ -1,9 +1,11 @@
 {
   "server_url": "https://otw.tech:59889",
   "user_name": "陈智",
-  "user_id": "10001",
+  "user_id": "chenzhi@otw.cn",
   "department": "公共技术部",
   "port": 18090,
+  "upstream_proxy": "http://127.0.0.1:8089",
   "install_system_proxy": true,
-  "install_ide_proxy": false
+  "install_ide_proxy": false,
+  "auth_token": "a36649b67e06445f246f438c4722a50cfbe969ecc3e239c37aec532cf3cfd177"
 }

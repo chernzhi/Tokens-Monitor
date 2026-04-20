@@ -40,3 +40,30 @@ func TestReporterFlushRetriesUntilOK(t *testing.T) {
 		t.Fatalf("TotalReported=%d", rp.Stats.TotalReported.Load())
 	}
 }
+
+// TestReporterFlushStopsRetryOn401 验证身份错误时不重试，避免刷屏。
+func TestReporterFlushStopsRetryOn401(t *testing.T) {
+	var attempts int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"detail":"invalid_token"}`))
+	}))
+	defer ts.Close()
+
+	cfg := &Config{
+		ServerURL: ts.URL,
+		UserName:  "t", UserID: "u", Port: 18090,
+		AuthToken: "stale-token",
+	}
+	rp := NewReporter(cfg)
+	rp.Add(UsageRecord{Vendor: "x", Model: "m", TotalTokens: 10})
+	rp.Flush()
+
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Fatalf("attempts=%d want 1 (no retry on 401)", n)
+	}
+	if rp.Stats.TotalReported.Load() != 0 {
+		t.Fatalf("TotalReported should be 0 on auth failure")
+	}
+}

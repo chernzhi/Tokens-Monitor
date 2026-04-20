@@ -57,6 +57,7 @@ func main() {
 	listLaunchPresets := flag.Bool("list-launch-presets", false, "列出可用的受管应用启动预设")
 	uninstall := flag.Bool("uninstall", false, "卸载: 移除CA证书, 清除系统代理和环境变量")
 	setup := flag.Bool("setup", false, "傻瓜式配置向导：生成 config.json 并安装证书/代理")
+	heal := flag.Bool("heal", false, "自愈：如果上次 ai-monitor 崩溃/被杀导致系统代理指向 dead 端口，还原原始网络配置")
 	configPath := flag.String("config", "config.json", "配置文件路径")
 	showVersion := flag.Bool("version", false, "显示版本号并退出")
 	flag.Parse()
@@ -84,6 +85,10 @@ func main() {
 	if *uninstall {
 		doUninstall(certMgr)
 		return
+	}
+
+	if *heal {
+		os.Exit(runHealMode(*configPath))
 	}
 
 	if *globalUninstall {
@@ -135,7 +140,7 @@ func main() {
 	if *install {
 		// Resolve actual port: reuse running instance or probe available port.
 		actualPort := resolveActualPort(cfg)
-		proxyAddr := fmt.Sprintf("localhost:%d", actualPort)
+		proxyAddr := fmt.Sprintf("127.0.0.1:%d", actualPort)
 		full := (*installFull || cfg.EffectiveInstallSystemProxy()) && !*installCertOnly
 		patchIDE := *installIDE || cfg.EffectiveInstallIDEProxy()
 		doInstall(certMgr, cfg, proxyAddr, bypass, noProxy, full, patchIDE)
@@ -167,6 +172,7 @@ func main() {
 		log.Printf("[singleton] 写入 instance.json 失败: %v", err)
 	}
 	applySessionManagedProxy(cfg, certMgr, runtime.listenPort)
+	startSelfWatchdog(runtime.listenPort)
 	if runtime.listenPort != cfg.Port {
 		log.Printf("[提示] 配置端口 %d 已被占用，已自动改用 %d（定向启动应用时请指向新端口）", cfg.Port, runtime.listenPort)
 	}
@@ -200,14 +206,13 @@ func main() {
 		len(aiDomains), len(aiWildcardDomains), eh, es)
 	fmt.Printf("  CA 证书: %s\n", certMgr.CACertPath())
 	fmt.Println()
-	fmt.Println("  说明: 默认不修改系统代理；推荐用 `--launch <程序>` 仅对子进程注入代理环境变量。")
-	fmt.Println("        若必须接管整机代理，请显式启用 install_system_proxy=true 或使用 --install-full（legacy 模式）。")
+	printMonitorModeHints()
 	fmt.Println("        经 MITM 的请求会尽量记录用量（免费额度与付费调用均尝试统计，不按计费类型过滤）；JSON 有 usage 为 [记录]，gRPC 多为 [记录·估算]。")
 	fmt.Println("  扩展: config.json 可设 extra_monitor_*；report_opaque_traffic=false 可关闭体积估算。")
 	if runtime.gatewayPort > 0 {
-		fmt.Printf("  API Gateway (无 MITM): localhost:%d  ← 工具可设 OPENAI_BASE_URL=http://localhost:%d/openai/v1\n", runtime.gatewayPort, runtime.gatewayPort)
+		fmt.Printf("  API Gateway (无 MITM): 127.0.0.1:%d  ← 工具可设 OPENAI_BASE_URL=http://127.0.0.1:%d/openai/v1\n", runtime.gatewayPort, runtime.gatewayPort)
 	}
-	fmt.Printf("  配置页面: http://localhost:%d/wizard\n", runtime.listenPort)
+	fmt.Printf("  配置页面: http://127.0.0.1:%d/wizard\n", runtime.listenPort)
 	fmt.Println()
 	fmt.Println("  等待 AI 请求中... (Ctrl+C 退出)")
 	fmt.Println("  " + strings.Repeat("─", 55))
@@ -222,38 +227,78 @@ func main() {
 	}
 
 	if err := runtime.server.Serve(runtime.listener); err != http.ErrServerClosed {
-		log.Fatalf("  服务器启动失败: %v", err)
+		// 不使用 log.Fatalf：它会直接 os.Exit(1)，绕过 restoreSessionManagedProxyOnShutdown，
+		// 导致用户级 HTTP_PROXY / 系统代理仍指向已 dead 的端口，整机网络会坏。
+		log.Printf("  服务器启动失败: %v", err)
 	}
 	restoreSessionManagedProxyOnShutdown()
 	fmt.Println("  已关闭。")
+}
+
+// resolveNodeExtraCACerts 返回本次安装应写入 NODE_EXTRA_CA_CERTS 的值。
+// 该变量只支持单一路径，若用户已经设了别的值（如公司自签 CA），
+// 直接覆盖会让 Node/Electron CLI 丢失原有信任链、外网请求失败。
+// 处理策略：
+//   - 未设置 或 已指向本程序 CA：写入本程序 CA。
+//   - 已设置为其他路径：保留原值并在终端打印警告，要求客户手动合并。
+func resolveNodeExtraCACerts(ourCAPath string, previousEnv map[string]string) string {
+	prev := ""
+	if previousEnv != nil {
+		if v, ok := previousEnv["NODE_EXTRA_CA_CERTS"]; ok {
+			prev = strings.TrimSpace(v)
+		}
+	}
+	if prev == "" {
+		prev = strings.TrimSpace(os.Getenv("NODE_EXTRA_CA_CERTS"))
+	}
+	if prev == "" || strings.EqualFold(prev, ourCAPath) {
+		return ourCAPath
+	}
+	fmt.Printf("    ⚠ 检测到已有 NODE_EXTRA_CA_CERTS=%s（保留不变）\n", prev)
+	fmt.Printf("      Node 仅支持单一路径；如需同时信任 ai-monitor CA，请手动把 %s 合并到原文件。\n", ourCAPath)
+	return prev
 }
 
 func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy string, fullSystemProxy, patchIDE bool) {
 	httpProxy := "http://" + proxyAddr
 
 	fmt.Println("  [1/4] 安装 CA 证书到用户信任存储...")
+	caInstalled := true
 	if err := certMgr.InstallCA(); err != nil {
+		caInstalled = false
 		log.Printf("    ✗ CA 证书安装失败: %v", err)
 		fmt.Printf("    手动安装: %s\n", manualCAInstallHint(certMgr.CACertPath()))
 	} else {
 		fmt.Printf("    ✓ CA 证书已安装: %s\n", certMgr.CACertPath())
 	}
 
+	// 安全门：全量代理模式要求 CA 必须安装成功，否则浏览器 / IDE 对 AI 域名
+	// 都会出现 SSL 错误，属于典型"把整机网络搞坏"的场景。此时自动降级为仅安装 CA。
+	if fullSystemProxy && !caInstalled {
+		fmt.Println()
+		fmt.Println("  ⚠ CA 证书未成功安装到用户信任存储，已自动降级为『仅 CA』模式：")
+		fmt.Println("    — 未修改系统代理 / 环境变量 / IDE 设置，本机原有网络不受影响。")
+		fmt.Printf("    — %s\n", userFacingInstallFullAfterManualCA())
+		fmt.Println("    — " + userFacingAfterCAFallbackLaunch())
+		fmt.Println()
+		return
+	}
+
 	if !fullSystemProxy {
 		fmt.Println("  [2/4] 跳过系统代理 / 环境变量 / IDE（默认，不破坏本机原有代理）")
 		fmt.Println("    — 未修改系统代理或持久环境变量，可与本机原有网络配置共存。")
-		fmt.Printf("    — 推荐用法: %s --launch <你的程序>，仅对子进程注入 HTTP(S)_PROXY 与 Base URL。\n", selfBinaryName())
+		fmt.Println(userFacingRecommendInstallProxyUsage())
 		fmt.Println("    — 若目标应用已有固定公司代理，可在 config.json 中设置 upstream_proxy 让本地 MITM 外联继续走原代理。")
 		if runtime.GOOS == "windows" {
-			fmt.Println("    — 若确需整机代理导流，可重新安装并启用 install_system_proxy=true 或执行 --install-full。")
+			fmt.Println("    — 若确需整机代理导流，可改 config 后双击「安装.bat」或「快速安装-系统代理.bat」。")
 		} else {
 			fmt.Println("    — 非 Windows 暂未实现自动整机代理与持久环境变量配置，请优先使用 --launch 模式。")
 		}
 		fmt.Println()
 		fmt.Println("  ══════════════════════════════════════════")
 		fmt.Println("  ✓ 安装完成 (仅 CA)")
-		fmt.Printf("  运行 %s 启动监控，或用 --launch 定向启动目标应用。\n", selfBinaryName())
-		fmt.Printf("  卸载: %s --uninstall\n", selfBinaryName())
+		fmt.Printf("  %s\n", userFacingRunMonitorOrLaunchHint())
+		fmt.Printf("  卸载: %s\n", userFacingUninstallHint())
 		fmt.Println("  ══════════════════════════════════════════")
 		return
 	}
@@ -300,7 +345,7 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 		"OPENAI_BASE_URL":     httpProxy + "/openai/v1",
 		"OPENAI_API_BASE":     httpProxy + "/openai/v1",
 		"ANTHROPIC_BASE_URL":  httpProxy + "/anthropic",
-		"NODE_EXTRA_CA_CERTS": certMgr.CACertPath(),
+		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
 	}
 	if err := SetEnvProxy(envVars); err != nil {
 		log.Printf("    ✗ 环境变量设置失败: %v", err)
@@ -328,7 +373,7 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 	} else {
 		if runtime.GOOS == "windows" {
 			fmt.Println("    — 已跳过（默认）。Electron/VS Code 将使用 Windows 系统代理走 MITM，避免与 IDE 内 http.proxy 重复导致网络异常。")
-			fmt.Println("      若某扩展仍不走系统代理，可在 config.json 设 \"install_ide_proxy\": true 后重新执行 --install")
+			fmt.Println("      若某扩展仍不走系统代理，" + userFacingIDEProxyReinstallHint())
 		} else {
 			fmt.Println("    — 已跳过。若需要让 VS Code / Cursor 明确走本地 MITM，可在 config.json 设 \"install_ide_proxy\": true 后重新执行 --install")
 		}
@@ -339,9 +384,9 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 	fmt.Println("  ✓ 安装完成!")
 	fmt.Println()
 	fmt.Println("  注意: 需重新打开终端窗口，环境变量才生效。")
-	fmt.Printf("  运行 %s 即可启动监控。\n", selfBinaryName())
+	fmt.Printf("  %s\n", userFacingRunMonitorHint())
 	fmt.Println("  Token 记录发往 config.json 中的 server_url（默认 otw.tech:59889）。")
-	fmt.Printf("  卸载: %s --uninstall\n", selfBinaryName())
+	fmt.Printf("  卸载: %s\n", userFacingUninstallHint())
 	fmt.Println("  ══════════════════════════════════════════")
 }
 
@@ -380,7 +425,9 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 	fmt.Println()
 
 	actualPort := resolveActualPort(cfg)
-	proxyAddr := fmt.Sprintf("localhost:%d", actualPort)
+	// 全局安装下坚持使用 127.0.0.1，避免 localhost 在 IPv6 优先解析场景下
+	// 把 HTTP_PROXY / PAC 指到 ::1 上（本程序仅监听 IPv4 回环）。
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", actualPort)
 	httpProxy := "http://" + proxyAddr
 
 	// ── Step 0: Detect existing upstream proxy BEFORE overwriting anything ──
@@ -408,11 +455,26 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 
 	// Step 1: Install CA certificate
 	fmt.Println("  [1/4] 安装 CA 证书到用户信任存储...")
+	caInstalled := true
 	if err := certMgr.InstallCA(); err != nil {
+		caInstalled = false
 		log.Printf("    ✗ CA 证书安装失败: %v", err)
 		fmt.Printf("    手动安装: %s\n", manualCAInstallHint(certMgr.CACertPath()))
 	} else {
 		fmt.Printf("    ✓ CA 证书已安装: %s\n", certMgr.CACertPath())
+	}
+
+	// 安全门：CA 未装入用户信任存储时，不能写系统代理 / PAC / 环境变量，
+	// 否则所有浏览器 / IDE / CLI 访问 AI 域名都会 SSL 握手失败，影响面大。
+	// 此时只保留 CA 文件生成 + 开机自启；其余步骤跳过，等待用户手动信任后再跑一次。
+	if !caInstalled {
+		fmt.Println()
+		fmt.Println("  ⚠ CA 证书未成功安装到用户信任存储，全局安装已自动暂停：")
+		fmt.Println("    — 未修改系统代理 / 环境变量 / PAC，本机原有网络不受影响。")
+		fmt.Printf("    — 按上面的提示手动信任 CA 后，%s 即可完成整机接管。\n", strings.TrimPrefix(userFacingGlobalInstallRetryHint(), "请"))
+		fmt.Println("    — " + userFacingAfterCAFallbackLaunch())
+		fmt.Println()
+		return
 	}
 
 	// Step 2: Set user-level environment variables
@@ -422,7 +484,7 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 		"HTTP_PROXY":          httpProxy,
 		"HTTPS_PROXY":         httpProxy,
 		"NO_PROXY":            noProxy,
-		"NODE_EXTRA_CA_CERTS": certMgr.CACertPath(),
+		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
 	}
 	if err := SetEnvProxy(envVars); err != nil {
 		log.Printf("    ✗ 环境变量设置失败: %v", err)
@@ -480,7 +542,7 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 		fmt.Println("  正在启动后台服务...")
 		if err := startBackgroundInstance(configPath); err != nil {
 			log.Printf("    ✗ 后台启动失败: %v", err)
-			fmt.Println("    请手动运行 ai-monitor.exe")
+			fmt.Println("    " + userFacingManualStartAfterGlobalInstall())
 		} else {
 			fmt.Println("    ✓ ai-monitor 已在后台运行")
 		}
@@ -505,7 +567,7 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 	fmt.Println()
 	fmt.Println("  重要: 需重新打开终端窗口和 IDE，环境变量才对新进程生效。")
 	fmt.Println("  已打开的程序不受影响，关闭后再打开即可。")
-	fmt.Printf("  卸载: %s --global-uninstall\n", selfBinaryName())
+	fmt.Printf("  卸载: %s\n", userFacingGlobalUninstallHint())
 	fmt.Println("  ══════════════════════════════════════════")
 }
 
@@ -619,14 +681,20 @@ func applySessionManagedProxy(cfg *Config, certMgr *CertManager, listenPort int)
 	if st == nil || !st.SystemProxySet {
 		return
 	}
-	proxyAddr := fmt.Sprintf("localhost:%d", listenPort)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", listenPort)
 	httpProxy := "http://" + proxyAddr
 	noProxy := buildNoProxyEnvWithConfig(cfg)
+	// 会话重维时不知道用户原始环境（install_state 里已快照），
+	// 优先用快照里的 NODE_EXTRA_CA_CERTS；否则才带上本程序 CA。
+	var prevEnv map[string]string
+	if st != nil {
+		prevEnv = st.PreviousEnvVars
+	}
 	envVars := map[string]string{
 		"HTTP_PROXY":          httpProxy,
 		"HTTPS_PROXY":         httpProxy,
 		"NO_PROXY":            noProxy,
-		"NODE_EXTRA_CA_CERTS": certMgr.CACertPath(),
+		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), prevEnv),
 	}
 
 	if st.PACFileSet {

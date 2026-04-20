@@ -42,6 +42,9 @@ copy /Y "%~dp0安装.bat" "%OUT%\" >nul
 copy /Y "%~dp0卸载.bat" "%OUT%\" >nul
 copy /Y "%~dp0重新配置.bat" "%OUT%\" >nul
 copy /Y "%~dp0快速安装-系统代理.bat" "%OUT%\" >nul
+copy /Y "%~dp0修复网络.bat" "%OUT%\" >nul
+copy /Y "%~dp0全局安装.bat" "%OUT%\" >nul
+copy /Y "%~dp0全局卸载.bat" "%OUT%\" >nul
 copy /Y "%~dp0config.example.json" "%OUT%\" >nul
 copy /Y "%~dp0部署说明.txt" "%OUT%\" >nul
 copy /Y "%~dp0使用说明.md" "%OUT%\" >nul

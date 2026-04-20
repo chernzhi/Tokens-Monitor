@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.4.0] - 2026-04-18
+
+### Changed
+- 打包内置 ai-monitor v2.3.0：MITM 仅监听 127.0.0.1、CA 失败自动降级、保留已有 NODE_EXTRA_CA_CERTS、goroutine panic 保护、Windows 改代理立即广播 WinINet/WM_SETTINGCHANGE
+- 认证失败（401/403）时不再重试刷屏，并自动打开本地登录向导 http://127.0.0.1:<port>/wizard 引导员工重新登录
+
 ## [0.1.43] - 2026-04-13
 
 ### Fixed

@@ -221,7 +221,7 @@ var legacyRoutes = map[string]string{
 // and backward-compatible reverse proxy for /vendor/path routes.
 type ProxyServer struct {
 	cfg              *Config
-	configPath       string    // path to config.json (for runtime wizard updates)
+	configPath       string // path to config.json (for runtime wizard updates)
 	reporter         *Reporter
 	certMgr          *CertManager
 	transport        *http.Transport
@@ -338,11 +338,24 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	vendor, isAI := s.matchAIDomain(hostname)
 	if isAI && s.certMgr != nil {
 		log.Printf("[CONNECT] MITM → %s (%s)", hostname, vendor)
-		go s.mitmConnection(clientConn, host, hostname, vendor)
+		go safeGo("mitm "+hostname, func() { s.mitmConnection(clientConn, host, hostname, vendor) })
 	} else {
 		log.Printf("[CONNECT] tunnel → %s", hostname)
-		go s.tunnelConnection(clientConn, host)
+		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host) })
 	}
+}
+
+// safeGo runs fn with panic recovery so a single malformed request can't crash
+// the entire proxy process — which, on a user's machine with system proxy /
+// PAC pointing at us, would make every HTTPS site fall back to DIRECT and
+// leave HTTP_PROXY env vars pointing at a dead port.
+func safeGo(label string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[panic] %s: %v", label, r)
+		}
+	}()
+	fn()
 }
 
 func (s *ProxyServer) tunnelConnection(clientConn net.Conn, host string) {
@@ -521,6 +534,25 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 			r.Header.Del("Accept-Encoding")
 			endpoint := r.URL.Path
 
+			// 调试：仅截取前 4KB 用于日志；必须转发完整请求体（Copilot 等 POST 常远大于 4KB，
+			// 截断会导致上游 Content-Length 与实际 body 不一致并触发 net/http ContentLength 错误）。
+			var reqBodyDump []byte
+			if r.Body != nil {
+				fullBody, readErr := io.ReadAll(r.Body)
+				if readErr != nil {
+					log.Printf("[MITM/h2] read request body %s%s: %v", hostname, endpoint, readErr)
+					http.Error(w, readErr.Error(), http.StatusBadRequest)
+					return
+				}
+				if len(fullBody) > 4096 {
+					reqBodyDump = append([]byte(nil), fullBody[:4096]...)
+				} else {
+					reqBodyDump = fullBody
+				}
+				r.Body = io.NopCloser(bytes.NewReader(fullBody))
+				r.ContentLength = int64(len(fullBody))
+			}
+
 			resp, err := s.transport.RoundTrip(r)
 			if err != nil {
 				log.Printf("[MITM/h2] forward error %s%s: %v", hostname, endpoint, err)
@@ -532,7 +564,16 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 
 			log.Printf("[MITM/h2] %s %s%s → %d", r.Method, hostname, endpoint, resp.StatusCode)
 
-			if resp.StatusCode < 400 {
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				// 临时调试：打印 4xx 响应体片段；转发给客户端的头部必须与截断后的 body 一致。
+				peek, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+				resp.Body.Close()
+				log.Printf("[MITM/h2 debug] %s%s req=%q resp=%q", hostname, endpoint, string(reqBodyDump), string(peek))
+				resp.Body = io.NopCloser(bytes.NewReader(peek))
+				resp.ContentLength = int64(len(peek))
+				resp.Header.Del("Transfer-Encoding")
+				resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(peek)))
+			} else if resp.StatusCode < 400 {
 				var buf bytes.Buffer
 				resp.Body = &recordingBody{
 					ReadCloser: resp.Body,
@@ -551,7 +592,11 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 			}
 			w.WriteHeader(resp.StatusCode)
 			if resp.Body != nil {
-				io.Copy(w, resp.Body)
+				if isStreamingResponse(resp.Header) {
+					streamCopy(w, resp.Body)
+				} else {
+					io.Copy(w, resp.Body)
+				}
 			}
 		}),
 	})
@@ -588,10 +633,18 @@ func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) 
 	if isAI && resp.StatusCode < 400 {
 		var buf bytes.Buffer
 		tee := io.TeeReader(resp.Body, &buf)
-		io.Copy(w, tee)
+		if isStreamingResponse(resp.Header) {
+			streamCopy(w, tee)
+		} else {
+			io.Copy(w, tee)
+		}
 		go s.processResponseData(vendor, r.URL.Path, requestModel, sourceApp, buf.Bytes())
 	} else {
-		io.Copy(w, resp.Body)
+		if isStreamingResponse(resp.Header) {
+			streamCopy(w, resp.Body)
+		} else {
+			io.Copy(w, resp.Body)
+		}
 	}
 }
 
@@ -705,6 +758,58 @@ func shouldInjectOpenAIStreamOptions(r *http.Request, reqData map[string]interfa
 	return false
 }
 
+// patchGitHubCopilotClaudeMessages 修正 Copilot 网关 /v1/messages 请求体：
+// - 网关会拒绝 enabled、以及 adaptive 下的 budget_tokens 等冗余字段；
+// - 但若 body 含 context_management…clear_thinking_20251015，又要求 thinking.type 为 enabled 或 adaptive。
+// 因此统一改为仅含 {"type":"adaptive"} 的最小 thinking；若仅有 clear_thinking 而无 thinking 则注入该对象。
+func patchGitHubCopilotClaudeMessages(r *http.Request, reqData map[string]interface{}) bool {
+	host := strings.ToLower(r.URL.Hostname())
+	path := strings.ToLower(r.URL.Path)
+	if !strings.Contains(host, "githubcopilot.com") {
+		return false
+	}
+	if !strings.Contains(path, "/v1/messages") {
+		return false
+	}
+
+	need := false
+	if _, ok := reqData["thinking"]; ok {
+		need = true
+	}
+	if !need && copilotHasClearThinkingStrategy(reqData) {
+		need = true
+	}
+	if !need {
+		return false
+	}
+
+	reqData["thinking"] = map[string]interface{}{
+		"type": "adaptive",
+	}
+	return true
+}
+
+func copilotHasClearThinkingStrategy(reqData map[string]interface{}) bool {
+	cm, ok := reqData["context_management"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	edits, ok := cm["edits"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, e := range edits {
+		edit, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := edit["type"].(string); t == "clear_thinking_20251015" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *ProxyServer) processRequestBody(r *http.Request) string {
 	if r.Body == nil || r.ContentLength == 0 {
 		return ""
@@ -725,6 +830,12 @@ func (s *ProxyServer) processRequestBody(r *http.Request) string {
 	model, _ := reqData["model"].(string)
 	if model == "" {
 		model = deepFindModel(reqData)
+	}
+
+	if patchGitHubCopilotClaudeMessages(r, reqData) {
+		if modified, err := json.Marshal(reqData); err == nil {
+			bodyBytes = modified
+		}
 	}
 
 	// 仅对 OpenAI Chat Completions 类 API 注入 stream_options（含 include_usage）。
@@ -816,7 +927,7 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 		"mode":                   "transparent-mitm",
 		"pid":                    os.Getpid(),
 		"port":                   s.listenPort,
-		"wizard_url":             fmt.Sprintf("http://localhost:%d/wizard", s.listenPort),
+		"wizard_url":             fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
 		"uptime_seconds":         int(time.Since(s.startedAt).Seconds()),
 		"upstream_proxy":         upstreamLabel,
 		"user":                   s.cfg.UserName,
@@ -835,15 +946,34 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // recordingBody wraps an io.ReadCloser, recording all bytes read.
+// 为防止超长流式响应（如 Claude Opus 的 reasoning）撑爆内存，
+// buf 设置上限；超出后只保留尾部，仍能从最后一段提取 usage 信息。
+const recordingBodyMaxBytes = 4 * 1024 * 1024 // 4MB
+
 type recordingBody struct {
 	io.ReadCloser
 	buf     *bytes.Buffer
 	onClose func([]byte)
+	dropped bool
 }
 
 func (r *recordingBody) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if n > 0 {
+		if r.buf.Len()+n > recordingBodyMaxBytes {
+			// 只保留尾段：丢弃 buf 头部，腾出空间。usage 通常在最后一帧。
+			over := r.buf.Len() + n - recordingBodyMaxBytes
+			if over >= r.buf.Len() {
+				r.buf.Reset()
+			} else {
+				keep := r.buf.Bytes()[over:]
+				cp := make([]byte, len(keep))
+				copy(cp, keep)
+				r.buf.Reset()
+				r.buf.Write(cp)
+			}
+			r.dropped = true
+		}
 		r.buf.Write(p[:n])
 	}
 	return n, err
@@ -854,7 +984,42 @@ func (r *recordingBody) Close() error {
 	if r.onClose != nil {
 		data := make([]byte, r.buf.Len())
 		copy(data, r.buf.Bytes())
-		go r.onClose(data)
+		go safeGo("recordingBody.onClose", func() { r.onClose(data) })
 	}
 	return err
+}
+
+// streamCopy 将 src 拷到 dst，适用于 SSE / chunked 等需要实时下发的响应。
+// 每读到一个 chunk 立刻 Flush，否则 Copilot/Claude 的流式输出会被缓冲到连接关闭
+// 才统一下发，表现为「回复为空 / 永远转圈」。
+func streamCopy(dst http.ResponseWriter, src io.Reader) {
+	flusher, _ := dst.(http.Flusher)
+	buf := make([]byte, 16*1024)
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
+// isStreamingResponse 判断响应是否属于需要即时下发的类型。
+func isStreamingResponse(h http.Header) bool {
+	ct := h.Get("Content-Type")
+	if strings.Contains(ct, "text/event-stream") {
+		return true
+	}
+	// chunked 且不是二进制/json整体响应：也采取实时下发。
+	if h.Get("Transfer-Encoding") == "chunked" || h.Get("Content-Length") == "" {
+		return true
+	}
+	return false
 }

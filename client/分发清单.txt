@@ -20,6 +20,9 @@ AI Token 监控 — client 目录文件说明（开发 vs 发给用户）
   卸载.bat                卸载证书与代理
   重新配置.bat            改配置向导
   快速安装-系统代理.bat   高级：强制写系统代理
+  修复网络.bat            异常退出后还原代理（原 --heal）
+  全局安装.bat            一键全局接管（原 --global-install）
+  全局卸载.bat            移除全局安装（原 --global-uninstall）
 
   不要随包附带：
   - config.json（若含真实姓名、内网地址，勿外泄；让用户本地从 example 复制）

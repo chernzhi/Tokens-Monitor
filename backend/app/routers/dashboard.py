@@ -9,6 +9,7 @@ from app.canonical import dashboard_tz, provider_key_sql_case, source_app_displa
 from app.config import settings
 from app.database import get_db
 from app.models import Alert, Client, Department, ModelPricing, TokenUsageLog, User
+from app.user_merge import resolve_user_ids_from_employee_filter
 from app.schemas import (
     AlertItem,
     AlertListResponse,
@@ -92,22 +93,18 @@ async def get_overview(
     start_ts, end_ts = _ts_range(days)
     prev_start_ts = start_ts - timedelta(days=days)
 
-    # 可选：按 employee_id 过滤（扩展侧边栏用）
-    user_filter_id: int | None = None
+    # 可选：按当前身份过滤（扩展侧边栏）。支持 employee_id 或登录后的邮箱。
+    user_filter_ids: list[int] | None = None
     if employee_id:
-        user_row = await db.execute(
-            select(User.id).where(User.employee_id == employee_id.strip())
-        )
-        found_id = user_row.scalar_one_or_none()
-        if found_id is None:
-            # 用户不存在，直接返回空数据
+        resolved = await resolve_user_ids_from_employee_filter(db, employee_id)
+        if resolved is None:
             return OverviewResponse(
                 total_tokens=0, total_cost_cny=0.0, total_requests=0,
                 active_users=0, avg_tokens_per_user=0, avg_cost_per_user=0.0,
                 exact_tokens=0, estimated_tokens=0, exact_requests=0,
                 estimated_requests=0, tokens_change_pct=None, cost_change_pct=None,
             )
-        user_filter_id = found_id
+        user_filter_ids = resolved
 
     # 排除测试/停用用户的 user_id 集合
     _excluded_user_ids = select(User.id).where(
@@ -128,8 +125,8 @@ async def get_overview(
         # 定价覆盖：排除估算流量后，cost_cny > 0 的 token 认为"已定价"
         func.coalesce(func.sum(case((((TokenUsageLog.source != ESTIMATE_SOURCE) & (TokenUsageLog.cost_cny > 0)), TokenUsageLog.total_tokens), else_=0)), 0),
     ).where(TokenUsageLog.request_at.between(start_ts, end_ts))
-    if user_filter_id is not None:
-        current_base = current_base.where(TokenUsageLog.user_id == user_filter_id)
+    if user_filter_ids is not None:
+        current_base = current_base.where(TokenUsageLog.user_id.in_(user_filter_ids))
     current_stmt = _apply_source_app_filter(current_base, source_app)
     cur = await db.execute(current_stmt)
     tokens, cost, requests, users, estimated_tokens, estimated_requests, priced_tokens = cur.one()
@@ -144,8 +141,8 @@ async def get_overview(
         func.coalesce(func.sum(TokenUsageLog.total_tokens), 0),
         func.coalesce(func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)), 0),
     ).where(TokenUsageLog.request_at.between(prev_start_ts, start_ts - timedelta(seconds=1)))
-    if user_filter_id is not None:
-        prev_base = prev_base.where(TokenUsageLog.user_id == user_filter_id)
+    if user_filter_ids is not None:
+        prev_base = prev_base.where(TokenUsageLog.user_id.in_(user_filter_ids))
     prev_stmt = _apply_source_app_filter(prev_base, source_app)
     prev = await db.execute(prev_stmt)
     prev_tokens, prev_cost = prev.one()

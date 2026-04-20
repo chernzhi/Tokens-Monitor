@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -78,7 +79,11 @@ func runSetupWizard(configPath string, certMgr *CertManager) error {
 
 	fmt.Println()
 	fmt.Println("  ── 如何让 AI 流量经过本程序？──")
-	fmt.Println("  [1] 推荐：仅安装证书，不改系统代理；后续用 --launch 只启动受管应用")
+	if runtime.GOOS == "windows" {
+		fmt.Println("  [1] 推荐：仅安装证书，不改系统代理；后续用「开始使用.bat」中的受管启动")
+	} else {
+		fmt.Println("  [1] 推荐：仅安装证书，不改系统代理；后续用 --launch 只启动受管应用")
+	}
 	fmt.Println("  [2] legacy：自动设置 Windows 系统代理（会影响整机网络）")
 	fmt.Print("  请选择 1 或 2 [1]: ")
 	choice, _ := reader.ReadString('\n')
@@ -88,7 +93,7 @@ func runSetupWizard(configPath string, certMgr *CertManager) error {
 		f := false
 		cfg.InstallSystemProxy = &f
 		fmt.Println("  → 已选：非侵入式模式（推荐）")
-		fmt.Println("  → 后续请用 ai-monitor.exe --launch <你的程序> 启动受管应用；不会改系统代理。")
+		fmt.Printf("  → 后续请用 %s 启动受管应用；不会改系统代理。\n", userFacingManagedLaunchPhrase())
 	case "2":
 		t := true
 		cfg.InstallSystemProxy = &t
@@ -113,7 +118,7 @@ func runSetupWizard(configPath string, certMgr *CertManager) error {
 
 	bypass := buildProxyBypass()
 	noProxy := buildNoProxyEnv()
-	proxyAddr := fmt.Sprintf("localhost:%d", cfg.Port)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	full := cfg.EffectiveInstallSystemProxy()
 	patchIDE := cfg.EffectiveInstallIDEProxy()
 
@@ -121,7 +126,7 @@ func runSetupWizard(configPath string, certMgr *CertManager) error {
 
 	fmt.Println()
 	fmt.Println("  向导已完成。接下来请保持本窗口运行。")
-	fmt.Println("  推荐启动方式：ai-monitor.exe --launch <你的程序>，只影响该程序，不改本机网络。")
+	fmt.Println("  推荐启动方式：" + userFacingPreferredLaunchLine())
 	fmt.Println("  （若选了系统代理：关机再开请先运行监控，否则部分网络可能暂时不可用）")
 	fmt.Println("  说明: 免费与付费 AI 调用只要经过本代理且可解析或估算，都会尽量上报，不因是否扣费而区分。")
 	return nil

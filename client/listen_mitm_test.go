@@ -24,7 +24,8 @@ func TestTryListenMitmPort_ReusesPreferredWhenFree(t *testing.T) {
 }
 
 func TestTryListenMitmPort_FallbackWhenBusy(t *testing.T) {
-	block, err := net.Listen("tcp", ":0")
+	// 生产代码只绑 127.0.0.1:port；测试必须占用同一地址才能撞端口。
+	block, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,6 +12,7 @@ import (
 )
 
 const taskName = "AIMonitorAutoStart"
+const healTaskName = "AIMonitorHeal"
 
 // startupShortcutPath returns the path to the startup folder shortcut.
 func startupShortcutPath() string {
@@ -44,6 +45,10 @@ func installAutoStart(configPath string) error {
 	if err == nil {
 		log.Printf("[service] 已注册开机自启任务 %q (schtasks)", taskName)
 		removeStartupShortcut() // clean up shortcut if exists from previous fallback
+		// 同时注册自愈任务：主任务起不来时也能恢复代理。失败不动探主流程。
+		if herr := installHealTask(exePath, absConfig); herr != nil {
+			log.Printf("[service] 注册自愈任务失败（不影响开机自启）: %v", herr)
+		}
 		return nil
 	}
 
@@ -56,6 +61,41 @@ func installAutoStart(configPath string) error {
 	// Fallback: create shortcut in Startup folder (no admin needed)
 	log.Printf("[service] schtasks 权限不足，改用启动文件夹快捷方式")
 	return createStartupShortcut(exePath, absConfig)
+}
+
+// installHealTask 注册 "AIMonitorHeal" 计划任务：每次登录运行 `ai-monitor.exe --heal`。
+// 该任务是主进程之外的安全网：如果 ai-monitor 被强杀/崩溃后未重启，下一次
+// 登录会主动清理指向 dead 端口的代理设置，避免污染 VS Code/Cursor 等应用。
+func installHealTask(exePath, configPath string) error {
+	cmd := exec.Command("schtasks", "/Create",
+		"/TN", healTaskName,
+		"/TR", fmt.Sprintf(`"%s" --heal --config "%s"`, exePath, configPath),
+		"/SC", "ONLOGON",
+		"/RL", "LIMITED",
+		"/F",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	log.Printf("[service] 已注册自愈任务 %q", healTaskName)
+	return nil
+}
+
+// uninstallHealTask 移除自愈计划任务。任务不存在不报错。
+func uninstallHealTask() error {
+	cmd := exec.Command("schtasks", "/Delete", "/TN", healTaskName, "/F")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := strings.TrimSpace(string(output))
+		if strings.Contains(outStr, "ERROR: The system cannot find") ||
+			strings.Contains(outStr, "错误: 系统找不到") {
+			return nil
+		}
+		return fmt.Errorf("删除自愈计划任务失败: %w\n%s", err, outStr)
+	}
+	log.Printf("[service] 已移除自愈任务 %q", healTaskName)
+	return nil
 }
 
 // createStartupShortcut creates a .lnk shortcut in the user's Startup folder
@@ -128,6 +168,11 @@ func uninstallAutoStart() error {
 
 	// Remove Startup shortcut
 	removeStartupShortcut()
+
+	// Remove heal task (不影响主进程，但与该函数语义成对)
+	if err := uninstallHealTask(); err != nil {
+		log.Printf("[service] 移除自愈任务失败: %v", err)
+	}
 
 	return nil
 }

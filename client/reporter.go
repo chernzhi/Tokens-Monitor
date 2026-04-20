@@ -61,6 +61,9 @@ type Reporter struct {
 	client      *http.Client
 	Stats       ReporterStats
 	heartbeatOK sync.Once
+	authWarned  sync.Once
+	// OnAuthFailed 在首次收到 401/403 时触发（至多一次）。用于在启动瞬间把用户引导到登录向导。
+	OnAuthFailed func()
 }
 
 // resolveReportProxy determines the proxy function for the Reporter HTTP client.
@@ -295,6 +298,29 @@ func (r *Reporter) postJSONRetry(path string, body []byte) (*http.Response, erro
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+		// 401/403 是身份凭证问题，重试无意义；立即返回并一次性给出可操作指引。
+		// 其他 4xx（除 408/429 外）同样是客户端错误，也不应反复重试。
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			r.authWarned.Do(func() {
+				if r.cfg.AuthToken != "" {
+					log.Printf("[认证] 身份令牌已失效 (HTTP %d): %s", resp.StatusCode, string(b))
+					log.Printf("[认证] 将自动打开登录向导；也可 %s。", userFacingSetupHint())
+				} else {
+					log.Printf("[认证] 上报被拒绝 (HTTP %d): %s", resp.StatusCode, string(b))
+					log.Printf("[认证] config.json 缺少有效 auth_token / api_key，将自动打开登录向导。")
+				}
+				if r.OnAuthFailed != nil {
+					go r.OnAuthFailed()
+				}
+			})
+			return nil, lastErr
+		}
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+			resp.StatusCode != http.StatusRequestTimeout &&
+			resp.StatusCode != http.StatusTooManyRequests {
+			log.Printf("[网络] POST %s HTTP %d（客户端错误，放弃重试）", path, resp.StatusCode)
+			return nil, lastErr
+		}
 		log.Printf("[网络] POST %s 第 %d/%d 次 HTTP %d", path, attempt+1, reportMaxAttempts, resp.StatusCode)
 	}
 	return nil, lastErr

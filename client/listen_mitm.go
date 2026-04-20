@@ -8,7 +8,9 @@ import (
 // mitmPortMaxFallback 配置端口被占用时最多顺延尝试的端口个数（含首选端口本身计 1 次）。
 const mitmPortMaxFallback = 64
 
-// tryListenMitmPort 在 preferred 起依次尝试绑定 TCP 监听（与原先一致监听于 :port 即全部接口）。
+// tryListenMitmPort 在 preferred 起依次尝试绑定 TCP 监听。
+// 仅绑定到回环地址 127.0.0.1，避免把本机自签 MITM 暴露到局域网，
+// 也避免与其它本机网卡/VPN 接口上相同端口的服务冲突。
 // 返回监听器、实际端口号；全部失败时返回错误。
 func tryListenMitmPort(preferred int) (net.Listener, int, error) {
 	if preferred <= 0 || preferred > 65535 {
@@ -19,7 +21,7 @@ func tryListenMitmPort(preferred int) (net.Listener, int, error) {
 		if port > 65535 {
 			break
 		}
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			return ln, port, nil
 		}

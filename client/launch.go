@@ -175,6 +175,15 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 	}
 	proxy.listenPort = listenPort
 
+	// 认证失败时自动把用户带到本地登录向导（/wizard），省去他们在日志里看指引后再找 .bat。
+	reporter.OnAuthFailed = func() {
+		// 稍等 MITM 端口监听起来，避免抢跑
+		time.Sleep(500 * time.Millisecond)
+		url := fmt.Sprintf("http://127.0.0.1:%d/wizard", listenPort)
+		log.Printf("[认证] 已打开登录向导 %s", url)
+		openBrowser(url)
+	}
+
 	rt := &monitorRuntime{
 		reporter:       reporter,
 		reporterCancel: reporterCancel,
@@ -186,7 +195,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 			IdleTimeout:       120 * time.Second,
 		},
 		listener:   ln,
-		proxyAddr:  fmt.Sprintf("localhost:%d", listenPort),
+		proxyAddr:  fmt.Sprintf("127.0.0.1:%d", listenPort),
 		listenPort: listenPort,
 	}
 
@@ -301,7 +310,7 @@ func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetN
 // ai-monitor instance. No new proxy is started.
 func launchChildWithExistingProxy(cfg *Config, certMgr *CertManager, commandArgs []string, preset *launchPreset, port int) error {
 	sourceApp := inferSourceApp(commandArgs, preset)
-	httpProxy := fmt.Sprintf("http://localhost:%d", port)
+	httpProxy := fmt.Sprintf("http://127.0.0.1:%d", port)
 	envVars := map[string]string{
 		"HTTP_PROXY":             httpProxy,
 		"HTTPS_PROXY":            httpProxy,
@@ -323,7 +332,7 @@ func launchChildWithExistingProxy(cfg *Config, certMgr *CertManager, commandArgs
 	cmd.Stderr = os.Stderr
 	cmd.Env = mergeEnv(os.Environ(), envVars)
 
-	log.Printf("[launch] 复用已有代理 (localhost:%d)，启动: %s", port, strings.Join(commandArgs, " "))
+	log.Printf("[launch] 复用已有代理 (127.0.0.1:%d)，启动: %s", port, strings.Join(commandArgs, " "))
 	return cmd.Run()
 }
 
@@ -374,14 +383,14 @@ func resolveLaunchCommand(args []string, presetName string, lookPath func(string
 	presetName = strings.TrimSpace(strings.ToLower(presetName))
 	if presetName == "" {
 		if len(args) == 0 {
-			return nil, nil, fmt.Errorf("--launch 后需要提供目标程序，例如: ai-monitor.exe --launch code.cmd；或使用 --launch-preset vscode")
+			return nil, nil, fmt.Errorf("未指定要启动的程序。%s", userFacingLaunchMissingTarget())
 		}
 		return args, nil, nil
 	}
 
 	preset := findLaunchPreset(presetName)
 	if preset == nil {
-		return nil, nil, fmt.Errorf("未知 launch 预设 %q，可先执行 --list-launch-presets 查看", presetName)
+		return nil, nil, fmt.Errorf("未知 launch 预设 %q。%s", presetName, userFacingUnknownPresetHint())
 	}
 
 	resolved, candidate, err := resolvePresetBinary(*preset, lookPath, fileExists)
