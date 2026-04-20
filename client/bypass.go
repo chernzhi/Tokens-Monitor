@@ -42,24 +42,32 @@ var bypassDomains = []string{
 	"*.github.com",
 }
 
-// mergeBypassDomains returns bypassDomains + cfg.ExtraBypassDomains (deduplicated).
+// mergeBypassDomains returns bypassDomains + cfg.ExtraBypassDomains + existing system
+// ProxyOverride entries (from install_state), all deduplicated.
+// This ensures the user's existing bypass entries (e.g. corporate intranet domains)
+// are preserved even after we overwrite ProxyOverride.
+//
+// NOTE: This function reads install_state.PreviousProxyOverride at runtime.
+// It is safe to call during install (the Previous* fields are the user's
+// original values) and during normal operation. However, if install_state
+// were ever written with OUR bypass list instead of the user's original,
+// this function would self-pollute on subsequent calls. The re-install
+// guard in doInstall/doGlobalInstall/webwizard prevents this by reusing
+// existingSt.Previous* fields instead of re-reading from registry.
+//
+// ⚠ MAINTENANCE WARNING: if you refactor doInstall / doGlobalInstall /
+// webwizard install paths, you MUST preserve the existingSt guard pattern
+// (reuse Previous* from existing install_state instead of re-reading registry).
+// Without that guard, a re-install would snapshot our own bypass list as the
+// "user's original", causing unbounded growth on every subsequent re-install.
 func mergeBypassDomains(cfg *Config) []string {
-	if cfg == nil || len(cfg.ExtraBypassDomains) == 0 {
-		return bypassDomains
-	}
-	seen := make(map[string]struct{}, len(bypassDomains)+len(cfg.ExtraBypassDomains))
-	merged := make([]string, 0, len(bypassDomains)+len(cfg.ExtraBypassDomains))
-	for _, d := range bypassDomains {
-		lower := strings.ToLower(strings.TrimSpace(d))
-		if _, ok := seen[lower]; !ok {
-			seen[lower] = struct{}{}
-			merged = append(merged, d)
-		}
-	}
-	for _, d := range cfg.ExtraBypassDomains {
+	seen := make(map[string]struct{}, len(bypassDomains)+32)
+	merged := make([]string, 0, len(bypassDomains)+32)
+
+	addUnique := func(d string) {
 		d = strings.TrimSpace(d)
-		if d == "" {
-			continue
+		if d == "" || d == "<local>" {
+			return
 		}
 		lower := strings.ToLower(d)
 		if _, ok := seen[lower]; !ok {
@@ -67,6 +75,26 @@ func mergeBypassDomains(cfg *Config) []string {
 			merged = append(merged, d)
 		}
 	}
+
+	// 1. Built-in bypass
+	for _, d := range bypassDomains {
+		addUnique(d)
+	}
+
+	// 2. Config extra bypass
+	if cfg != nil {
+		for _, d := range cfg.ExtraBypassDomains {
+			addUnique(d)
+		}
+	}
+
+	// 3. User's existing ProxyOverride entries (from install_state snapshot)
+	if st := loadInstallState(); st != nil && st.PreviousProxyOverride != "" {
+		for _, d := range strings.Split(st.PreviousProxyOverride, ";") {
+			addUnique(d)
+		}
+	}
+
 	return merged
 }
 

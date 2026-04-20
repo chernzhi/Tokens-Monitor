@@ -89,7 +89,7 @@ func patchConfigUpstreamProxy(configPath, upstream string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, out, 0644)
+	return os.WriteFile(configPath, out, 0600)
 }
 
 // isSelfProxy returns true if the proxy URL points to ai-monitor's own listening range.
@@ -121,6 +121,6 @@ func isSelfProxy(proxy string) bool {
 		}
 		port = port*10 + int(c-'0')
 	}
-	// ai-monitor uses port range 18090 – 18090+63(=18153)
-	return port >= 18090 && port <= 18090+mitmPortMaxFallback
+	// ai-monitor uses port range 18090 – 18090+(mitmPortMaxFallback-1) = 18153
+	return port >= 18090 && port <= 18090+mitmPortMaxFallback-1
 }

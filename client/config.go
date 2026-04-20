@@ -54,6 +54,17 @@ type Config struct {
 	// ReportProxy 上报服务器流量使用的代理。"auto" 或空值 = 智能判断（内网直连，外网走上游代理）；
 	// "direct" = 强制直连；"upstream" = 强制走 upstream_proxy；也可填具体代理地址。
 	ReportProxy string `json:"report_proxy,omitempty"`
+	// ChainExistingPAC 为 true（默认）时，检测到用户已有 AutoConfigURL（企业 PAC）时，
+	// 将旧 PAC 内容内联到新生成的 PAC 中，非 AI 域名仍走原 PAC 策略。
+	// 设为 false 则直接覆盖旧 PAC（不推荐，会丢失企业内网路由策略）。
+	ChainExistingPAC *bool `json:"chain_existing_pac,omitempty"`
+	// StrictPolicyCheck 为 true（默认）时，检测到 HKLM 策略级代理时拒绝全局安装，
+	// 建议用户改用 --launch 模式。设为 false 则仅警告。
+	StrictPolicyCheck *bool `json:"strict_policy_check,omitempty"`
+	// WatchdogIntervalSec 自检间隔秒数，默认 10。
+	WatchdogIntervalSec int `json:"watchdog_interval_sec,omitempty"`
+	// WatchdogFailures 连续失败多少次触发恢复，默认 2。
+	WatchdogFailures int `json:"watchdog_failures,omitempty"`
 }
 
 // EffectiveInstallSystemProxy 是否写入系统代理与环境变量。省略字段时默认 false，优先保持本机网络环境不变。
@@ -81,6 +92,38 @@ func (c *Config) EffectiveReportOpaqueTraffic() bool {
 		return true
 	}
 	return *c.ReportOpaqueTraffic
+}
+
+// EffectiveChainExistingPAC 是否链式包裹企业已有 PAC。默认 true。
+func (c *Config) EffectiveChainExistingPAC() bool {
+	if c == nil || c.ChainExistingPAC == nil {
+		return true
+	}
+	return *c.ChainExistingPAC
+}
+
+// EffectiveStrictPolicyCheck 是否在 HKLM 策略代理存在时拒绝全局安装。默认 true。
+func (c *Config) EffectiveStrictPolicyCheck() bool {
+	if c == nil || c.StrictPolicyCheck == nil {
+		return true
+	}
+	return *c.StrictPolicyCheck
+}
+
+// EffectiveWatchdogInterval 返回 watchdog 自检间隔秒数，默认 10。
+func (c *Config) EffectiveWatchdogInterval() int {
+	if c == nil || c.WatchdogIntervalSec <= 0 {
+		return 10
+	}
+	return c.WatchdogIntervalSec
+}
+
+// EffectiveWatchdogFailures 返回连续失败阈值，默认 2。
+func (c *Config) EffectiveWatchdogFailures() int {
+	if c == nil || c.WatchdogFailures <= 0 {
+		return 2
+	}
+	return c.WatchdogFailures
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -123,9 +166,11 @@ func LoadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// generateUserID 生成稳定的匿名用户 ID（MD5 哈希，16 位十六进制）。
+// generateUserID 生成稳定的匿名用户 ID（MD5 哈希，32 位十六进制）。
 // 优先对 Windows SID（user.Uid，格式 S-1-5-21-...）哈希，确保改名/换机同人仍为同 ID。
 // 兜底对小写完整登录名哈希（DOMAIN\\user），避免手填工号时大小写错误。
+// 混入 hostname 作为 salt，使得即使攻击者知道目标 SID，也无法在不知道机器名的情况下
+// 复算 UserID 进行伪造上报。salt 对同一台机器是稳定的，不影响 ID 一致性。
 func generateUserID() string {
 	u, err := user.Current()
 	var raw string
@@ -139,7 +184,10 @@ func generateUserID() string {
 		hostname, _ := os.Hostname()
 		raw = strings.ToLower(hostname)
 	}
-	sum := md5.Sum([]byte(raw))
+	// 混入 hostname 作为 salt
+	hostname, _ := os.Hostname()
+	salted := raw + "\x00" + strings.ToLower(hostname)
+	sum := md5.Sum([]byte(salted))
 	return hex.EncodeToString(sum[:])
 }
 

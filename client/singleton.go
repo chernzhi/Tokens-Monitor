@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -35,7 +36,9 @@ func writeInstanceInfo(port int) error {
 		return err
 	}
 	p := instanceInfoPath()
-	os.MkdirAll(filepath.Dir(p), 0755)
+	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+		return fmt.Errorf("create instance dir: %w", err)
+	}
 	return os.WriteFile(p, data, 0644)
 }
 
@@ -86,6 +89,9 @@ func probeInstanceStatus(port int) bool {
 	if err != nil {
 		return false
 	}
+	// 必须 drain body 后再 Close，否则 HTTP/1.1 keep-alive 连接无法复用，
+	// watchdog 每 10s 一次会持续打开新 TCP，长期运行造成 TIME_WAIT 堆积。
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
 }

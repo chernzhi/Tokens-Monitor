@@ -511,19 +511,19 @@ async def collect_usage(
 
         # 当有认证用户时，强制使用认证用户的 employee_id/name/department
         if auth_user:
-            effective_employee_id = auth_user.employee_id
-            effective_name = auth_user.name
-            dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
-            effective_department = dept.name if dept else None
+            # 直接落到 auth_user.id：避免走 _get_or_create_user 时因 employee_id
+            # 命中重复行 / 缓存命中老行而把 token 写到他人名下，导致 my-stats
+            # 按 email 合并查询时拿不到这条记录。
+            user_id = auth_user.id
         else:
             effective_employee_id = rec.user_id
             effective_name = rec.user_name
             effective_department = rec.department
 
-        try:
-            user_id = await _get_or_create_user(db, effective_employee_id, effective_name, effective_department)
-        except IdentityConflictError as exc:
-            _raise_identity_conflict(exc)
+            try:
+                user_id = await _get_or_create_user(db, effective_employee_id, effective_name, effective_department)
+            except IdentityConflictError as exc:
+                _raise_identity_conflict(exc)
 
         provider_key = canonical_provider_key(rec.vendor)
 

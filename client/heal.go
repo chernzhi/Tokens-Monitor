@@ -20,12 +20,21 @@ import (
 //     仅当确实没有 config.json 时才清掉 install_state（说明用户已不打算再用本程序）。
 //
 // 退出码：
-//   0  成功（无事可做或修复完成）
-//   1  发现需要恢复但执行失败
+//
+//	0  成功（无事可做或修复完成）
+//	1  发现需要恢复但执行失败
 func runHealMode(configPath string) int {
 	st := loadInstallState()
 	if st == nil || !st.SystemProxySet {
 		fmt.Println("  [heal] install_state 未记录系统代理变更，无需恢复。")
+		return 0
+	}
+
+	// 非 Windows 平台无系统代理恢复实现：直接早返回，避免打印误导性"正在恢复…"日志。
+	// 当前所有注册表/WinINet 操作都在 sysproxy_windows.go 内 (//go:build windows)，
+	// 在 Linux/macOS 下不存在恢复路径，install_state 也不会被写入。
+	if runtime.GOOS != "windows" {
+		fmt.Println("  [heal] 当前平台不支持系统代理恢复，跳过。")
 		return 0
 	}
 
@@ -36,7 +45,7 @@ func runHealMode(configPath string) int {
 
 	// 实例不可达 → 进一步确认「真没人在监听」。注意 instance.json 可能因强杀残留，
 	// 因此不依赖 PID，只看 install_state 记录的端口或 instance.json 端口实际可连。
-	port := healCandidatePort()
+	port := healCandidatePort(st)
 	if port > 0 && portIsListening(port) {
 		// 端口在监听但 /status 不通：可能是占用同端口的别的程序，不动配置避免误伤。
 		fmt.Printf("  [heal] 端口 %d 有进程在监听但非 ai-monitor，跳过恢复以避免误伤。\n", port)
@@ -44,14 +53,24 @@ func runHealMode(configPath string) int {
 	}
 
 	fmt.Println("  [heal] 检测到 ai-monitor 已停止，但系统代理仍指向其端口，正在恢复…")
-	if runtime.GOOS == "windows" {
+	{
 		if st.PACFileSet {
-			// PAC 模式下不动 AutoConfigURL（PAC 自带 DIRECT 回退），只清环境变量。
+			// PAC 模式：恢复原始 AutoConfigURL 或清除
+			if st.PreviousAutoConfigURL != "" {
+				fmt.Printf("  [heal] 恢复原始 PAC: %s\n", st.PreviousAutoConfigURL)
+				EnableSystemProxyPAC(st.PreviousAutoConfigURL)
+			} else {
+				// 没有原始 PAC，清除我们的
+				DisableSystemProxyPAC()
+			}
+			removePACFile()
 			restoreOrClearEnvVars(st)
-			fmt.Println("  [heal] 已清理用户级 HTTP_PROXY / HTTPS_PROXY；PAC 文件保留（自带 DIRECT 回退）。")
+			RestoreAutoDetect(st.PreviousAutoDetect, st.PreviousAutoDetectPresent)
+			fmt.Println("  [heal] 已恢复系统代理与用户级环境变量。")
 		} else {
 			restoreWinInetProxyFromState(st)
 			restoreOrClearEnvVars(st)
+			RestoreAutoDetect(st.PreviousAutoDetect, st.PreviousAutoDetectPresent)
 			fmt.Println("  [heal] 已恢复系统代理与用户级环境变量。")
 		}
 	}
@@ -78,13 +97,32 @@ func instanceHealthy() bool {
 	return probeInstanceStatus(info.Port)
 }
 
-// healCandidatePort 返回最可能的 MITM 端口：优先 instance.json，否则 17590（默认）。
-func healCandidatePort() int {
+// healCandidatePort 返回最可能的 MITM 端口。优先级：
+//  1. install_state.PortAtInstall（精确记录安装时端口）
+//  2. instance.json 中记录的端口
+//  3. 扫描整个 18090..18090+mitmPortMaxFallback 端口范围
+//  4. 默认 18090
+func healCandidatePort(st *InstallState) int {
+	// 1. install_state 记录的端口
+	if st != nil && st.PortAtInstall > 0 {
+		return st.PortAtInstall
+	}
+
+	// 2. instance.json 端口
 	if info, err := readInstanceInfo(); err == nil && info.Port > 0 {
 		return info.Port
 	}
-	// 从 install_state 没存端口；尝试默认端口 18090（与 wizard 默认一致）。
-	return 18090
+
+	// 3. 扫描端口范围，找到第一个"在监听但 /status 不通"的端口
+	basePort := 18090
+	for i := 0; i < mitmPortMaxFallback; i++ {
+		port := basePort + i
+		if portIsListening(port) && !probeInstanceStatus(port) {
+			return port
+		}
+	}
+
+	return basePort
 }
 
 // portIsListening 判断本机指定端口是否被任何进程监听。
@@ -104,19 +142,21 @@ func portIsListening(port int) bool {
 // 主动触发 restoreSessionManagedProxyOnShutdown 并退出，让用户网络立即恢复。
 //
 // 不替代 OS 的 graceful shutdown — 只兜底「listener 死了但进程还在」的边缘场景。
-func startSelfWatchdog(port int) {
-	if runtime.GOOS != "windows" {
+func startSelfWatchdog(port int, cfg *Config) {
+	if runtime.GOOS != "windows" || cfg == nil {
 		return
 	}
 	go func() {
-		const (
-			interval        = 30 * time.Second
-			failureThreshold = 3
-		)
+		interval := time.Duration(cfg.EffectiveWatchdogInterval()) * time.Second
+		failureThreshold := cfg.EffectiveWatchdogFailures()
+		if failureThreshold < 1 {
+			failureThreshold = 2
+		}
+
 		client := &http.Client{Timeout: 3 * time.Second}
 		failures := 0
-		// 启动后先等 interval，避免冷启动期间偶发失败误触发。
-		time.Sleep(interval)
+		// 启动后先等 15s，避免冷启动期间偶发失败误触发。
+		time.Sleep(15 * time.Second)
 		for {
 			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/status", port))
 			if err == nil {

@@ -8,3 +8,21 @@ package main
 func readCurrentSystemProxy() string {
 	return ""
 }
+
+func readCurrentProxyOverride() string {
+	return ""
+}
+
+func readCurrentAutoDetect() (uint32, bool) {
+	return 0, false
+}
+
+func readMachinePolicyProxy() (bool, string) {
+	return false, ""
+}
+
+func fetchPACBody(pacURL string) (string, error) {
+	return "", nil
+}
+
+func RestoreAutoDetect(value uint32, present bool) {}

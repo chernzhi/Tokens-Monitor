@@ -721,10 +721,42 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		// Run global install (CA + env vars + auto-start)
 		var messages []string
 
-		// Step 0: Detect existing upstream proxy BEFORE overwriting
-		detectedUpstream := detectUpstreamProxy(cfg)
-		previousSysProxy := readCurrentSystemProxy()
-		previousEnvVars := snapshotProxyEnvVars()
+		// Step 0: Detect existing upstream proxy BEFORE overwriting.
+		// Re-install guard: if install_state already exists with SystemProxySet,
+		// reuse its Previous* fields to avoid polluting them with our own values.
+		existingSt := loadInstallState()
+		var detectedUpstream, previousSysProxy string
+		var previousEnvVars map[string]string
+		var previousAutoConfigURL, previousProxyOverride string
+		var previousAutoDetect uint32
+		var previousAutoDetectPresent bool
+		var previousPACBody string
+
+		if existingSt != nil && existingSt.SystemProxySet {
+			previousSysProxy = existingSt.PreviousProxyAddr
+			previousEnvVars = existingSt.PreviousEnvVars
+			previousAutoConfigURL = existingSt.PreviousAutoConfigURL
+			previousProxyOverride = existingSt.PreviousProxyOverride
+			previousAutoDetect = existingSt.PreviousAutoDetect
+			previousAutoDetectPresent = existingSt.PreviousAutoDetectPresent
+			previousPACBody = existingSt.PreviousAutoConfigURLBody
+			detectedUpstream = existingSt.PreviousUpstreamProxy
+			if detectedUpstream == "" {
+				detectedUpstream = detectUpstreamProxy(cfg)
+			}
+		} else {
+			detectedUpstream = detectUpstreamProxy(cfg)
+			previousSysProxy = readCurrentSystemProxy()
+			previousEnvVars = snapshotProxyEnvVars()
+			previousAutoConfigURL = ReadCurrentAutoConfigURL()
+			previousProxyOverride = readCurrentProxyOverride()
+			previousAutoDetect, previousAutoDetectPresent = readCurrentAutoDetect()
+			if previousAutoConfigURL != "" && cfg.EffectiveChainExistingPAC() {
+				if body, err := fetchPACBody(previousAutoConfigURL); err == nil {
+					previousPACBody = body
+				}
+			}
+		}
 
 		if detectedUpstream != "" {
 			messages = append(messages, fmt.Sprintf("ℹ 检测到已有代理: %s（将作为上游保留）", detectedUpstream))
@@ -761,17 +793,22 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		}
 
 		// 2b. System proxy via PAC (with DIRECT fallback for crash safety)
-		previousAutoConfigURL := ReadCurrentAutoConfigURL()
-		pacURL, pacErr := writePACFile(actualPort, cfg)
+		pacURL, pacErr := writePACFile(actualPort, cfg, previousPACBody)
 		saveInstallState(&InstallState{
-			SystemProxySet:        true,
-			PreviousProxyAddr:     previousSysProxy,
-			PreviousProxyEnabled:  previousSysProxy != "" && !isSelfProxy(previousSysProxy),
-			PreviousUpstreamProxy: detectedUpstream,
-			PreviousEnvVars:       previousEnvVars,
-			PACFileSet:            true,
-			PACFilePath:           pacFilePath(),
-			PreviousAutoConfigURL: previousAutoConfigURL,
+			SystemProxySet:            true,
+			PreviousProxyAddr:         previousSysProxy,
+			PreviousProxyEnabled:      previousSysProxy != "" && !isSelfProxy(previousSysProxy),
+			PreviousUpstreamProxy:     detectedUpstream,
+			PreviousEnvVars:           previousEnvVars,
+			PACFileSet:                true,
+			PACFilePath:               pacFilePath(),
+			PreviousAutoConfigURL:     previousAutoConfigURL,
+			PreviousAutoConfigURLBody: previousPACBody,
+			PreviousProxyOverride:     previousProxyOverride,
+			PreviousAutoDetect:        previousAutoDetect,
+			PreviousAutoDetectPresent: previousAutoDetectPresent,
+			PortAtInstall:             actualPort,
+			Version:                   3,
 		})
 		if pacErr != nil {
 			messages = append(messages, "⚠ PAC 文件生成失败: "+pacErr.Error())
