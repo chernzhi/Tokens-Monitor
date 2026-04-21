@@ -52,7 +52,11 @@ var aiDomains = map[string]string{
 	"metrics.cursor.sh": "cursor",
 
 	// ── Anthropic / Claude Code（CLI 默认 api.anthropic.com；Bedrock 见通配）──
-	"api.anthropic.com": "anthropic",
+	"api.anthropic.com":      "anthropic",
+	"claude.ai":              "anthropic", // Claude Code OAuth 认证
+	"platform.claude.com":    "anthropic", // Console 账号认证
+	"www.claude.ai":          "anthropic",
+	"console.anthropic.com":  "anthropic", // Console 管理界面
 
 	// ── Google ──
 	"generativelanguage.googleapis.com": "google",
@@ -136,6 +140,15 @@ var aiDomains = map[string]string{
 	"api.stepfun.com":             "stepfun",
 	"api.tiangong.cn":             "skywork",
 	"api.siliconflow.cn":          "siliconflow",
+
+	// 阿里 Qoder（AI IDE，OpenAI / Anthropic 协议混用）
+	// 客户端日志里观察到的请求 host：api2.qoder.sh / center.qoder.sh；
+	// 不补会一直走 CONNECT 透传 → 0 token 上报。
+	"api2.qoder.sh":   "qoder",
+	"api3.qoder.sh":   "qoder",
+	"api.qoder.sh":    "qoder",
+	"center.qoder.sh": "qoder",
+	"api.qoder.com":   "qoder",
 }
 
 // aiWildcardDomains matches AI hostnames by suffix (and optional prefix).
@@ -164,6 +177,9 @@ var aiWildcardDomains = []struct {
 	{suffix: ".githubcopilot.com", vendor: "github-copilot"},
 	// 阿里 Qwen 后续子域（如 *.qwen.ai 的新登录入口）
 	{suffix: ".qwen.ai", vendor: "qwen"},
+	// 阿里 Qoder 新增子域（api*.qoder.sh / center.qoder.sh / *.qoder.com）
+	{suffix: ".qoder.sh", vendor: "qoder"},
+	{suffix: ".qoder.com", vendor: "qoder"},
 }
 
 // pinnedTLSHosts 是已知会做证书钉扎（cert pinning）的主机后缀。

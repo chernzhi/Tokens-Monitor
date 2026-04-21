@@ -18,6 +18,7 @@ var editorVersionPatterns = []sourceAppPattern{
 	{"windsurf/", "windsurf"},
 	{"kiro/", "kiro"},
 	{"trae/", "trae"},
+	{"qoder/", "qoder"},
 }
 
 // userAgentPatterns checks User-Agent for known IDE/tool identifiers.
@@ -29,6 +30,7 @@ var userAgentPatterns = []sourceAppPattern{
 	{"windsurf/", "windsurf"},
 	{"kiro/", "kiro"},
 	{"trae/", "trae"},
+	{"qoder/", "qoder"},
 	{"jetbrains", "jetbrains"},
 	{"intellij", "jetbrains"},
 	{"claude-code/", "claude"},

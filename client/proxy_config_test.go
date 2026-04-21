@@ -28,6 +28,12 @@ func TestMatchAIDomainBuiltinDevTools(t *testing.T) {
 		{"chat.qwen.ai", "qwen"},
 		{"oauth.qwen.ai", "qwen"}, // 通配 *.qwen.ai
 		{"dashscope-intl.aliyuncs.com", "qwen"},
+		// 阿里 Qoder（AI IDE）：客户端日志里只见 CONNECT tunnel，没补域名前永远 0 上报
+		{"api2.qoder.sh", "qoder"},
+		{"center.qoder.sh", "qoder"},
+		{"api.qoder.com", "qoder"},
+		{"newsub.qoder.sh", "qoder"}, // 通配 *.qoder.sh
+		{"foo.qoder.com", "qoder"},   // 通配 *.qoder.com
 	}
 	for _, tc := range cases {
 		v, ok := s.matchAIDomain(tc.host)

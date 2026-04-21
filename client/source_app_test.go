@@ -103,6 +103,20 @@ func TestInferSourceAppFromHeaders(t *testing.T) {
 			want: "trae",
 		},
 		{
+			name: "Qoder via User-Agent",
+			header: http.Header{
+				"User-Agent": {"qoder/0.5.1 (windows-x64)"},
+			},
+			want: "qoder",
+		},
+		{
+			name: "Qoder via editor-version",
+			header: http.Header{
+				"Editor-Version": {"qoder/0.5.1"},
+			},
+			want: "qoder",
+		},
+		{
 			name: "editor-version takes priority over User-Agent",
 			header: http.Header{
 				"User-Agent":     {"vscode/1.96.0"},
