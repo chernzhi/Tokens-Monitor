@@ -138,6 +138,24 @@ var managedLaunchPresets = []launchPreset{
 		Candidates:  []string{"cmd.exe"},
 		KnownPaths:  []string{"%SYSTEMROOT%\\System32\\cmd.exe"},
 	},
+	{
+		Name:        "claude-code",
+		Description: "启动 Claude Code CLI（Node.js，需注入 HTTPS_PROXY 才能被代理统计）",
+		Candidates:  []string{"claude.cmd", "claude.exe", "claude"},
+		KnownPaths: []string{
+			"%APPDATA%\\npm\\claude.cmd",
+			"%APPDATA%\\npm\\claude.ps1",
+		},
+	},
+	{
+		Name:        "qoder",
+		Description: "启动 Qoder IDE",
+		Candidates:  []string{"qoder.exe", "qoder.cmd", "qoder"},
+		KnownPaths: []string{
+			"%LOCALAPPDATA%\\Programs\\Qoder\\Qoder.exe",
+			"%PROGRAMFILES%\\Qoder\\Qoder.exe",
+		},
+	},
 }
 
 type monitorRuntime struct {

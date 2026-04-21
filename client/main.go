@@ -415,6 +415,10 @@ func doUninstall(certMgr *CertManager) {
 	removeIDEProxy()
 	fmt.Println("    ✓ done")
 
+	fmt.Println("  [5/5] 移除 PowerShell Profile 代理包装...")
+	RemovePowerShellProfile()
+	fmt.Println("    ✓ done")
+
 	// Clean up state files
 	clearInstallState()
 	removeInstanceInfo()
@@ -490,12 +494,15 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 		"HTTP_PROXY":          httpProxy,
 		"HTTPS_PROXY":         httpProxy,
 		"NO_PROXY":            noProxy,
+		"OPENAI_BASE_URL":     httpProxy + "/openai/v1",
+		"OPENAI_API_BASE":     httpProxy + "/openai/v1",
+		"ANTHROPIC_BASE_URL":  httpProxy + "/anthropic",
 		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
 	}
 	if err := SetEnvProxy(envVars); err != nil {
 		log.Printf("    ✗ 环境变量设置失败: %v", err)
 	} else {
-		fmt.Println("    ✓ 已设置 HTTP_PROXY / HTTPS_PROXY / NO_PROXY / NODE_EXTRA_CA_CERTS")
+		fmt.Println("    ✓ 已设置 HTTP_PROXY / HTTPS_PROXY / ANTHROPIC_BASE_URL / OPENAI_BASE_URL / NODE_EXTRA_CA_CERTS")
 		fmt.Println("      → VS Code/Cursor/JetBrains/Claude Code/Aider/Codex 等 CLI 工具自动走监控")
 	}
 
@@ -540,6 +547,14 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 		fmt.Println("    可手动将 ai-monitor.exe 快捷方式放入「启动」文件夹")
 	} else {
 		fmt.Println("    ✓ 已注册: 每次登录自动在后台启动 ai-monitor")
+	}
+
+	// Step 5: Inject PowerShell Profile wrapper for claude / codex CLI tools
+	fmt.Println("  [5/5] 写入 PowerShell Profile（claude / codex 命令自动带代理）...")
+	if err := InstallPowerShellProfile(proxyAddr, certMgr.CACertPath()); err != nil {
+		log.Printf("    ✗ PowerShell Profile 写入失败: %v", err)
+	} else {
+		fmt.Println("    ✓ 已写入: 重新打开 PowerShell 后 claude / codex 直接使用即可")
 	}
 
 	// Start background instance now if not already running
@@ -609,6 +624,10 @@ func doGlobalUninstall(certMgr *CertManager) {
 	} else {
 		fmt.Println("    ✓ 已移除看门狗（如有）")
 	}
+
+	fmt.Println("  [5/5] 移除 PowerShell Profile 代理包装...")
+	RemovePowerShellProfile()
+	fmt.Println("    ✓ done")
 
 	clearInstallState()
 	removeInstanceInfo()

@@ -390,7 +390,18 @@ func extractFromSSE(vendor string, data []byte) *UsageInfo {
 	// Anthropic 流式：input_tokens 在 message_start.message.usage 里，
 	// output_tokens 在 message_delta.usage 里；只看最后一个事件会丢 prompt 端。
 	// Claude Code 长期被「prompt_tokens=0」困扰就是这个原因。
-	if vendor == "anthropic" {
+	// 注意：vendor="qoder" 等混用 Anthropic 协议的工具同样需要此路径，
+	// 因此改为按事件内容（是否有 message_start 事件）自动检测，而非仅依赖 vendor 标签。
+	isAnthropicSSE := vendor == "anthropic"
+	if !isAnthropicSSE {
+		for _, e := range events {
+			if t, _ := e.data["type"].(string); t == "message_start" {
+				isAnthropicSSE = true
+				break
+			}
+		}
+	}
+	if isAnthropicSSE {
 		if info := mergeAnthropicSSE(events, modelHint); info != nil && info.TotalTokens > 0 {
 			return info
 		}

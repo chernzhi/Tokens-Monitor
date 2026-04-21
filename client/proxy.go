@@ -569,7 +569,12 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 
 		log.Printf("[MITM] %s %s%s → %d", req.Method, hostname, endpoint, resp.StatusCode)
 
-		if resp.StatusCode < 400 {
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			resp.Body.Close()
+			log.Printf("[MITM] error response %s%s: status=%d body=%q", hostname, endpoint, resp.StatusCode, string(errBody))
+			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+		} else {
 			var buf bytes.Buffer
 			resp.Body = &recordingBody{
 				ReadCloser: resp.Body,
@@ -614,7 +619,12 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 
 			log.Printf("[MITM/h2] %s %s%s → %d", r.Method, hostname, endpoint, resp.StatusCode)
 
-			if resp.StatusCode < 400 {
+			if resp.StatusCode >= 400 {
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+				resp.Body.Close()
+				log.Printf("[MITM/h2] error response %s%s: status=%d body=%q", hostname, endpoint, resp.StatusCode, string(errBody))
+				resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			} else {
 				var buf bytes.Buffer
 				resp.Body = &recordingBody{
 					ReadCloser: resp.Body,
@@ -659,10 +669,19 @@ func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := s.transport.RoundTrip(r)
 	if err != nil {
+		log.Printf("[HTTP] forward error %s %s: %v", r.Method, r.URL.String(), err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	log.Printf("[HTTP] %s %s → %d", r.Method, r.URL.String(), resp.StatusCode)
+
+	if isAI && resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		log.Printf("[HTTP] error response %s %s: status=%d body=%q", r.Method, r.URL.String(), resp.StatusCode, string(errBody))
+		resp.Body = io.NopCloser(bytes.NewReader(errBody))
+	}
 
 	for k, vs := range resp.Header {
 		for _, v := range vs {
@@ -846,6 +865,17 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 	}
 
 	usage := ExtractUsage(vendor, data)
+	if usage == nil {
+		prefix := data
+		if len(prefix) > 120 {
+			prefix = prefix[:120]
+		}
+		log.Printf("[usage] %s %s: extract failed, data_len=%d, prefix=%q", vendor, endpoint, len(data), string(prefix))
+	} else if usage.TotalTokens == 0 {
+		log.Printf("[usage] %s %s: TotalTokens=0 (prompt=%d, completion=%d, model=%q, sourceApp=%q)",
+			vendor, endpoint, usage.PromptTokens, usage.CompletionTokens, usage.Model, sourceApp)
+	}
+
 	if usage != nil && usage.TotalTokens > 0 {
 		model := usage.Model
 		if model == "" {
@@ -857,6 +887,8 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		if model == "" {
 			model = "unknown"
 		}
+		log.Printf("[usage] %s %s: reported model=%q prompt=%d completion=%d total=%d sourceApp=%q",
+			vendor, endpoint, model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, sourceApp)
 		s.reporter.Add(UsageRecord{
 			Vendor:           vendor,
 			Model:            model,

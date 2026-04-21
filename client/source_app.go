@@ -19,6 +19,7 @@ var editorVersionPatterns = []sourceAppPattern{
 	{"kiro/", "kiro"},
 	{"trae/", "trae"},
 	{"qoder/", "qoder"},
+	{"qoder-", "qoder"}, // 兼容 Qoder-2.x 等带连字符的格式
 }
 
 // userAgentPatterns checks User-Agent for known IDE/tool identifiers.
@@ -33,8 +34,11 @@ var userAgentPatterns = []sourceAppPattern{
 	{"qoder/", "qoder"},
 	{"jetbrains", "jetbrains"},
 	{"intellij", "jetbrains"},
+	// Claude Code CLI: User-Agent 格式 "claude-code/X.X.X" 或 "anthropic-cli/X.X.X"
+	// claude.ai 网页版 / OAuth 流也可能带 "claude/"
 	{"claude-code/", "claude"},
 	{"anthropic-cli/", "claude"},
+	{"claude/", "claude"},
 	{"codex/", "codex"},
 	{"opencode/", "opencode"},
 	// vscode last — many forks also contain "vscode" in their UA
