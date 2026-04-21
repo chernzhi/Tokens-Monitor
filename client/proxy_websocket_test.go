@@ -22,6 +22,10 @@ func TestMitmClientALPNForChatGPTForcesHTTP1(t *testing.T) {
 	if len(got) != 1 || got[0] != "http/1.1" {
 		t.Fatalf("expected chatgpt ALPN to force http/1.1, got %#v", got)
 	}
+	got = mitmClientALPN("openai-codex")
+	if len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("expected openai-codex ALPN to force http/1.1, got %#v", got)
+	}
 
 	got = mitmClientALPN("github-copilot")
 	if len(got) != 2 || got[0] != "h2" || got[1] != "http/1.1" {

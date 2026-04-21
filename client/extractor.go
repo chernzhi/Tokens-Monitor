@@ -146,13 +146,14 @@ func deepExtractUsageOpenAIStyle(root map[string]interface{}, modelHint string) 
 				if um, ok := u.(map[string]interface{}); ok {
 					pt := toInt(um["prompt_tokens"])
 					ct := toInt(um["completion_tokens"])
+					tt := toInt(um["total_tokens"])
+					// Responses API / 新一代 OpenAI 接口的 snake_case 命名
 					if pt == 0 {
 						pt = toInt(um["input_tokens"])
 					}
 					if ct == 0 {
 						ct = toInt(um["output_tokens"])
 					}
-					tt := toInt(um["total_tokens"])
 					if tt == 0 {
 						tt = pt + ct
 					}
@@ -271,19 +272,28 @@ func looksLikeModelHint(model string) bool {
 func extractOpenAI(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
 	usage, ok := resp["usage"].(map[string]interface{})
 	if !ok {
+		// Responses API（Codex CLI / 新 ChatGPT 后端）把 usage 放在 response.usage 下。
+		// 形如 {"type":"response.completed","response":{...,"usage":{...}}}。
+		if r, ok := resp["response"].(map[string]interface{}); ok {
+			if u, ok := r["usage"].(map[string]interface{}); ok {
+				usage = u
+			}
+		}
+	}
+	if usage == nil {
 		return nil
 	}
-	// Standard Chat Completions API: prompt_tokens / completion_tokens
+	// Chat Completions 命名
 	info.PromptTokens = toInt(usage["prompt_tokens"])
 	info.CompletionTokens = toInt(usage["completion_tokens"])
-	// Responses API (Codex CLI, /v1/responses): input_tokens / output_tokens
+	info.TotalTokens = toInt(usage["total_tokens"])
+	// Responses API / 新一代 OpenAI 接口命名（与 Anthropic 同形）
 	if info.PromptTokens == 0 {
 		info.PromptTokens = toInt(usage["input_tokens"])
 	}
 	if info.CompletionTokens == 0 {
 		info.CompletionTokens = toInt(usage["output_tokens"])
 	}
-	info.TotalTokens = toInt(usage["total_tokens"])
 	if info.TotalTokens == 0 {
 		info.TotalTokens = info.PromptTokens + info.CompletionTokens
 	}
@@ -341,12 +351,19 @@ func extractCohere(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
 	return nil
 }
 
+// sseEvent 是单个 SSE data 事件解析后的形态，便于厂商专属合并。
+type sseEvent struct {
+	raw  string
+	data map[string]interface{}
+}
+
 func extractFromSSE(vendor string, data []byte) *UsageInfo {
 	raw := string(data)
 	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
 	modelHint := ""
 
-	// 先扫描一次 model 线索（有些流式实现将 model 与 usage 分散在不同 data 事件中）。
+	// 收集所有 data 行的 JSON payload，方便后面做厂商专属合并。
+	events := make([]sseEvent, 0, len(lines))
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
 		var payload string
@@ -361,29 +378,27 @@ func extractFromSSE(vendor string, data []byte) *UsageInfo {
 			continue
 		}
 		var m map[string]interface{}
-		if json.Unmarshal([]byte(payload), &m) == nil {
-			if mm := deepFindModel(m); mm != "" {
-				modelHint = mm
-			}
+		if json.Unmarshal([]byte(payload), &m) != nil {
+			continue
+		}
+		events = append(events, sseEvent{raw: payload, data: m})
+		if mm := deepFindModel(m); mm != "" {
+			modelHint = mm
 		}
 	}
 
-	// 从后往前找带 usage 的 data 行（兼容 "data: " / "data:"）
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		var payload string
-		if strings.HasPrefix(line, "data: ") {
-			payload = strings.TrimPrefix(line, "data: ")
-		} else if strings.HasPrefix(line, "data:") {
-			payload = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		} else {
-			continue
+	// Anthropic 流式：input_tokens 在 message_start.message.usage 里，
+	// output_tokens 在 message_delta.usage 里；只看最后一个事件会丢 prompt 端。
+	// Claude Code 长期被「prompt_tokens=0」困扰就是这个原因。
+	if vendor == "anthropic" {
+		if info := mergeAnthropicSSE(events, modelHint); info != nil && info.TotalTokens > 0 {
+			return info
 		}
-		if payload == "[DONE]" || payload == "" {
-			continue
-		}
+	}
 
-		info := extractFromJSON(vendor, []byte(payload))
+	// 从后往前找带 usage 的 data 行（兼容 OpenAI / Responses API / Google 等）
+	for i := len(events) - 1; i >= 0; i-- {
+		info := extractFromJSON(vendor, []byte(events[i].raw))
 		if info != nil && info.TotalTokens > 0 {
 			if info.Model == "" {
 				info.Model = modelHint
@@ -397,6 +412,55 @@ func extractFromSSE(vendor string, data []byte) *UsageInfo {
 		return info
 	}
 	return nil
+}
+
+// mergeAnthropicSSE 把 message_start 的 input_tokens 与 message_delta 的 output_tokens
+// 合并成一条完整 UsageInfo。
+//   - message_start: {"type":"message_start","message":{"model":"...","usage":{"input_tokens":N,"output_tokens":1}}}
+//   - message_delta: {"type":"message_delta","delta":{...},"usage":{"output_tokens":N}}
+//
+// 任一缺失也允许：只要总和 > 0 就当一次有效记录。
+func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
+	info := &UsageInfo{Model: modelHint}
+	saw := false
+	for _, e := range events {
+		typ, _ := e.data["type"].(string)
+		switch typ {
+		case "message_start":
+			if msg, ok := e.data["message"].(map[string]interface{}); ok {
+				if u, ok := msg["usage"].(map[string]interface{}); ok {
+					if v := toInt(u["input_tokens"]); v > 0 {
+						info.PromptTokens = v
+						saw = true
+					}
+					if v := toInt(u["output_tokens"]); v > 0 && info.CompletionTokens == 0 {
+						info.CompletionTokens = v
+						saw = true
+					}
+				}
+				if m, _ := msg["model"].(string); m != "" && info.Model == "" {
+					info.Model = m
+				}
+			}
+		case "message_delta":
+			if u, ok := e.data["usage"].(map[string]interface{}); ok {
+				// message_delta 的 output_tokens 是「截至此刻的累计」，覆盖式赋值。
+				if v := toInt(u["output_tokens"]); v > 0 {
+					info.CompletionTokens = v
+					saw = true
+				}
+				if v := toInt(u["input_tokens"]); v > 0 && info.PromptTokens == 0 {
+					info.PromptTokens = v
+					saw = true
+				}
+			}
+		}
+	}
+	if !saw {
+		return nil
+	}
+	info.TotalTokens = info.PromptTokens + info.CompletionTokens
+	return info
 }
 
 func toInt(v interface{}) int {

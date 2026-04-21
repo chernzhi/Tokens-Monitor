@@ -6,7 +6,7 @@
   "department": "研发部",
   "port": 18090,
   "api_key": "YOUR_API_KEY_HERE",
-  "upstream_proxy": "socks5://127.0.0.1:7890",
+  "upstream_proxy": "",
   "install_system_proxy": false,
   "install_ide_proxy": false,
   "report_opaque_traffic": true,

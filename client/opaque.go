@@ -102,7 +102,7 @@ func shouldOpaqueEstimateForVendor(vendor, endpoint, modelHint string, body []by
 	if shouldOpaqueEstimate(endpoint, modelHint, body) {
 		return true
 	}
-	if strings.EqualFold(strings.TrimSpace(vendor), "chatgpt") {
+	if isChatGPTLikeVendor(vendor) {
 		return shouldEstimateChatGPTWeb(endpoint, body)
 	}
 	return false

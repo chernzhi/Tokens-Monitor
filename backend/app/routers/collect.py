@@ -4,11 +4,13 @@ Receives batched usage records from the Go client applications.
 """
 
 import hashlib
+import logging
+import re
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import case, delete, func, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_api_key_or_user_token
@@ -16,11 +18,16 @@ from app.canonical import dashboard_tz, canonical_provider_key, source_app_displ
 from app.config import settings
 from app.database import get_db
 from app.models import Client, Department, ModelPricing, TokenUsageLog, User
-from app.user_merge import resolve_user_ids_for_personal_stats
 from app.pricing import calc_cost_usd
 from app.schemas import TokscaleSubmitRequest
 
 router = APIRouter(prefix="/api", tags=["collect"])
+
+logger = logging.getLogger(__name__)
+
+# 身份策略：客户端匿名上报只接受邮箱作为 user_id。
+# 非邮箱别名（纯数字工号 / 32 hex 机器指纹 / DESKTOP-xxx\\Administrator 等）仅在能归并到
+# 已有注册账号时调用原上报，否则丢弃该记录并记日志。避免 users 表产生同一自然人 2-3 条僵尸行。
 
 # ── Schemas ──────────────────────────────────────────────────
 
@@ -261,6 +268,88 @@ async def _get_existing_user_by_employee_id(db: AsyncSession, employee_id: str) 
     return result.scalar_one_or_none()
 
 
+_HEX_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _looks_like_email(value: str) -> bool:
+    if not value or "@" not in value:
+        return False
+    domain = value.rsplit("@", 1)[-1]
+    return "." in domain and len(domain) >= 3
+
+
+def _looks_like_machine_fingerprint(value: str) -> bool:
+    return bool(_HEX_FINGERPRINT_RE.match(value or ""))
+
+
+_HEX_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _looks_like_email(value: str) -> bool:
+    if not value or "@" not in value:
+        return False
+    domain = value.rsplit("@", 1)[-1]
+    return "." in domain and len(domain) >= 3
+
+
+def _looks_like_machine_fingerprint(value: str) -> bool:
+    return bool(_HEX_FINGERPRINT_RE.match(value or ""))
+
+
+async def _find_canonical_user_for_alias(
+    db: AsyncSession, alias_employee_id: str, name: str
+) -> User | None:
+    """在创建新 User 之前，尝试把 alias_employee_id 归并到一条已有的“真账号”。
+
+    避免客户端用未登录身份（邮箱 / 32 hex 机器指纹）上报、心跳时重复创建僵尸 User 行，
+    导致同一自然人在 users 表里产生 2-3 条重复记录。
+
+    只命中“能高置信识别为本人”的行，不命中则保持原有 INSERT 行为：
+      - 邮箱形态：existing.email == alias 或 existing.employee_id == alias，且姓名一致。
+        优先返回 password_hash 不空的注册行；同时优先 employee_id 不等于 alias 的“真工号行”。
+      - 32 字节 hex 指纹：仅在同 name 恒点 password_hash 不空的注册用户中唯一命中时归并；
+        多区别同名则跳过，避免串号。
+    """
+    alias = (alias_employee_id or "").strip()
+    person_name = (name or "").strip()
+    if not alias or not person_name:
+        return None
+
+    if _looks_like_email(alias):
+        result = await db.execute(
+            select(User).where(
+                User.is_active == True,  # noqa: E712
+                or_(User.email == alias, User.employee_id == alias),
+            )
+        )
+        candidates = [u for u in result.scalars().all() if _same_person_name(u.name, person_name)]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda u: (
+                0 if u.password_hash else 1,
+                0 if u.employee_id and u.employee_id != alias else 1,
+                u.id,
+            )
+        )
+        return candidates[0]
+
+    if _looks_like_machine_fingerprint(alias):
+        result = await db.execute(
+            select(User).where(
+                User.is_active == True,  # noqa: E712
+                User.password_hash.isnot(None),
+                User.name == person_name,
+            )
+        )
+        registered = result.scalars().all()
+        if len(registered) == 1:
+            return registered[0]
+        return None
+
+    return None
+
+
 async def _get_same_name_employee_ids(db: AsyncSession, name: str, exclude_employee_id: str) -> list[str]:
     normalized_name = _normalize_identity_value(name)
     if not normalized_name:
@@ -346,9 +435,31 @@ async def _get_or_create_user(db: AsyncSession, employee_id: str, name: str, dep
             user.name = normalized_name
         if department_id != user.department_id:
             user.department_id = department_id
+        # 若精确命中的是「脏行」（password 空 + employee_id 形似邮箱/指纹），且库里另有
+        # 同人的真注册账号，则把 alias 升级归并到真账号，避免新上报继续灌进脏行。
+        if not user.password_hash and (
+            _looks_like_email(normalized_employee_id)
+            or _looks_like_machine_fingerprint(normalized_employee_id)
+        ):
+            canonical = await _find_canonical_user_for_alias(db, normalized_employee_id, normalized_name)
+            if canonical is not None and canonical.id != user.id:
+                _user_cache[normalized_employee_id] = canonical.id
+                await db.flush()
+                return canonical.id
         await db.flush()
         _user_cache[normalized_employee_id] = user.id
         return user.id
+
+    # 在 INSERT 之前先试能不能归并到已有的真账号（邮箱别名 / 机器指纹 → 注册行）。
+    # 不归并会产生同一人在 users 表里 2-3 条僵尸行，且上报被分摄到多个 user_id。
+    canonical = await _find_canonical_user_for_alias(db, normalized_employee_id, normalized_name)
+    if canonical is not None:
+        if department_id and canonical.department_id is None:
+            canonical.department_id = department_id
+            await db.flush()
+        # 缓存 alias → 真 id 的映射，避免同进程重复查库。
+        _user_cache[normalized_employee_id] = canonical.id
+        return canonical.id
 
     user = User(
         employee_id=normalized_employee_id,
@@ -359,6 +470,41 @@ async def _get_or_create_user(db: AsyncSession, employee_id: str, name: str, dep
     await db.flush()
     _user_cache[normalized_employee_id] = user.id
     return user.id
+
+
+async def _resolve_anonymous_user_strict(
+    db: AsyncSession, alias_employee_id: str, name: str, department: str | None
+) -> int | None:
+    """匿名上报路径的「邮箱优先」身份解析。返回 None 表示应当丢弃这条上报。
+
+    规则：
+      - alias 形似邮箱 → 走原 _get_or_create_user（首次会按邮箱新建注册前的占位行，
+        后续注册成功会自动归并到真账号）。
+      - alias 不像邮箱（纯数字工号 / 32 hex 指纹 / DESKTOP-xxx\\Administrator 等）
+        → 仅当能高置信归并到已有注册账号时返回该账号 id；否则返回 None，
+        让调用方丢弃该记录、记日志，避免产生新的脏 User 行。
+    """
+    alias = (alias_employee_id or "").strip()
+    person_name = (name or "").strip()
+    if not alias or not person_name:
+        return None
+
+    if _looks_like_email(alias):
+        try:
+            return await _get_or_create_user(db, alias, person_name, department)
+        except IdentityConflictError:
+            raise
+
+    canonical = await _find_canonical_user_for_alias(db, alias, person_name)
+    if canonical is None:
+        return None
+    if department and canonical.department_id is None:
+        dept_id = await _get_or_create_department(db, department)
+        if dept_id:
+            canonical.department_id = dept_id
+            await db.flush()
+    _user_cache[alias] = canonical.id
+    return canonical.id
 
 
 async def _upsert_client_presence(
@@ -489,6 +635,7 @@ async def collect_usage(
     pricing = await _get_pricing(db)
     inserted = 0
     skipped_duplicates = 0
+    skipped_anonymous = 0
     request_ids = [rec.request_id for rec in records if rec.request_id]
     existing_pairs: set[tuple[str, str]] = set()
 
@@ -511,19 +658,36 @@ async def collect_usage(
 
         # 当有认证用户时，强制使用认证用户的 employee_id/name/department
         if auth_user:
-            # 直接落到 auth_user.id：避免走 _get_or_create_user 时因 employee_id
-            # 命中重复行 / 缓存命中老行而把 token 写到他人名下，导致 my-stats
-            # 按 email 合并查询时拿不到这条记录。
-            user_id = auth_user.id
+            effective_employee_id = auth_user.employee_id
+            effective_name = auth_user.name
+            dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
+            effective_department = dept.name if dept else None
         else:
             effective_employee_id = rec.user_id
             effective_name = rec.user_name
             effective_department = rec.department
 
+        if auth_user:
+            user_id = auth_user.id
+        else:
             try:
-                user_id = await _get_or_create_user(db, effective_employee_id, effective_name, effective_department)
+                user_id = await _resolve_anonymous_user_strict(
+                    db, effective_employee_id, effective_name, effective_department
+                )
             except IdentityConflictError as exc:
                 _raise_identity_conflict(exc)
+            if user_id is None:
+                # 客户端裸上报但 user_id 不是邮箱，且匹配不到已注册账号 → 丢弃。
+                # 避免在 users 表里继续生成 "10034" / "5babb...32hex" 形态的脏行。
+                skipped_anonymous += 1
+                logger.info(
+                    "collect: drop anonymous record alias=%r name=%r vendor=%s model=%s",
+                    effective_employee_id,
+                    effective_name,
+                    rec.vendor,
+                    rec.model,
+                )
+                continue
 
         provider_key = canonical_provider_key(rec.vendor)
 
@@ -574,7 +738,12 @@ async def collect_usage(
             existing_pairs.add((rec.request_id, source))
 
     await db.commit()
-    return {"status": "ok", "inserted": inserted, "skipped_duplicates": skipped_duplicates}
+    return {
+        "status": "ok",
+        "inserted": inserted,
+        "skipped_duplicates": skipped_duplicates,
+        "skipped_anonymous": skipped_anonymous,
+    }
 
 
 @router.post("/collect/tokscale", dependencies=[Depends(require_api_key_or_user_token)])
@@ -689,9 +858,21 @@ async def client_heartbeat(
     ip = request.client.host if request.client else None
 
     try:
-        await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
+        resolved_user_id = await _resolve_anonymous_user_strict(
+            db, normalized_user_id, normalized_user_name, normalized_department
+        )
     except IdentityConflictError as exc:
         _raise_identity_conflict(exc)
+
+    if resolved_user_id is None:
+        # 心跳 user_id 不是邮箱也无法归并到已注册账号 → 不创建 users 行，
+        # 但仍记录 client 在线状态，方便管理员看到设备存在并引导用户去 wizard 注册。
+        logger.info(
+            "heartbeat: anonymous client without registered email alias=%r name=%r host=%s",
+            normalized_user_id,
+            normalized_user_name,
+            data.hostname,
+        )
 
     result = await db.execute(
         select(Client).where(Client.client_id == data.client_id)
@@ -744,13 +925,12 @@ async def get_my_stats(
     # 归到 auth_user.id，这里必须保持一致，否则会因为 user_id 字段在 User 表里
     # 是数值工号、而客户端传的是 email，导致查询命中一个新建的空用户而返回 0。
     if auth_user is not None:
-        merged_ids = await resolve_user_ids_for_personal_stats(db, auth_user)
         start_ts, end_ts = _ts_range(days)
         stmt = select(
             func.coalesce(func.sum(TokenUsageLog.total_tokens), 0),
             func.coalesce(func.sum(func.coalesce(TokenUsageLog.request_count, 1)), 0),
         ).where(
-            TokenUsageLog.user_id.in_(merged_ids),
+            TokenUsageLog.user_id == auth_user.id,
             TokenUsageLog.request_at.between(start_ts, end_ts),
         )
         result = await db.execute(stmt)
@@ -804,9 +984,10 @@ async def get_my_daily_usage(
     db: AsyncSession = Depends(get_db),
     auth_user: User | None = Depends(require_api_key_or_user_token),
 ):
-    # 与 /api/collect 对齐：认证用户存在时合并同一邮箱下的多条 User（历史重复账号）。
+    # 与 /api/collect 对齐：认证用户存在时优先使用 auth_user.id，避免把 email 当作
+    # employee_id 新建/命中错误的 User 导致查询返回 0。
     if auth_user is not None:
-        internal_user_ids = await resolve_user_ids_for_personal_stats(db, auth_user)
+        internal_user_id = auth_user.id
     else:
         normalized_user_id = _normalize_identity_value(user_id)
         normalized_user_name = _normalize_identity_value(user_name)
@@ -829,8 +1010,6 @@ async def get_my_daily_usage(
                 _raise_identity_conflict(exc)
             await db.commit()
 
-        internal_user_ids = [internal_user_id]
-
     start_ts, end_ts = _ts_range(days, start_date, end_date)
     local_day = _request_local_date_column()
     request_count_expr = func.coalesce(TokenUsageLog.request_count, 1)
@@ -848,7 +1027,7 @@ async def get_my_daily_usage(
             func.coalesce(func.sum(case((TokenUsageLog.source == ESTIMATE_SOURCE, request_count_expr), else_=0)), 0),
         )
         .where(
-            TokenUsageLog.user_id.in_(internal_user_ids),
+            TokenUsageLog.user_id == internal_user_id,
             TokenUsageLog.request_at.between(start_ts, end_ts),
         )
         .group_by(local_day)

@@ -7,5 +7,5 @@
   "upstream_proxy": "http://127.0.0.1:8089",
   "install_system_proxy": true,
   "install_ide_proxy": false,
-  "auth_token": "a36649b67e06445f246f438c4722a50cfbe969ecc3e239c37aec532cf3cfd177"
+  "auth_token": "f6c80902de69d16b93b00c537bb83c6bf19850231ef069b9f19995ebc755c975"
 }

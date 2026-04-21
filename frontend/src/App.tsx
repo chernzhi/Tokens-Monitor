@@ -65,7 +65,7 @@ function App() {
       const [ov, tr, usr, dept, mdl, prov, src, srcApp, clients] = await Promise.all([
         api.getOverview(trendDays, activeSourceApp),
         api.getTrend(trendDays, activeSourceApp),
-        api.getByUser(trendDays, 10, activeSourceApp),
+        api.getByUser(trendDays, 1000, activeSourceApp),
         api.getByDepartment(trendDays, activeSourceApp),
         api.getByModel(trendDays, activeSourceApp),
         api.getByProvider(trendDays, activeSourceApp),
@@ -347,7 +347,7 @@ function App() {
       {/* Rankings + Insights — scrollable lists */}
       <div className="rankings-section">
         <div className="ranking-card ranking-card-user-wide">
-          <h3>👤 用户 Token 消耗 Top {userRanking.length}</h3>
+          <h3>👤 用户 Token 消耗排行（共 {userRanking.length} 人）</h3>
           <AutoScroll speed={18}>
             {userRanking.length > 0 ? (
               <div className="rank-list">

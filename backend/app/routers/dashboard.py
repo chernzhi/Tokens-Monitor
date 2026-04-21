@@ -215,7 +215,7 @@ async def get_trend(
 @router.get("/by-user", response_model=RankingResponse)
 async def get_by_user(
     days: int = Query(30, ge=1, le=365),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(1000, ge=1, le=1000),
     source_app: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
