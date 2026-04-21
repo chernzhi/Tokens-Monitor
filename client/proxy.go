@@ -28,6 +28,12 @@ import (
 var aiDomains = map[string]string{
 	// ── OpenAI ──
 	"api.openai.com": "openai",
+	// Codex CLI（ChatGPT Plus/Pro/Team 登录态）默认基址：
+	//   https://chatgpt.com/backend-api/codex/responses
+	// 走 OAuth 而非 API key，必须把 chatgpt.com 列入 MITM 名单，否则
+	// 全部 ChatGPT 计费的 Codex 调用都不会被记录。
+	"chatgpt.com":     "openai-codex",
+	"www.chatgpt.com": "openai-codex",
 
 	// ── GitHub Copilot (VS Code, Visual Studio, Kiro 等) ──
 	"copilot-proxy.githubusercontent.com": "github-copilot",
@@ -115,6 +121,12 @@ var aiDomains = map[string]string{
 	"aip.baidubce.com":            "baidu",
 	"api.minimax.chat":            "minimax",
 	"dashscope.aliyuncs.com":      "qwen",
+	"dashscope-intl.aliyuncs.com": "qwen",
+	// 阿里 qwen-code（gemini-cli fork）OAuth 模式默认走
+	//   https://portal.qwen.ai/v1/chat/completions
+	// 而不是 dashscope；不补这两个域名，OAuth 用户全部漏报。
+	"portal.qwen.ai":              "qwen",
+	"chat.qwen.ai":                "qwen",
 	"api.lingyiwanwu.com":         "yi",
 	"ark.cn-beijing.volces.com":   "doubao",
 	"api.baichuan-ai.com":         "baichuan",
@@ -150,6 +162,39 @@ var aiWildcardDomains = []struct {
 	{suffix: ".cursor.sh", vendor: "cursor"},
 	// GitHub Copilot 新增子域
 	{suffix: ".githubcopilot.com", vendor: "github-copilot"},
+	// 阿里 Qwen 后续子域（如 *.qwen.ai 的新登录入口）
+	{suffix: ".qwen.ai", vendor: "qwen"},
+}
+
+// pinnedTLSHosts 是已知会做证书钉扎（cert pinning）的主机后缀。
+// 这些客户端不信任我们的本地 CA，干脆不 MITM，直接 CONNECT 透传。
+// 代价是这些厂商的 token 用量无法记录——但 Cursor 本来走 gRPC/Protobuf也解不出 usage，
+// 与其让 IDE 手握失败、用户根本用不了对话，不如透传。
+// 注：cursor 系条目可被 cfg.MitmCursor=true 覆盖（仅在确认本机 Cursor 不再 pin 时启用）。
+var pinnedTLSHosts = []string{
+	".cursor.sh",  // Cursor IDE 桌面端钉证书
+	".cursor.com", // 预留：Cursor 主站 / 后续 API 子域
+}
+
+// isCursorHost 判断主机是否属于 Cursor 系。
+func isCursorHost(hostname string) bool {
+	hostname = strings.ToLower(hostname)
+	return strings.HasSuffix(hostname, ".cursor.sh") || strings.HasSuffix(hostname, ".cursor.com")
+}
+
+// isPinnedTLSHost 判断主机是否在钉扎名单中。cfg 不为 nil 且开启 MitmCursor 时，
+// cursor 系主机会从名单中豁免，进入正常 MITM 流程。
+func isPinnedTLSHost(hostname string, cfg *Config) bool {
+	hostname = strings.ToLower(hostname)
+	if cfg != nil && cfg.EffectiveMitmCursor() && isCursorHost(hostname) {
+		return false
+	}
+	for _, suf := range pinnedTLSHosts {
+		if strings.HasSuffix(hostname, suf) {
+			return true
+		}
+	}
+	return false
 }
 
 // matchAIDomain 判断主机名是否应走 MITM，并返回供应商标签（内置表 + config 扩展）。
@@ -336,11 +381,19 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	vendor, isAI := s.matchAIDomain(hostname)
+	if isAI && isPinnedTLSHost(hostname, s.cfg) {
+		// 证书钉扎主机：不能 MITM，否则客户端会 EOF 断连。改为透传。
+		isAI = false
+	}
 	if isAI && s.certMgr != nil {
 		log.Printf("[CONNECT] MITM → %s (%s)", hostname, vendor)
 		go safeGo("mitm "+hostname, func() { s.mitmConnection(clientConn, host, hostname, vendor) })
 	} else {
-		log.Printf("[CONNECT] tunnel → %s", hostname)
+		if vendor != "" {
+			log.Printf("[CONNECT] tunnel → %s (钉证书主机，跳过 MITM)", hostname)
+		} else {
+			log.Printf("[CONNECT] tunnel → %s", hostname)
+		}
 		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host) })
 	}
 }
@@ -534,25 +587,6 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 			r.Header.Del("Accept-Encoding")
 			endpoint := r.URL.Path
 
-			// 调试：仅截取前 4KB 用于日志；必须转发完整请求体（Copilot 等 POST 常远大于 4KB，
-			// 截断会导致上游 Content-Length 与实际 body 不一致并触发 net/http ContentLength 错误）。
-			var reqBodyDump []byte
-			if r.Body != nil {
-				fullBody, readErr := io.ReadAll(r.Body)
-				if readErr != nil {
-					log.Printf("[MITM/h2] read request body %s%s: %v", hostname, endpoint, readErr)
-					http.Error(w, readErr.Error(), http.StatusBadRequest)
-					return
-				}
-				if len(fullBody) > 4096 {
-					reqBodyDump = append([]byte(nil), fullBody[:4096]...)
-				} else {
-					reqBodyDump = fullBody
-				}
-				r.Body = io.NopCloser(bytes.NewReader(fullBody))
-				r.ContentLength = int64(len(fullBody))
-			}
-
 			resp, err := s.transport.RoundTrip(r)
 			if err != nil {
 				log.Printf("[MITM/h2] forward error %s%s: %v", hostname, endpoint, err)
@@ -564,16 +598,7 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 
 			log.Printf("[MITM/h2] %s %s%s → %d", r.Method, hostname, endpoint, resp.StatusCode)
 
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				// 临时调试：打印 4xx 响应体片段；转发给客户端的头部必须与截断后的 body 一致。
-				peek, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-				resp.Body.Close()
-				log.Printf("[MITM/h2 debug] %s%s req=%q resp=%q", hostname, endpoint, string(reqBodyDump), string(peek))
-				resp.Body = io.NopCloser(bytes.NewReader(peek))
-				resp.ContentLength = int64(len(peek))
-				resp.Header.Del("Transfer-Encoding")
-				resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(peek)))
-			} else if resp.StatusCode < 400 {
+			if resp.StatusCode < 400 {
 				var buf bytes.Buffer
 				resp.Body = &recordingBody{
 					ReadCloser: resp.Body,
@@ -758,58 +783,6 @@ func shouldInjectOpenAIStreamOptions(r *http.Request, reqData map[string]interfa
 	return false
 }
 
-// patchGitHubCopilotClaudeMessages 修正 Copilot 网关 /v1/messages 请求体：
-// - 网关会拒绝 enabled、以及 adaptive 下的 budget_tokens 等冗余字段；
-// - 但若 body 含 context_management…clear_thinking_20251015，又要求 thinking.type 为 enabled 或 adaptive。
-// 因此统一改为仅含 {"type":"adaptive"} 的最小 thinking；若仅有 clear_thinking 而无 thinking 则注入该对象。
-func patchGitHubCopilotClaudeMessages(r *http.Request, reqData map[string]interface{}) bool {
-	host := strings.ToLower(r.URL.Hostname())
-	path := strings.ToLower(r.URL.Path)
-	if !strings.Contains(host, "githubcopilot.com") {
-		return false
-	}
-	if !strings.Contains(path, "/v1/messages") {
-		return false
-	}
-
-	need := false
-	if _, ok := reqData["thinking"]; ok {
-		need = true
-	}
-	if !need && copilotHasClearThinkingStrategy(reqData) {
-		need = true
-	}
-	if !need {
-		return false
-	}
-
-	reqData["thinking"] = map[string]interface{}{
-		"type": "adaptive",
-	}
-	return true
-}
-
-func copilotHasClearThinkingStrategy(reqData map[string]interface{}) bool {
-	cm, ok := reqData["context_management"].(map[string]interface{})
-	if !ok {
-		return false
-	}
-	edits, ok := cm["edits"].([]interface{})
-	if !ok {
-		return false
-	}
-	for _, e := range edits {
-		edit, ok := e.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if t, _ := edit["type"].(string); t == "clear_thinking_20251015" {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *ProxyServer) processRequestBody(r *http.Request) string {
 	if r.Body == nil || r.ContentLength == 0 {
 		return ""
@@ -830,12 +803,6 @@ func (s *ProxyServer) processRequestBody(r *http.Request) string {
 	model, _ := reqData["model"].(string)
 	if model == "" {
 		model = deepFindModel(reqData)
-	}
-
-	if patchGitHubCopilotClaudeMessages(r, reqData) {
-		if modified, err := json.Marshal(reqData); err == nil {
-			bodyBytes = modified
-		}
 	}
 
 	// 仅对 OpenAI Chat Completions 类 API 注入 stream_options（含 include_usage）。

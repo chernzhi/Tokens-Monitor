@@ -20,6 +20,14 @@ func TestMatchAIDomainBuiltinDevTools(t *testing.T) {
 		{"new.api.cursor.sh", "cursor"},
 		{"api.enterprise.githubcopilot.com", "github-copilot"},
 		{"foo.githubcopilot.com", "github-copilot"},
+		// Codex CLI 走 ChatGPT 登录态：必须走 chatgpt.com，否则永远不进 MITM
+		{"chatgpt.com", "openai-codex"},
+		{"www.chatgpt.com", "openai-codex"},
+		// 阿里 qwen-code OAuth 模式默认上游
+		{"portal.qwen.ai", "qwen"},
+		{"chat.qwen.ai", "qwen"},
+		{"oauth.qwen.ai", "qwen"}, // 通配 *.qwen.ai
+		{"dashscope-intl.aliyuncs.com", "qwen"},
 	}
 	for _, tc := range cases {
 		v, ok := s.matchAIDomain(tc.host)
@@ -51,5 +59,44 @@ func TestMatchAIDomainExtraConfig(t *testing.T) {
 	_, ok = s.matchAIDomain("unknown.example.com")
 	if ok {
 		t.Fatal("expected no match")
+	}
+}
+
+// 默认情况下（MitmCursor 默认 true）cursor 主域应豁免 pinning 进入 MITM 流程；
+// nil cfg（极少数代码路径未传配置）保持保守，仍走 pinning。
+func TestPinnedTLSHostCursorDefaultAllowsMITM(t *testing.T) {
+	if !isPinnedTLSHost("api2.cursor.sh", nil) {
+		t.Fatal("nil cfg 时 api2.cursor.sh 应仍在 pinned 名单内")
+	}
+	if isPinnedTLSHost("api.cursor.com", &Config{}) {
+		t.Fatal("默认配置下 MitmCursor 应为 true，api.cursor.com 不应被 pinning 拦截")
+	}
+}
+
+// 显式关闭 mitm_cursor 后 cursor 主域应回到 pinning 透传（紧急回退路径）。
+func TestPinnedTLSHostCursorOptOutPins(t *testing.T) {
+	disabled := false
+	cfg := &Config{MitmCursor: &disabled}
+	if !isPinnedTLSHost("api2.cursor.sh", cfg) {
+		t.Fatal("显式关闭 MitmCursor 后 api2.cursor.sh 应回到 pinned 名单")
+	}
+	if !isPinnedTLSHost("api.cursor.com", cfg) {
+		t.Fatal("显式关闭 MitmCursor 后 api.cursor.com 应回到 pinned 名单")
+	}
+}
+
+// 开启 mitm_cursor 后 cursor 主域应该豁免 pinning，从而进入正常 MITM 流程。
+func TestPinnedTLSHostCursorOptInUnpins(t *testing.T) {
+	enabled := true
+	cfg := &Config{MitmCursor: &enabled}
+	if isPinnedTLSHost("api2.cursor.sh", cfg) {
+		t.Fatal("启用 MitmCursor 后 api2.cursor.sh 不应再被 pinning 拦截")
+	}
+	if isPinnedTLSHost("api.cursor.com", cfg) {
+		t.Fatal("启用 MitmCursor 后 api.cursor.com 不应再被 pinning 拦截")
+	}
+	// 其他 pinned 主机不受影响（目前列表里只有 cursor 系，加一个反例守护未来添加）
+	if !isPinnedTLSHost("foo.cursor.sh", nil) {
+		t.Fatal("nil cfg 时 cursor 仍应被 pinning")
 	}
 }

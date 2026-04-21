@@ -85,7 +85,7 @@ export interface OnlineClients {
 export const api = {
   getOverview: (days = 30, sourceApp?: string) => fetchJson<Overview>(buildUrl("overview", { days, source_app: sourceApp })),
   getTrend: (days = 15, sourceApp?: string) => fetchJson<TrendData>(buildUrl("trend", { days, source_app: sourceApp })),
-  getByUser: (days = 30, limit = 10, sourceApp?: string) => fetchJson<{ items: RankingItem[] }>(buildUrl("by-user", { days, limit, source_app: sourceApp })),
+  getByUser: (days = 30, limit = 1000, sourceApp?: string) => fetchJson<{ items: RankingItem[] }>(buildUrl("by-user", { days, limit, source_app: sourceApp })),
   getByDepartment: (days = 30, sourceApp?: string) => fetchJson<{ items: RankingItem[] }>(buildUrl("by-department", { days, source_app: sourceApp })),
   getByModel: (days = 30, sourceApp?: string) => fetchJson<{ items: BreakdownItem[] }>(buildUrl("by-model", { days, source_app: sourceApp })),
   getByProvider: (days = 30, sourceApp?: string) => fetchJson<{ items: BreakdownItem[] }>(buildUrl("by-provider", { days, source_app: sourceApp })),

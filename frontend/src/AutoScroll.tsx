@@ -37,7 +37,6 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
     const outer = outerRef.current;
     const inner = innerRef.current;
     if (!outer || !inner) return;
-    // Check if content overflows
     const check = () => setNeedsScroll(inner.scrollHeight > outer.clientHeight + 2);
     check();
     const ro = new ResizeObserver(check);
@@ -60,9 +59,14 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
       return;
     }
     if (!inner) return;
-    const halfH = inner.scrollHeight / 2;
 
     const step = (now: number) => {
+      const halfH = inner.scrollHeight / 2;
+      if (halfH <= 0) {
+        lastTime.current = now;
+        raf.current = requestAnimationFrame(step);
+        return;
+      }
       if (lastTime.current) {
         const dt = (now - lastTime.current) / 1000;
         offset.current += speed * dt;
@@ -88,8 +92,8 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
     >
       <div ref={innerRef} className="auto-scroll-inner">
         {children}
-        {/* Duplicate for seamless loop */}
-        {shouldAnimate && children}
+        {/* 内容超出可视区域时复制一份做无缝循环；不超出时不复制，避免重复展示 */}
+        {shouldAnimate ? children : null}
       </div>
     </div>
   );

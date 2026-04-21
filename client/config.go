@@ -41,6 +41,11 @@ type Config struct {
 	// ReportOpaqueTraffic 为 true（默认）时，对无法解析 JSON usage 的响应（如 gRPC/Protobuf）按响应体大小做粗略估算并上报，使 135 大屏可见；非官方计费口径。
 	// 设为 false 则仅上报能解析出 usage 的 JSON（与旧版行为一致）。
 	ReportOpaqueTraffic *bool `json:"report_opaque_traffic,omitempty"`
+	// MitmCursor 为 true（默认）时，尝试 MITM Cursor 桌面端流量（*.cursor.sh / *.cursor.com）。
+	// 设为 false：保持 CONNECT 透传（Cursor 历史上做过 TLS pinning，若新版本恢复 pinning
+	// 导致 IDE 断连可关闭此开关回退）。开启后：能解析的 OpenAI 兼容 JSON 走正常 usage 上报，
+	// 不能解析的二进制（gRPC/Protobuf）若同时开启 report_opaque_traffic 则按体积估算。
+	MitmCursor *bool `json:"mitm_cursor,omitempty"`
 	// GatewayPort 为 API Gateway 专用端口（可选）。设置后，该端口仅提供反向代理 /v1/* 与 /vendor/* 路由，
 	// 不做 CONNECT MITM，也不需要 CA 证书信任。设为 0 或省略则 Gateway 路由共享 MITM 主端口。
 	GatewayPort int `json:"gateway_port,omitempty"`
@@ -92,6 +97,14 @@ func (c *Config) EffectiveReportOpaqueTraffic() bool {
 		return true
 	}
 	return *c.ReportOpaqueTraffic
+}
+
+// EffectiveMitmCursor 是否尝试 MITM Cursor 桌面端流量。默认 true（如新版本 Cursor 恢复 TLS pinning 可显式 false 回退）。
+func (c *Config) EffectiveMitmCursor() bool {
+	if c == nil || c.MitmCursor == nil {
+		return true
+	}
+	return *c.MitmCursor
 }
 
 // EffectiveChainExistingPAC 是否链式包裹企业已有 PAC。默认 true。

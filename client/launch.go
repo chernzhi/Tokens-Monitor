@@ -171,7 +171,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 	proxy := NewProxyServer(cfg, reporter, certMgr, configPath)
 	ln, listenPort, err := tryListenMitmPort(cfg.Port)
 	if err != nil {
-		reporterCancel() // 停止已启动的 reporter goroutine，避免泄漏
+		reporterCancel() // 失败路径：取消 reporter ctx，避免 goroutine + context 泄漏
 		return nil, err
 	}
 	proxy.listenPort = listenPort
@@ -384,14 +384,14 @@ func resolveLaunchCommand(args []string, presetName string, lookPath func(string
 	presetName = strings.TrimSpace(strings.ToLower(presetName))
 	if presetName == "" {
 		if len(args) == 0 {
-			return nil, nil, fmt.Errorf("未指定要启动的程序。%s", userFacingLaunchMissingTarget())
+			return nil, nil, fmt.Errorf("--launch 后需要提供目标程序，例如: ai-monitor.exe --launch code.cmd；或使用 --launch-preset vscode")
 		}
 		return args, nil, nil
 	}
 
 	preset := findLaunchPreset(presetName)
 	if preset == nil {
-		return nil, nil, fmt.Errorf("未知 launch 预设 %q。%s", presetName, userFacingUnknownPresetHint())
+		return nil, nil, fmt.Errorf("未知 launch 预设 %q，可先执行 --list-launch-presets 查看", presetName)
 	}
 
 	resolved, candidate, err := resolvePresetBinary(*preset, lookPath, fileExists)
