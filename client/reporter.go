@@ -67,8 +67,8 @@ type Reporter struct {
 }
 
 // resolveReportProxy determines the proxy function for the Reporter HTTP client.
-// Default auto mode is direct: telemetry must not depend on a stale local developer proxy.
-// Use report_proxy=upstream or a concrete proxy URL when the report server really needs it.
+// Auto mode uses an explicit/detected upstream when available, otherwise direct.
+// Loopback upstream candidates are probed before use so stale local developer proxies are ignored.
 func resolveReportProxy(cfg *Config) func(*http.Request) (*url.URL, error) {
 	directProxy := func(*http.Request) (*url.URL, error) { return nil, nil }
 
@@ -98,7 +98,17 @@ func resolveReportProxy(cfg *Config) func(*http.Request) (*url.URL, error) {
 		return directProxy
 
 	case "", "auto":
-		log.Println("[reporter] 上报路由: 直连 (report_proxy=auto)")
+		upstream := strings.TrimSpace(cfg.UpstreamProxy)
+		if upstream == "" {
+			upstream = detectUpstreamProxy(cfg)
+		}
+		if upstream != "" {
+			if u, err := url.Parse(upstream); err == nil {
+				log.Printf("[reporter] 上报路由: 走上游代理 %s (report_proxy=auto)", u.Redacted())
+				return http.ProxyURL(u)
+			}
+		}
+		log.Println("[reporter] 上报路由: 直连 (report_proxy=auto, no upstream)")
 		return directProxy
 
 	default:

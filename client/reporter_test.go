@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -96,7 +97,7 @@ func TestReporterFlushRecordedByServer(t *testing.T) {
 }
 
 func TestResolveReportProxyAutoIgnoresEnvProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:8899")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:18090")
 	proxyFunc := resolveReportProxy(&Config{
 		ServerURL: "https://otw.tech:59889",
 	})
@@ -107,6 +108,28 @@ func TestResolveReportProxyAutoIgnoresEnvProxy(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("auto report proxy should be direct, got %s", got.Redacted())
+	}
+}
+
+func TestResolveReportProxyAutoUsesReachableLoopbackUpstream(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	upstream := "http://" + ln.Addr().String()
+	t.Setenv("HTTPS_PROXY", upstream)
+	proxyFunc := resolveReportProxy(&Config{
+		ServerURL: "https://otw.tech:59889",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://otw.tech:59889/api/collect", nil)
+	got, err := proxyFunc(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.String() != upstream {
+		t.Fatalf("auto report proxy=%v want %s", got, upstream)
 	}
 }
 
