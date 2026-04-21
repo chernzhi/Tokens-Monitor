@@ -551,7 +551,7 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 
 	// Step 5: Inject PowerShell Profile wrapper for claude / codex CLI tools
 	fmt.Println("  [5/5] 写入 PowerShell Profile（claude / codex 命令自动带代理）...")
-	if err := InstallPowerShellProfile(proxyAddr, certMgr.CACertPath()); err != nil {
+	if err := InstallPowerShellProfile(httpProxy, certMgr.CACertPath()); err != nil {
 		log.Printf("    ✗ PowerShell Profile 写入失败: %v", err)
 	} else {
 		fmt.Println("    ✓ 已写入: 重新打开 PowerShell 后 claude / codex 直接使用即可")
