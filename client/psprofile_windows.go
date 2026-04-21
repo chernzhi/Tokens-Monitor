@@ -23,6 +23,13 @@ $_aiMonitorCACert = "%s"
 
 function _Invoke-AIMonitorProxy {
     param([string]$Cmd, [string[]]$CmdArgs)
+    # 必须用 -CommandType Application 查找外部可执行文件，
+    # 否则 & $Cmd 会递归调用同名函数（PowerShell 函数优先于外部命令）。
+    $realPath = (Get-Command $Cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $realPath) {
+        Write-Error "ai-monitor: 找不到外部命令 '$Cmd'，请确认已安装并在 PATH 中。"
+        return
+    }
     $env:HTTPS_PROXY         = $_aiMonitorProxy
     $env:HTTP_PROXY          = $_aiMonitorProxy
     $env:ANTHROPIC_BASE_URL  = "$_aiMonitorProxy/anthropic"
@@ -32,7 +39,7 @@ function _Invoke-AIMonitorProxy {
         $env:NODE_EXTRA_CA_CERTS = $_aiMonitorCACert
         $env:SSL_CERT_FILE       = $_aiMonitorCACert
     }
-    & $Cmd @CmdArgs
+    & $realPath @CmdArgs
     Remove-Item Env:HTTPS_PROXY        -ErrorAction SilentlyContinue
     Remove-Item Env:HTTP_PROXY         -ErrorAction SilentlyContinue
     Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
