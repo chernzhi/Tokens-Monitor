@@ -41,6 +41,21 @@ var userAgentPatterns = []sourceAppPattern{
 	{"claude/", "claude"},
 	{"codex/", "codex"},
 	{"opencode/", "opencode"},
+	// Cline（VS Code AI 编码插件）UA 格式 "cline/<version>" 或 "roo-cline/<version>"
+	{"cline/", "cline"},
+	{"roo-cline/", "cline"},
+	{"roo/", "cline"},
+	// Continue.dev: "continue/<version>"
+	{"continue/", "continue"},
+	// Aider（终端 AI 编码工具）
+	{"aider/", "aider"},
+	{"aider-chat/", "aider"},
+	// Supermaven
+	{"supermaven/", "supermaven"},
+	// Zed Editor
+	{"zed/", "zed"},
+	// Void Editor（Cursor 开源替代）
+	{"void/", "void"},
 	// vscode last — many forks also contain "vscode" in their UA
 	{"vscode/", "vscode"},
 }
@@ -65,6 +80,13 @@ func inferSourceAppFromHeaders(h http.Header) string {
 			if strings.Contains(uaLower, p.substr) {
 				return p.app
 			}
+		}
+	}
+
+	// Priority 3: 自定义客户端标识头（部分工具设置）
+	for _, hdr := range []string{"X-Client-Name", "X-App-Name", "X-Tool-Name", "X-IDE-Name"} {
+		if v := h.Get(hdr); v != "" {
+			return strings.ToLower(strings.TrimSpace(v))
 		}
 	}
 

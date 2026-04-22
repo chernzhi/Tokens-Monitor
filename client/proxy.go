@@ -52,11 +52,11 @@ var aiDomains = map[string]string{
 	"metrics.cursor.sh": "cursor",
 
 	// ── Anthropic / Claude Code（CLI 默认 api.anthropic.com；Bedrock 见通配）──
-	"api.anthropic.com":      "anthropic",
-	"claude.ai":              "anthropic", // Claude Code OAuth 认证
-	"platform.claude.com":    "anthropic", // Console 账号认证
-	"www.claude.ai":          "anthropic",
-	"console.anthropic.com":  "anthropic", // Console 管理界面
+	"api.anthropic.com":     "anthropic",
+	"claude.ai":             "anthropic", // Claude Code OAuth 认证
+	"platform.claude.com":   "anthropic", // Console 账号认证
+	"www.claude.ai":         "anthropic",
+	"console.anthropic.com": "anthropic", // Console 管理界面
 
 	// ── Google ──
 	"generativelanguage.googleapis.com": "google",
@@ -113,6 +113,18 @@ var aiDomains = map[string]string{
 	// ── Augment Code ──
 	"api.augmentcode.com":     "augment",
 	"dialapi.augmentcode.com": "augment",
+
+	// ── DeepInfra（多模型推理平台，Cline/Aider/Continue 等工具常用）──
+	"api.deepinfra.com": "deepinfra",
+
+	// ── Cerebras（高速推理，开发工具集成逐渐增多）──
+	"api.cerebras.ai": "cerebras",
+
+	// ── SambaNova Cloud ──
+	"api.sambanova.ai": "sambanova",
+
+	// ── Novita AI ──
+	"api.novita.ai": "novita",
 
 	// ── fal.ai（部分工作流 / 插件）──
 	"fal.run":    "fal",
@@ -215,6 +227,7 @@ func isPinnedTLSHost(hostname string, cfg *Config) bool {
 
 // matchAIDomain 判断主机名是否应走 MITM，并返回供应商标签（内置表 + config 扩展）。
 func (s *ProxyServer) matchAIDomain(hostname string) (string, bool) {
+	hostname = strings.ToLower(hostname) // RFC 1123：hostname 大小写不敏感
 	if vendor, ok := aiDomains[hostname]; ok {
 		return vendor, true
 	}
@@ -758,22 +771,14 @@ func (s *ProxyServer) handleLegacy(w http.ResponseWriter, r *http.Request, vendo
 			if resp.StatusCode >= 400 {
 				return nil
 			}
-			if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
-				var buf bytes.Buffer
-				resp.Body = &recordingBody{
-					ReadCloser: resp.Body, buf: &buf,
-					onClose: func(data []byte) { s.processResponseData(vendor, remaining, requestModel, sourceApp, data) },
-				}
-				return nil
+			// 无论 SSE 还是普通 JSON 响应，统一用 recordingBody 异步采集 usage。
+			// 这样既能实时流式下发（FlushInterval:-1），又不会因 Content-Type 不是
+			// text/event-stream 而漏记 chunked JSON / gRPC-Web 等格式的响应。
+			var buf bytes.Buffer
+			resp.Body = &recordingBody{
+				ReadCloser: resp.Body, buf: &buf,
+				onClose: func(data []byte) { s.processResponseData(vendor, remaining, requestModel, sourceApp, data) },
 			}
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				return err
-			}
-			s.processResponseData(vendor, remaining, requestModel, sourceApp, body)
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			resp.ContentLength = int64(len(body))
 			return nil
 		},
 		FlushInterval: -1,
@@ -795,12 +800,18 @@ func (s *ProxyServer) handleLegacy(w http.ResponseWriter, r *http.Request, vendo
 // shouldInjectOpenAIStreamOptions 判断是否可注入 OpenAI 专有的 stream_options。
 // Anthropic Messages API、Copilot→Claude 等请求若带上该字段会 400（Extra inputs are not permitted）。
 func shouldInjectOpenAIStreamOptions(r *http.Request, reqData map[string]interface{}) bool {
+	// 请求体含 anthropic_version → Anthropic 协议，勿注入
 	if _, ok := reqData["anthropic_version"]; ok {
 		return false
 	}
 	host := strings.ToLower(r.URL.Hostname())
 	path := strings.ToLower(r.URL.Path)
+
+	// Anthropic 端点（含直连与 gateway 模式下 path=/v1/messages）
 	if strings.Contains(host, "anthropic.com") {
+		return false
+	}
+	if strings.HasPrefix(path, "/v1/messages") {
 		return false
 	}
 	// Copilot 网关（含 Claude）；勿注入 OpenAI 专有字段
@@ -808,11 +819,20 @@ func shouldInjectOpenAIStreamOptions(r *http.Request, reqData map[string]interfa
 		strings.Contains(host, "copilot-proxy.githubusercontent.com") {
 		return false
 	}
+	// Codeium / Windsurf Cascade 使用自有协议，不接受 stream_options
+	if strings.Contains(host, "codeium.com") {
+		return false
+	}
+	// Google AI / Vertex：OpenAI-compatible 端点可能不接受 stream_options
+	if strings.Contains(host, "googleapis.com") || strings.Contains(host, "aiplatform.googleapis.com") {
+		return false
+	}
+	// 明确是 OpenAI 或 Azure OpenAI：直接注入
 	if strings.Contains(host, "api.openai.com") || strings.Contains(host, "openai.azure.com") {
 		return true
 	}
-	// 标准 OpenAI Chat Completions 路径（多数兼容网关）
-	if strings.Contains(path, "/v1/chat/completions") {
+	// 标准 OpenAI Chat Completions / Responses API 路径（多数 OpenAI-compatible 网关）
+	if strings.Contains(path, "/v1/chat/completions") || strings.Contains(path, "/v1/responses") {
 		return true
 	}
 	return false
@@ -832,6 +852,7 @@ func (s *ProxyServer) processRequestBody(r *http.Request) string {
 	if json.Unmarshal(bodyBytes, &reqData) != nil {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		r.ContentLength = int64(len(bodyBytes))
+		r.TransferEncoding = nil // 已完整读取，移除 chunked 标记，避免上游收到两套 framing 信号
 		return inferModelHint(bodyBytes)
 	}
 
@@ -853,16 +874,44 @@ func (s *ProxyServer) processRequestBody(r *http.Request) string {
 
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	r.ContentLength = int64(len(bodyBytes))
+	r.TransferEncoding = nil // 已完整读取，移除 chunked 标记
 	if model == "" {
 		model = inferModelHint(bodyBytes)
 	}
 	return model
 }
 
-// responseEndpointHasNoTokenUsage 为账户/支付等响应（无 OpenAI/Anthropic 式 usage 字段）的 API，不打印「extract failed」避免刷屏。
+// responseEndpointHasNoTokenUsage 为账户/支付/内部服务等响应（无 OpenAI/Anthropic 式 usage 字段）的 API，不打印「extract failed」避免刷屏。
 // 无 usage 时后面仍会走 opaque 粗算逻辑（若配置开启且 shouldOpaqueEstimate 为真）。
 func responseEndpointHasNoTokenUsage(endpoint string) bool {
-	return strings.Contains(strings.ToLower(endpoint), "full_stripe_profile")
+	ep := strings.ToLower(endpoint)
+	// 复用 opaque denylist：这些接口天然无 token usage
+	for _, kw := range opaqueEndpointDenylist {
+		if strings.Contains(ep, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	// 账户/支付接口
+	if strings.Contains(ep, "full_stripe_profile") || strings.Contains(ep, "stripe") {
+		return true
+	}
+	// Cursor 内部仪表板/元数据接口（如 DashboardService/GetGlassEarlyPreviewEnrollment）
+	if strings.Contains(ep, "dashboardservice") || strings.Contains(ep, "dashboard") {
+		return true
+	}
+	// 认证/账户管理类
+	if strings.Contains(ep, "auth") || strings.Contains(ep, "oauth") ||
+		strings.Contains(ep, "login") || strings.Contains(ep, "signup") ||
+		strings.Contains(ep, "account") || strings.Contains(ep, "billing") ||
+		strings.Contains(ep, "subscription") || strings.Contains(ep, "profile") {
+		return true
+	}
+	// 健康检查/状态接口
+	if ep == "/health" || ep == "/healthz" || ep == "/ping" || ep == "/status" ||
+		strings.HasSuffix(ep, "/health") || strings.HasSuffix(ep, "/healthz") {
+		return true
+	}
+	return false
 }
 
 func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, sourceApp string, data []byte) {
