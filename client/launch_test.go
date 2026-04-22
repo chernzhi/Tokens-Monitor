@@ -121,6 +121,28 @@ func TestInferSourceApp(t *testing.T) {
 	}
 }
 
+func TestCompatProxyPortsIncludesStaleSelfProxyPorts(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:18092")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+
+	got := compatProxyPorts(&Config{Port: 18090}, 18090)
+	if !intSliceContains(got, 18091) || !intSliceContains(got, 18092) {
+		t.Fatalf("compatProxyPorts()=%v, want stale ai-monitor ports 18091 and 18092", got)
+	}
+	if intSliceContains(got, 18090) || intSliceContains(got, 7890) {
+		t.Fatalf("compatProxyPorts()=%v, should exclude current port and non-ai-monitor proxy port", got)
+	}
+}
+
+func intSliceContains(xs []int, want int) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestManagedPresetProcessImage(t *testing.T) {
 	tests := []struct {
 		name        string

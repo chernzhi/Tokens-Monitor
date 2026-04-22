@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"net/http"
 	"testing"
 )
@@ -112,6 +113,27 @@ func TestCopyWebSocketServerToClientFallsBackRawOnOversizedFrame(t *testing.T) {
 	}
 	if !bytes.Equal(forwarded.Bytes(), raw) {
 		t.Fatalf("raw fallback changed stream: got %x want %x", forwarded.Bytes(), raw)
+	}
+}
+
+func TestWebSocketClientToServerCopyIncludesBufferedBytes(t *testing.T) {
+	prefetched := []byte("prefetched-frame")
+	live := []byte("live-frame")
+	clientReader := bufio.NewReaderSize(bytes.NewReader(prefetched), len(prefetched))
+	if _, err := clientReader.Peek(1); err != nil {
+		t.Fatal(err)
+	}
+	src := io.Reader(clientReader)
+	if clientReader.Buffered() > 0 {
+		src = io.MultiReader(clientReader, bytes.NewReader(live))
+	}
+
+	var upstream bytes.Buffer
+	if _, err := io.Copy(&upstream, src); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(upstream.Bytes(), append(prefetched, live...)) {
+		t.Fatalf("upstream bytes = %q, want %q", upstream.Bytes(), append(prefetched, live...))
 	}
 }
 

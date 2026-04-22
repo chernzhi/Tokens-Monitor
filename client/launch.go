@@ -156,6 +156,7 @@ type monitorRuntime struct {
 	listener       net.Listener
 	proxyAddr      string
 	listenPort     int
+	compatLn       []net.Listener
 	gatewayServer  *http.Server // nil if gateway_port not configured
 	gatewayLn      net.Listener // nil if gateway_port not configured
 	gatewayPort    int
@@ -214,6 +215,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 		proxyAddr:  fmt.Sprintf("127.0.0.1:%d", listenPort),
 		listenPort: listenPort,
 	}
+	startCompatProxyListeners(rt, cfg)
 
 	// Start dedicated gateway port if configured (no MITM, no cert needed).
 	if cfg.GatewayPort > 0 && cfg.GatewayPort != cfg.Port {
@@ -242,6 +244,55 @@ func (m *monitorRuntime) Shutdown(ctx context.Context) error {
 		m.gatewayServer.Shutdown(ctx)
 	}
 	return m.server.Shutdown(ctx)
+}
+
+func startCompatProxyListeners(rt *monitorRuntime, cfg *Config) {
+	for _, port := range compatProxyPorts(cfg, rt.listenPort) {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			continue
+		}
+		rt.compatLn = append(rt.compatLn, ln)
+		log.Printf("[proxy] 兼容监听旧代理端口 127.0.0.1:%d → 当前代理处理器", port)
+		go func(port int, ln net.Listener) {
+			if err := rt.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("[proxy] 兼容端口 %d 退出: %v", port, err)
+			}
+		}(port, ln)
+	}
+}
+
+func compatProxyPorts(cfg *Config, listenPort int) []int {
+	seen := map[int]struct{}{listenPort: {}}
+	var ports []int
+	add := func(port int) {
+		if !isAIMonitorPort(port) {
+			return
+		}
+		if _, ok := seen[port]; ok {
+			return
+		}
+		seen[port] = struct{}{}
+		ports = append(ports, port)
+	}
+	if cfg != nil {
+		add(cfg.Port)
+		add(cfg.Port + 1)
+	}
+	if st := loadInstallState(); st != nil {
+		add(st.PortAtInstall)
+	}
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		_, port, ok := proxyHostPort(os.Getenv(key))
+		if ok {
+			add(port)
+		}
+	}
+	return ports
+}
+
+func isAIMonitorPort(port int) bool {
+	return port >= 18090 && port <= 18090+mitmPortMaxFallback-1
 }
 
 func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetName string, configPath string) error {
