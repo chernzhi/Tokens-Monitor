@@ -46,6 +46,10 @@ var aiDomains = map[string]string{
 	"api.business.githubcopilot.com":      "github-copilot",
 	"api.enterprise.githubcopilot.com":    "github-copilot",
 
+	// ── Kiro（官方核心服务：chat / code assistance）──
+	"runtime.us-east-1.kiro.dev":    "kiro",
+	"runtime.eu-central-1.kiro.dev": "kiro",
+
 	// ── GitHub Models ──
 	"models.inference.ai.azure.com": "github-models",
 
@@ -160,6 +164,8 @@ var aiWildcardDomains = []struct {
 	{suffix: ".amazonaws.com", prefix: "codewhisperer.", vendor: "aws-codewhisperer"},
 	// Amazon Q Developer API：q.<region>.amazonaws.com
 	{suffix: ".amazonaws.com", prefix: "q.", vendor: "aws-q"},
+	// Kiro GovCloud / Amazon Q FIPS endpoint：q-fips.<region>.amazonaws.com
+	{suffix: ".amazonaws.com", prefix: "q-fips.", vendor: "aws-q"},
 	// Azure AI Inference / Foundry 等：*.inference.azure.com
 	{suffix: ".inference.azure.com", vendor: "azure-inference"},
 	// Cursor 新增子域（如未来 api*.cursor.sh）
@@ -731,9 +737,11 @@ func (s *ProxyServer) handleWebSocketMITM(clientConn net.Conn, req *http.Request
 		done <- struct{}{}
 	}()
 	go func() {
-		_ = copyWebSocketServerToClient(clientConn, upstreamReader, func(payload []byte) {
+		if err := copyWebSocketServerToClient(clientConn, upstreamReader, func(payload []byte) {
 			s.processResponseData(vendor, endpoint, requestModel, sourceApp, payload)
-		})
+		}); err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			log.Printf("[MITM/ws] server->client copy ended %s%s: %v", hostname, endpoint, err)
+		}
 		done <- struct{}{}
 	}()
 	<-done
@@ -780,10 +788,21 @@ func copyWebSocketServerToClient(dst io.Writer, src *bufio.Reader, onMessage fun
 	var acc websocketMessageAccumulator
 	for {
 		frame, err := readWebSocketFrame(src)
-		if err != nil {
-			return err
+		if len(frame.raw) > 0 {
+			if _, writeErr := dst.Write(frame.raw); writeErr != nil {
+				return writeErr
+			}
 		}
-		if _, err := dst.Write(frame.raw); err != nil {
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return err
+			}
+			// Inspection is best-effort only. Keep the WebSocket transparent
+			// when we hit an unsupported frame shape or an oversized payload.
+			_, copyErr := io.Copy(dst, src)
+			if copyErr != nil {
+				return fmt.Errorf("%w; raw fallback failed: %v", err, copyErr)
+			}
 			return err
 		}
 		acc.observe(frame, onMessage)
@@ -802,7 +821,8 @@ type websocketFrame struct {
 func readWebSocketFrame(r *bufio.Reader) (websocketFrame, error) {
 	var f websocketFrame
 	header := make([]byte, 2)
-	if _, err := io.ReadFull(r, header); err != nil {
+	if n, err := io.ReadFull(r, header); err != nil {
+		f.raw = append(f.raw, header[:n]...)
 		return f, err
 	}
 	f.raw = append(f.raw, header...)
@@ -814,14 +834,16 @@ func readWebSocketFrame(r *bufio.Reader) (websocketFrame, error) {
 	switch payloadLen {
 	case 126:
 		ext := make([]byte, 2)
-		if _, err := io.ReadFull(r, ext); err != nil {
+		if n, err := io.ReadFull(r, ext); err != nil {
+			f.raw = append(f.raw, ext[:n]...)
 			return f, err
 		}
 		f.raw = append(f.raw, ext...)
 		payloadLen = uint64(ext[0])<<8 | uint64(ext[1])
 	case 127:
 		ext := make([]byte, 8)
-		if _, err := io.ReadFull(r, ext); err != nil {
+		if n, err := io.ReadFull(r, ext); err != nil {
+			f.raw = append(f.raw, ext[:n]...)
 			return f, err
 		}
 		f.raw = append(f.raw, ext...)
@@ -835,13 +857,16 @@ func readWebSocketFrame(r *bufio.Reader) (websocketFrame, error) {
 		return f, fmt.Errorf("websocket frame too large: %d bytes", payloadLen)
 	}
 	if f.masked {
-		if _, err := io.ReadFull(r, f.maskKey[:]); err != nil {
+		if n, err := io.ReadFull(r, f.maskKey[:]); err != nil {
+			f.raw = append(f.raw, f.maskKey[:n]...)
 			return f, err
 		}
 		f.raw = append(f.raw, f.maskKey[:]...)
 	}
 	f.payload = make([]byte, int(payloadLen))
-	if _, err := io.ReadFull(r, f.payload); err != nil {
+	if n, err := io.ReadFull(r, f.payload); err != nil {
+		f.payload = f.payload[:n]
+		f.raw = append(f.raw, f.payload...)
 		return f, err
 	}
 	f.raw = append(f.raw, f.payload...)

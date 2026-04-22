@@ -91,6 +91,30 @@ func TestCopyWebSocketServerToClientReassemblesFragments(t *testing.T) {
 	}
 }
 
+func TestCopyWebSocketServerToClientFallsBackRawOnOversizedFrame(t *testing.T) {
+	payloadLen := uint64(recordingBodyMaxBytes + 1)
+	raw := []byte{0x82, 127,
+		byte(payloadLen >> 56),
+		byte(payloadLen >> 48),
+		byte(payloadLen >> 40),
+		byte(payloadLen >> 32),
+		byte(payloadLen >> 24),
+		byte(payloadLen >> 16),
+		byte(payloadLen >> 8),
+		byte(payloadLen),
+		'a', 'b', 'c',
+	}
+
+	var forwarded bytes.Buffer
+	err := copyWebSocketServerToClient(&forwarded, bufio.NewReader(bytes.NewReader(raw)), nil)
+	if err == nil {
+		t.Fatal("expected oversized frame error after raw fallback")
+	}
+	if !bytes.Equal(forwarded.Bytes(), raw) {
+		t.Fatalf("raw fallback changed stream: got %x want %x", forwarded.Bytes(), raw)
+	}
+}
+
 func buildServerWebSocketFrame(opcode byte, payload []byte) []byte {
 	return buildServerWebSocketFrameWithFin(true, opcode, payload)
 }

@@ -14,6 +14,9 @@ func TestMatchAIDomainBuiltinDevTools(t *testing.T) {
 		{"cody-gateway.sourcegraph.com", "sourcegraph-cody"},
 		{"codewhisperer.us-east-1.amazonaws.com", "aws-codewhisperer"},
 		{"q.us-west-2.amazonaws.com", "aws-q"},
+		{"q-fips.us-gov-west-1.amazonaws.com", "aws-q"},
+		{"runtime.us-east-1.kiro.dev", "kiro"},
+		{"runtime.eu-central-1.kiro.dev", "kiro"},
 		{"my-model.inference.azure.com", "azure-inference"},
 		// Cursor / Copilot / Claude Code 相关
 		{"metrics.cursor.sh", "cursor"},
