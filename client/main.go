@@ -106,6 +106,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("  加载配置失败: %v", err)
 		}
+		resolveLocalUpstreamWithFallback(cfg, *configPath, nil)
 		doGlobalInstall(certMgr, cfg, *configPath)
 		return
 	}
@@ -138,6 +139,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("  加载配置失败: %v", err)
 	}
+	resolveLocalUpstreamWithFallback(cfg, *configPath, nil)
 
 	bypass := buildProxyBypassWithConfig(cfg)
 	noProxy := buildNoProxyEnvWithConfig(cfg)
