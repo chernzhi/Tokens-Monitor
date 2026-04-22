@@ -859,6 +859,12 @@ func (s *ProxyServer) processRequestBody(r *http.Request) string {
 	return model
 }
 
+// responseEndpointHasNoTokenUsage 为账户/支付等响应（无 OpenAI/Anthropic 式 usage 字段）的 API，不打印「extract failed」避免刷屏。
+// 无 usage 时后面仍会走 opaque 粗算逻辑（若配置开启且 shouldOpaqueEstimate 为真）。
+func responseEndpointHasNoTokenUsage(endpoint string) bool {
+	return strings.Contains(strings.ToLower(endpoint), "full_stripe_profile")
+}
+
 func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, sourceApp string, data []byte) {
 	if vendor == "github-copilot" {
 		s.updateGitHubCopilotDiscounts(data)
@@ -866,11 +872,13 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 
 	usage := ExtractUsage(vendor, data)
 	if usage == nil {
-		prefix := data
-		if len(prefix) > 120 {
-			prefix = prefix[:120]
+		if !responseEndpointHasNoTokenUsage(endpoint) {
+			prefix := data
+			if len(prefix) > 120 {
+				prefix = prefix[:120]
+			}
+			log.Printf("[usage] %s %s: extract failed, data_len=%d, prefix=%q", vendor, endpoint, len(data), string(prefix))
 		}
-		log.Printf("[usage] %s %s: extract failed, data_len=%d, prefix=%q", vendor, endpoint, len(data), string(prefix))
 	} else if usage.TotalTokens == 0 {
 		log.Printf("[usage] %s %s: TotalTokens=0 (prompt=%d, completion=%d, model=%q, sourceApp=%q)",
 			vendor, endpoint, usage.PromptTokens, usage.CompletionTokens, usage.Model, sourceApp)
