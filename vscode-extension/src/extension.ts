@@ -11,6 +11,21 @@ import { checkForUpdates } from './updater';
 
 const LEGACY_DEFAULT_SERVER_URL = 'http://192.168.0.135:8000';
 
+async function applyTrackerAuth(
+    secrets: vscode.SecretStorage,
+    cfg: import('./config').MonitorConfig,
+    tracker: TokenTracker,
+) {
+    const authSession = parseAuthSession(await secrets.get(AUTH_SESSION_SECRET_KEY));
+    if (authSession && authSessionMatchesConfig(authSession, cfg)) {
+        tracker.setAuthToken(authSession.token);
+    } else if (cfg.authToken) {
+        tracker.setAuthToken(cfg.authToken);
+    } else {
+        tracker.setAuthToken(undefined);
+    }
+}
+
 export async function activate(context: vscode.ExtensionContext) {
     const cfgSection = vscode.workspace.getConfiguration('aiTokenMonitor');
 
@@ -23,10 +38,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // TokenTracker: read-only stats viewer, fetches data from server
     const tracker = new TokenTracker(cfg, context.globalState);
-    const authSession = parseAuthSession(await context.secrets.get(AUTH_SESSION_SECRET_KEY));
-    if (authSession && authSessionMatchesConfig(authSession, cfg)) {
-        tracker.setAuthToken(authSession.token);
-    }
+    await applyTrackerAuth(context.secrets, cfg, tracker);
     tracker.start();
     context.subscriptions.push({ dispose: () => tracker.stop() });
 
@@ -72,9 +84,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Listen for config changes
     context.subscriptions.push(
-        vscode.workspace.onDidChangeConfiguration(e => {
+        vscode.workspace.onDidChangeConfiguration(async e => {
             if (e.affectsConfiguration('aiTokenMonitor')) {
                 const newCfg = getConfig();
+                await applyTrackerAuth(context.secrets, newCfg, tracker);
                 tracker.updateConfig(newCfg);
                 statusBar.refresh();
                 dashboardProvider.updateConfig(newCfg);

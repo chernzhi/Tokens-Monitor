@@ -5,15 +5,14 @@ Receives batched usage records from the Go client applications.
 
 import hashlib
 import logging
-import re
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_api_key_or_user_token
+from app.auth import require_api_key_or_user_token, require_user_token
 from app.canonical import dashboard_tz, canonical_provider_key, source_app_display_name
 from app.config import settings
 from app.database import get_db
@@ -97,16 +96,6 @@ class MyDailyUsageResponse(BaseModel):
     estimated_requests: int = 0
 
 
-class IdentityConflictError(Exception):
-    def __init__(self, employee_id: str, existing_name: str, provided_name: str):
-        self.employee_id = employee_id
-        self.existing_name = existing_name
-        self.provided_name = provided_name
-        super().__init__(
-            f"employee_id={employee_id!r} already belongs to {existing_name!r}, got {provided_name!r}"
-        )
-
-
 # ── Pricing cache (plain dicts to avoid DetachedInstanceError) ──
 
 _pricing_cache: dict[str, tuple[float, float]] = {}  # model_name → (input_price, output_price)
@@ -127,12 +116,6 @@ async def _get_pricing(db: AsyncSession) -> dict[str, tuple[float, float]]:
     _pricing_cache_ts = now
     return _pricing_cache
 
-
-
-# ── User cache ───────────────────────────────────────────────
-
-_user_cache: dict[str, int] = {}  # employee_id → user.id
-_dept_cache: dict[str, int] = {}  # department name → department.id
 
 
 def _normalize_identity_value(value: str | None) -> str:
@@ -156,53 +139,6 @@ def _same_person_name(left: str | None, right: str | None) -> bool:
     normalized_left = _normalize_person_name(left)
     normalized_right = _normalize_person_name(right)
     return bool(normalized_left and normalized_right and normalized_left == normalized_right)
-
-
-async def _resolve_existing_user_id(
-    db: AsyncSession, user_id: str, user_name: str
-) -> int | None:
-    """只读解析 token_usage_logs.user_id：按 email / employee_id 在已有 User 中匹配。
-
-    用于 my-stats / my-daily-usage 这类只读查询，避免在 _get_or_create_user 里
-    为 email 形式的 user_id 新建一个与真实用户不同 id 的僵尸账号，导致查询返回 0。
-    """
-    normalized_id = _normalize_identity_value(user_id)
-    normalized_name = _normalize_identity_value(user_name)
-    if not normalized_id:
-        return None
-
-    # 优先按 email 精确匹配活跃用户
-    result = await db.execute(
-        select(User).where(User.email == normalized_id, User.is_active == True)  # noqa: E712
-    )
-    user = result.scalar_one_or_none()
-    if user is None:
-        # 回退到 employee_id（兼容老用户用工号登录）
-        result = await db.execute(
-            select(User).where(User.employee_id == normalized_id, User.is_active == True)  # noqa: E712
-        )
-        user = result.scalar_one_or_none()
-
-    if user is None:
-        return None
-    # 防止同邮箱碰撞导致归错人：如果提供了姓名，必须与库内一致。
-    if normalized_name and not _same_person_name(user.name, normalized_name):
-        return None
-    return user.id
-
-
-
-def _raise_identity_conflict(exc: IdentityConflictError) -> None:
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "code": "identity_conflict",
-            "employee_id": exc.employee_id,
-            "existing_name": exc.existing_name,
-            "provided_name": exc.provided_name,
-            "message": f"工号 {exc.employee_id} 已绑定姓名“{exc.existing_name}”，与当前填写的“{exc.provided_name}”不一致。",
-        },
-    )
 
 
 def _safe_non_negative_int(value: int | None) -> int:
@@ -268,88 +204,6 @@ async def _get_existing_user_by_employee_id(db: AsyncSession, employee_id: str) 
     return result.scalar_one_or_none()
 
 
-_HEX_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
-
-
-def _looks_like_email(value: str) -> bool:
-    if not value or "@" not in value:
-        return False
-    domain = value.rsplit("@", 1)[-1]
-    return "." in domain and len(domain) >= 3
-
-
-def _looks_like_machine_fingerprint(value: str) -> bool:
-    return bool(_HEX_FINGERPRINT_RE.match(value or ""))
-
-
-_HEX_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
-
-
-def _looks_like_email(value: str) -> bool:
-    if not value or "@" not in value:
-        return False
-    domain = value.rsplit("@", 1)[-1]
-    return "." in domain and len(domain) >= 3
-
-
-def _looks_like_machine_fingerprint(value: str) -> bool:
-    return bool(_HEX_FINGERPRINT_RE.match(value or ""))
-
-
-async def _find_canonical_user_for_alias(
-    db: AsyncSession, alias_employee_id: str, name: str
-) -> User | None:
-    """在创建新 User 之前，尝试把 alias_employee_id 归并到一条已有的“真账号”。
-
-    避免客户端用未登录身份（邮箱 / 32 hex 机器指纹）上报、心跳时重复创建僵尸 User 行，
-    导致同一自然人在 users 表里产生 2-3 条重复记录。
-
-    只命中“能高置信识别为本人”的行，不命中则保持原有 INSERT 行为：
-      - 邮箱形态：existing.email == alias 或 existing.employee_id == alias，且姓名一致。
-        优先返回 password_hash 不空的注册行；同时优先 employee_id 不等于 alias 的“真工号行”。
-      - 32 字节 hex 指纹：仅在同 name 恒点 password_hash 不空的注册用户中唯一命中时归并；
-        多区别同名则跳过，避免串号。
-    """
-    alias = (alias_employee_id or "").strip()
-    person_name = (name or "").strip()
-    if not alias or not person_name:
-        return None
-
-    if _looks_like_email(alias):
-        result = await db.execute(
-            select(User).where(
-                User.is_active == True,  # noqa: E712
-                or_(User.email == alias, User.employee_id == alias),
-            )
-        )
-        candidates = [u for u in result.scalars().all() if _same_person_name(u.name, person_name)]
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda u: (
-                0 if u.password_hash else 1,
-                0 if u.employee_id and u.employee_id != alias else 1,
-                u.id,
-            )
-        )
-        return candidates[0]
-
-    if _looks_like_machine_fingerprint(alias):
-        result = await db.execute(
-            select(User).where(
-                User.is_active == True,  # noqa: E712
-                User.password_hash.isnot(None),
-                User.name == person_name,
-            )
-        )
-        registered = result.scalars().all()
-        if len(registered) == 1:
-            return registered[0]
-        return None
-
-    return None
-
-
 async def _get_same_name_employee_ids(db: AsyncSession, name: str, exclude_employee_id: str) -> list[str]:
     normalized_name = _normalize_identity_value(name)
     if not normalized_name:
@@ -381,130 +235,6 @@ async def _get_known_apps_for_user(db: AsyncSession, internal_user_id: int) -> l
         if display_name not in known_apps:
             known_apps.append(display_name)
     return known_apps[:5]
-
-
-async def _get_or_create_department(db: AsyncSession, name: str | None) -> int | None:
-    normalized = (name or "").strip()
-    if not normalized:
-        return None
-
-    if normalized in _dept_cache:
-        cached_department = await db.get(Department, _dept_cache[normalized])
-        if cached_department:
-            return cached_department.id
-        _dept_cache.pop(normalized, None)
-
-    result = await db.execute(
-        select(Department).where(Department.name == normalized)
-    )
-    department = result.scalar_one_or_none()
-    if department:
-        _dept_cache[normalized] = department.id
-        return department.id
-
-    department = Department(name=normalized)
-    db.add(department)
-    await db.flush()
-    _dept_cache[normalized] = department.id
-    return department.id
-
-
-async def _get_or_create_user(db: AsyncSession, employee_id: str, name: str, department: str | None) -> int:
-    normalized_employee_id = _normalize_identity_value(employee_id)
-    normalized_name = _normalize_identity_value(name)
-    department_id = await _get_or_create_department(db, department)
-
-    if normalized_employee_id in _user_cache:
-        cached_user = await db.get(User, _user_cache[normalized_employee_id])
-        if cached_user:
-            if normalized_name and not _same_person_name(cached_user.name, normalized_name):
-                if cached_user.password_hash:
-                    raise IdentityConflictError(cached_user.employee_id, cached_user.name, normalized_name)
-                cached_user.name = normalized_name
-            if department_id != cached_user.department_id:
-                cached_user.department_id = department_id
-            await db.flush()
-            return cached_user.id
-        _user_cache.pop(normalized_employee_id, None)
-
-    user = await _get_existing_user_by_employee_id(db, normalized_employee_id)
-    if user:
-        if normalized_name and not _same_person_name(user.name, normalized_name):
-            if user.password_hash:
-                raise IdentityConflictError(user.employee_id, user.name, normalized_name)
-            user.name = normalized_name
-        if department_id != user.department_id:
-            user.department_id = department_id
-        # 若精确命中的是「脏行」（password 空 + employee_id 形似邮箱/指纹），且库里另有
-        # 同人的真注册账号，则把 alias 升级归并到真账号，避免新上报继续灌进脏行。
-        if not user.password_hash and (
-            _looks_like_email(normalized_employee_id)
-            or _looks_like_machine_fingerprint(normalized_employee_id)
-        ):
-            canonical = await _find_canonical_user_for_alias(db, normalized_employee_id, normalized_name)
-            if canonical is not None and canonical.id != user.id:
-                _user_cache[normalized_employee_id] = canonical.id
-                await db.flush()
-                return canonical.id
-        await db.flush()
-        _user_cache[normalized_employee_id] = user.id
-        return user.id
-
-    # 在 INSERT 之前先试能不能归并到已有的真账号（邮箱别名 / 机器指纹 → 注册行）。
-    # 不归并会产生同一人在 users 表里 2-3 条僵尸行，且上报被分摄到多个 user_id。
-    canonical = await _find_canonical_user_for_alias(db, normalized_employee_id, normalized_name)
-    if canonical is not None:
-        if department_id and canonical.department_id is None:
-            canonical.department_id = department_id
-            await db.flush()
-        # 缓存 alias → 真 id 的映射，避免同进程重复查库。
-        _user_cache[normalized_employee_id] = canonical.id
-        return canonical.id
-
-    user = User(
-        employee_id=normalized_employee_id,
-        name=normalized_name,
-        department_id=department_id,
-    )
-    db.add(user)
-    await db.flush()
-    _user_cache[normalized_employee_id] = user.id
-    return user.id
-
-
-async def _resolve_anonymous_user_strict(
-    db: AsyncSession, alias_employee_id: str, name: str, department: str | None
-) -> int | None:
-    """匿名上报路径的「邮箱优先」身份解析。返回 None 表示应当丢弃这条上报。
-
-    规则：
-      - alias 形似邮箱 → 走原 _get_or_create_user（首次会按邮箱新建注册前的占位行，
-        后续注册成功会自动归并到真账号）。
-      - alias 不像邮箱（纯数字工号 / 32 hex 指纹 / DESKTOP-xxx\\Administrator 等）
-        → 仅当能高置信归并到已有注册账号时返回该账号 id；否则返回 None，
-        让调用方丢弃该记录、记日志，避免产生新的脏 User 行。
-    """
-    alias = (alias_employee_id or "").strip()
-    person_name = (name or "").strip()
-    if not alias or not person_name:
-        return None
-
-    if _looks_like_email(alias):
-        try:
-            return await _get_or_create_user(db, alias, person_name, department)
-        except IdentityConflictError:
-            raise
-
-    canonical = await _find_canonical_user_for_alias(db, alias, person_name)
-    if canonical is None:
-        return None
-    if department and canonical.department_id is None:
-        dept_id = await _get_or_create_department(db, department)
-        if dept_id:
-            canonical.department_id = dept_id
-            await db.flush()
-    _user_cache[alias] = canonical.id
-    return canonical.id
 
 
 async def _upsert_client_presence(
@@ -622,20 +352,22 @@ MAX_BATCH_SIZE = 500
 @router.post("/collect")
 async def collect_usage(
     records: list[UsageRecordIn],
-    request: Request,
     db: AsyncSession = Depends(get_db),
-    auth_user: User | None = Depends(require_api_key_or_user_token),
+    auth_user: User = Depends(require_user_token),
 ):
-    """Receive batched token usage records from client applications."""
+    """Receive batched token usage records from client applications.
+
+    必须携带 `Authorization: Bearer <auth_token>`。匿名 / 仅 X-API-Key 已禁用，避免多用户与僵尸行问题。
+    """
     if len(records) > MAX_BATCH_SIZE:
         raise HTTPException(status_code=400, detail=f"batch too large (max {MAX_BATCH_SIZE})")
     if not records:
         return {"status": "ok", "inserted": 0}
 
     pricing = await _get_pricing(db)
+    internal_user_id = auth_user.id
     inserted = 0
     skipped_duplicates = 0
-    skipped_anonymous = 0
     request_ids = [rec.request_id for rec in records if rec.request_id]
     existing_pairs: set[tuple[str, str]] = set()
 
@@ -655,39 +387,6 @@ async def collect_usage(
         if rec.request_id and (rec.request_id, source) in existing_pairs:
             skipped_duplicates += 1
             continue
-
-        # 当有认证用户时，强制使用认证用户的 employee_id/name/department
-        if auth_user:
-            effective_employee_id = auth_user.employee_id
-            effective_name = auth_user.name
-            dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
-            effective_department = dept.name if dept else None
-        else:
-            effective_employee_id = rec.user_id
-            effective_name = rec.user_name
-            effective_department = rec.department
-
-        if auth_user:
-            user_id = auth_user.id
-        else:
-            try:
-                user_id = await _resolve_anonymous_user_strict(
-                    db, effective_employee_id, effective_name, effective_department
-                )
-            except IdentityConflictError as exc:
-                _raise_identity_conflict(exc)
-            if user_id is None:
-                # 客户端裸上报但 user_id 不是邮箱，且匹配不到已注册账号 → 丢弃。
-                # 避免在 users 表里继续生成 "10034" / "5babb...32hex" 形态的脏行。
-                skipped_anonymous += 1
-                logger.info(
-                    "collect: drop anonymous record alias=%r name=%r vendor=%s model=%s",
-                    effective_employee_id,
-                    effective_name,
-                    rec.vendor,
-                    rec.model,
-                )
-                continue
 
         provider_key = canonical_provider_key(rec.vendor)
 
@@ -717,7 +416,7 @@ async def collect_usage(
             source_app_value = "cursor"
 
         log_entry = TokenUsageLog(
-            user_id=user_id,
+            user_id=internal_user_id,
             model_name=rec.model,
             provider=provider_key,
             source=source,
@@ -742,38 +441,35 @@ async def collect_usage(
         "status": "ok",
         "inserted": inserted,
         "skipped_duplicates": skipped_duplicates,
-        "skipped_anonymous": skipped_anonymous,
+        "skipped_anonymous": 0,
     }
 
 
-@router.post("/collect/tokscale", dependencies=[Depends(require_api_key_or_user_token)])
+@router.post("/collect/tokscale")
 async def collect_tokscale_usage(
     data: TokscaleSubmitRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    auth_user: User = Depends(require_user_token),
 ):
+    """Tokscale 上报必须已登录。用量归属为 auth_token 对应用户，不再按 body 内 user_id 建用户。"""
     contributions = data.payload.contributions
     if not contributions:
         return {"status": "ok", "inserted": 0, "replaced": 0, "sources": []}
 
-    normalized_user_id = _normalize_identity_value(data.user_id)
-    normalized_user_name = _normalize_identity_value(data.user_name)
-    normalized_department = _normalize_department_value(data.department)
-    if not _has_complete_identity(normalized_user_id, normalized_user_name):
-        raise HTTPException(status_code=400, detail="missing_identity")
-
-    try:
-        internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
-    except IdentityConflictError as exc:
-        _raise_identity_conflict(exc)
+    internal_user_id = auth_user.id
+    dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
+    display_department = dept.name if dept else None
+    display_user_id = _normalize_identity_value(auth_user.employee_id)
+    display_name = _normalize_identity_value(auth_user.name)
 
     ip = request.client.host if request.client else None
     await _upsert_client_presence(
         db,
         client_id=data.client_id,
-        user_name=normalized_user_name,
-        user_id=normalized_user_id,
-        department=normalized_department,
+        user_name=display_name,
+        user_id=display_user_id,
+        department=display_department,
         hostname=data.hostname,
         version=data.version,
         ip_address=ip,
@@ -788,6 +484,8 @@ async def collect_tokscale_usage(
     range_start = data.payload.meta.dateRange.start
     range_end = data.payload.meta.dateRange.end
     start_ts, end_ts = _tokscale_range(range_start, range_end)
+
+    tokscale_owner_key = str(internal_user_id)
 
     delete_stmt = delete(TokenUsageLog).where(
         TokenUsageLog.user_id == internal_user_id,
@@ -826,7 +524,7 @@ async def collect_tokscale_usage(
                 request_count=request_count,
                 cost_usd=round(max(float(client_contrib.cost or 0.0), 0.0), 6),
                 cost_cny=round(max(float(client_contrib.cost or 0.0), 0.0) * settings.USD_TO_CNY, 4),
-                request_id=_build_tokscale_request_id(normalized_user_id, contribution.date, source_app, provider, model),
+                request_id=_build_tokscale_request_id(tokscale_owner_key, contribution.date, source_app, provider, model),
                 request_at=request_at,
             ))
             inserted += 1
@@ -841,38 +539,20 @@ async def collect_tokscale_usage(
     }
 
 
-@router.post("/clients/heartbeat", dependencies=[Depends(require_api_key_or_user_token)])
+@router.post("/clients/heartbeat")
 async def client_heartbeat(
     data: ClientHeartbeatIn,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    auth_user: User = Depends(require_user_token),
 ):
-    """Register or update a client's online status."""
-    normalized_user_id = _normalize_identity_value(data.user_id)
-    normalized_user_name = _normalize_identity_value(data.user_name)
-    normalized_department = _normalize_department_value(data.department)
-
-    if not _has_complete_identity(normalized_user_id, normalized_user_name):
-        return {"status": "ignored", "reason": "missing_identity"}
+    """Register or update a client's online status. 必须已登录；展示身份以 token 为准。"""
+    dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
+    display_department = _normalize_department_value(dept.name if dept else None)
+    display_user_id = _normalize_identity_value(auth_user.employee_id)
+    display_name = _normalize_identity_value(auth_user.name)
 
     ip = request.client.host if request.client else None
-
-    try:
-        resolved_user_id = await _resolve_anonymous_user_strict(
-            db, normalized_user_id, normalized_user_name, normalized_department
-        )
-    except IdentityConflictError as exc:
-        _raise_identity_conflict(exc)
-
-    if resolved_user_id is None:
-        # 心跳 user_id 不是邮箱也无法归并到已注册账号 → 不创建 users 行，
-        # 但仍记录 client 在线状态，方便管理员看到设备存在并引导用户去 wizard 注册。
-        logger.info(
-            "heartbeat: anonymous client without registered email alias=%r name=%r host=%s",
-            normalized_user_id,
-            normalized_user_name,
-            data.hostname,
-        )
 
     result = await db.execute(
         select(Client).where(Client.client_id == data.client_id)
@@ -887,18 +567,18 @@ async def client_heartbeat(
                 last_seen=datetime.now(timezone.utc),
                 ip_address=ip,
                 version=data.version,
-                user_name=normalized_user_name,
-                user_id=normalized_user_id,
-                department=normalized_department,
+                user_name=display_name,
+                user_id=display_user_id,
+                department=display_department,
                 hostname=data.hostname,
             )
         )
     else:
         client = Client(
             client_id=data.client_id,
-            user_name=normalized_user_name,
-            user_id=normalized_user_id,
-            department=normalized_department,
+            user_name=display_name,
+            user_id=display_user_id,
+            department=display_department,
             hostname=data.hostname,
             ip_address=ip,
             version=data.version,
@@ -919,57 +599,22 @@ async def get_my_stats(
     department: str | None = None,
     days: int = Query(1, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
-    auth_user: User | None = Depends(require_api_key_or_user_token),
+    auth_user: User = Depends(require_user_token),
 ):
-    # 认证用户存在时直接使用其 user.id：上报路径（/api/collect）同样会把 tokens
-    # 归到 auth_user.id，这里必须保持一致，否则会因为 user_id 字段在 User 表里
-    # 是数值工号、而客户端传的是 email，导致查询命中一个新建的空用户而返回 0。
-    if auth_user is not None:
-        start_ts, end_ts = _ts_range(days)
-        stmt = select(
-            func.coalesce(func.sum(TokenUsageLog.total_tokens), 0),
-            func.coalesce(func.sum(func.coalesce(TokenUsageLog.request_count, 1)), 0),
-        ).where(
-            TokenUsageLog.user_id == auth_user.id,
-            TokenUsageLog.request_at.between(start_ts, end_ts),
-        )
-        result = await db.execute(stmt)
-        row = result.first()
-        today_tokens = int(row[0]) if row else 0
-        today_requests = int(row[1]) if row else 0
-        return MyStatsResponse(today_tokens=today_tokens, today_requests=today_requests)
-
-    normalized_user_id = _normalize_identity_value(user_id)
-    normalized_user_name = _normalize_identity_value(user_name)
-    normalized_department = _normalize_department_value(department)
-
-    if not _has_complete_identity(normalized_user_id, normalized_user_name):
-        return MyStatsResponse(today_tokens=0, today_requests=0)
-
-    # 只读解析：优先按 email/employee_id 匹配已有 User。找不到才降级走
-    # _get_or_create_user（只会在对应的用户有上报记录时才存在）。
-    internal_user_id = await _resolve_existing_user_id(db, normalized_user_id, normalized_user_name)
-    if internal_user_id is None:
-        try:
-            internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
-        except IdentityConflictError as exc:
-            _raise_identity_conflict(exc)
-        await db.commit()
+    """与 /api/collect 一致，仅允许 Bearer，统计项归属 auth 用户。query 参数保留兼容，已忽略。"""
     start_ts, end_ts = _ts_range(days)
-    
     stmt = select(
         func.coalesce(func.sum(TokenUsageLog.total_tokens), 0),
         func.coalesce(func.sum(func.coalesce(TokenUsageLog.request_count, 1)), 0),
     ).where(
-        TokenUsageLog.user_id == internal_user_id,
-        TokenUsageLog.request_at.between(start_ts, end_ts)
+        TokenUsageLog.user_id == auth_user.id,
+        TokenUsageLog.request_at.between(start_ts, end_ts),
     )
     result = await db.execute(stmt)
     row = result.first()
     today_tokens = int(row[0]) if row else 0
     today_requests = int(row[1]) if row else 0
-
-    return MyStatsResponse(today_tokens=int(today_tokens), today_requests=int(today_requests))
+    return MyStatsResponse(today_tokens=today_tokens, today_requests=today_requests)
 
 
 @router.get("/clients/my-daily-usage", response_model=MyDailyUsageResponse)
@@ -982,33 +627,10 @@ async def get_my_daily_usage(
     end_date: date | None = None,
     include_tokscale: bool = False,
     db: AsyncSession = Depends(get_db),
-    auth_user: User | None = Depends(require_api_key_or_user_token),
+    auth_user: User = Depends(require_user_token),
 ):
-    # 与 /api/collect 对齐：认证用户存在时优先使用 auth_user.id，避免把 email 当作
-    # employee_id 新建/命中错误的 User 导致查询返回 0。
-    if auth_user is not None:
-        internal_user_id = auth_user.id
-    else:
-        normalized_user_id = _normalize_identity_value(user_id)
-        normalized_user_name = _normalize_identity_value(user_name)
-        normalized_department = _normalize_department_value(department)
-
-        if not _has_complete_identity(normalized_user_id, normalized_user_name):
-            return MyDailyUsageResponse(
-                points=[],
-                total_tokens=0,
-                total_cost_usd=0.0,
-                total_cost_cny=0.0,
-                total_requests=0,
-            )
-
-        internal_user_id = await _resolve_existing_user_id(db, normalized_user_id, normalized_user_name)
-        if internal_user_id is None:
-            try:
-                internal_user_id = await _get_or_create_user(db, normalized_user_id, normalized_user_name, normalized_department)
-            except IdentityConflictError as exc:
-                _raise_identity_conflict(exc)
-            await db.commit()
+    """仅允许 Bearer；query 参数保留兼容，已忽略。"""
+    internal_user_id = auth_user.id
 
     start_ts, end_ts = _ts_range(days, start_date, end_date)
     local_day = _request_local_date_column()

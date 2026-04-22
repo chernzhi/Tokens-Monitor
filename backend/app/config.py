@@ -6,7 +6,9 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # 认证配置
-    COLLECT_API_KEY: str = ""  # 上报用全局 API Key，为空时进入迁移宽限期（仅告警不拒绝）
+    # 上报用全局 API Key：用于 /api/* 中仍接受「仅 X-API-Key」的接口（如安装向导前 identity-check）；
+    # /api/collect、心跳、个人统计 等须登录（Authorization: Bearer），与 COLLECT_API_KEY 无关。
+    COLLECT_API_KEY: str = ""  # 为空时 /identity-check 等端点处于宽限期；建议生产显式设置
     ADMIN_PASSWORD: str = ""   # 管理接口密码，为空时拒绝所有管理请求返回 503
 
     # CORS 允许域名（逗号分隔），为空时使用默认内网地址

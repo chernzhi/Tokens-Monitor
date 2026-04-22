@@ -9,6 +9,8 @@ export interface MonitorConfig {
     department: string;
     copilotOrg: string;
     apiKey: string;
+    /** 优先于 identity.json 的显式工作区项（如设置 aiTokenMonitor.authToken） */
+    authToken: string;
 }
 
 interface IdentityInfo {
@@ -16,6 +18,8 @@ interface IdentityInfo {
     user_name?: string;
     department?: string;
     api_key?: string;
+    /** 与 ai-monitor 配置同步，供仅读 API（如 my-stats）在未用扩展密钥区登录时回退 */
+    auth_token?: string;
 }
 
 let _identityCache: IdentityInfo | null | undefined; // undefined = not yet loaded
@@ -51,6 +55,7 @@ export function getConfig(): MonitorConfig {
         department: cfg.get<string>('department', '') || identity?.department || '',
         copilotOrg: cfg.get<string>('copilotOrg', ''),
         apiKey: cfg.get<string>('apiKey', '') || identity?.api_key || '',
+        authToken: (cfg.get<string>('authToken', '') || identity?.auth_token || '').trim(),
     };
 }
 

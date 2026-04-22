@@ -38,6 +38,7 @@ describe('config', () => {
             expect(cfg.department).toBe('');
             expect(cfg.copilotOrg).toBe('');
             expect(cfg.apiKey).toBe('');
+            expect(cfg.authToken).toBe('');
         });
 
         test('strips trailing slashes from serverUrl', () => {
@@ -60,6 +61,7 @@ describe('config', () => {
                 department: 'Dev',
                 copilotOrg: 'my-org',
                 apiKey: 'test-key-123',
+                authToken: 'token-from-workspace',
             };
 
             mockGetConfiguration.mockReturnValue({
@@ -75,6 +77,7 @@ describe('config', () => {
             expect(cfg.department).toBe('Dev');
             expect(cfg.copilotOrg).toBe('my-org');
             expect(cfg.apiKey).toBe('test-key-123');
+            expect(cfg.authToken).toBe('token-from-workspace');
         });
     });
 

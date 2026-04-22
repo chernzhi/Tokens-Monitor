@@ -17,6 +17,7 @@ describe('TokenTracker (read-only dashboard)', () => {
         department: 'Engineering',
         copilotOrg: '',
         apiKey: '',
+        authToken: '',
     };
 
     beforeEach(() => {

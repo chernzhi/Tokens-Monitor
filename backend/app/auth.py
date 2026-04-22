@@ -58,7 +58,11 @@ async def _lookup_user_by_token(token: str, db: AsyncSession) -> User | None:
 
 
 async def require_user_token(request: Request, db: AsyncSession = Depends(get_db)) -> User:
-    """用户 token 认证依赖。返回已认证的 User 对象。"""
+    """用户 token 认证依赖。返回已认证的 User 对象。
+
+    用于 /api/collect、心跳、按登录用户聚合的只读统计等需「已登录」才能访问的接口。
+    仅 `Authorization: Bearer <auth_token>`，不接受仅 X-API-Key 替代登录。
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="unauthorized")

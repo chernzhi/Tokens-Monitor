@@ -712,9 +712,10 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		identityPath := filepath.Join(appDataDir(), "identity.json")
 		os.MkdirAll(filepath.Dir(identityPath), 0755)
 		identityData, _ := json.MarshalIndent(map[string]string{
-			"user_id":    cfg.UserID,
-			"user_name":  cfg.UserName,
-			"department": cfg.Department,
+			"user_id":     cfg.UserID,
+			"user_name":   cfg.UserName,
+			"department":  cfg.Department,
+			"auth_token":  cfg.AuthToken,
 		}, "", "  ")
 		os.WriteFile(identityPath, identityData, 0644)
 
