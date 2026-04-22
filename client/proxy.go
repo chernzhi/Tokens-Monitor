@@ -170,6 +170,9 @@ var aiDomains = map[string]string{
 	"api.qoder.sh":    "qoder",
 	"center.qoder.sh": "qoder",
 	"api.qoder.com":   "qoder",
+
+	// ── OFox AI（OpenAI 兼容接口）──
+	"api.ofox.ai": "ofox",
 }
 
 // aiWildcardDomains matches AI hostnames by suffix (and optional prefix).
