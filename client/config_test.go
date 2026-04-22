@@ -141,3 +141,27 @@ func TestLoadConfig_ValidatesOptionalUpstreamProxy(t *testing.T) {
 		t.Fatalf("UpstreamProxy = %q", cfg.UpstreamProxy)
 	}
 }
+
+func TestIsSelfProxyOnlyTreatsAIMonitorPortsAsSelf(t *testing.T) {
+	for _, proxy := range []string{
+		"http://127.0.0.1:18090",
+		"http://localhost:18100",
+		"http://[::1]:18153",
+	} {
+		if !isSelfProxy(proxy) {
+			t.Fatalf("%s should be treated as ai-monitor self proxy", proxy)
+		}
+	}
+	for _, proxy := range []string{
+		"socks5://localhost:7890",
+		"http://127.0.0.1:8899",
+		"http://proxy.example:8080",
+	} {
+		if isSelfProxy(proxy) {
+			t.Fatalf("%s should not be treated as ai-monitor self proxy", proxy)
+		}
+	}
+	if isSelfProxy("http://proxy.example:8080") {
+		t.Fatal("remote proxy should not be treated as self")
+	}
+}

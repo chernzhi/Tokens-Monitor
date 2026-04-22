@@ -107,6 +107,7 @@ func TestInferSourceApp(t *testing.T) {
 	}{
 		{name: "preset wins", args: []string{"C:\\Tools\\cursor.exe"}, preset: &launchPreset{Name: "cursor"}, wantApp: "cursor"},
 		{name: "vscode command", args: []string{"code.cmd"}, wantApp: "vscode"},
+		{name: "codex command", args: []string{"/usr/local/bin/codex"}, wantApp: "codex"},
 		{name: "powershell exe", args: []string{"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"}, wantApp: "powershell"},
 		{name: "custom command", args: []string{"python.exe"}, wantApp: "python"},
 		{name: "empty args", args: nil, wantApp: ""},
@@ -118,6 +119,28 @@ func TestInferSourceApp(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompatProxyPortsIncludesStaleSelfProxyPorts(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:18092")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+
+	got := compatProxyPorts(&Config{Port: 18090}, 18090)
+	if !intSliceContains(got, 18091) || !intSliceContains(got, 18092) {
+		t.Fatalf("compatProxyPorts()=%v, want stale ai-monitor ports 18091 and 18092", got)
+	}
+	if intSliceContains(got, 18090) || intSliceContains(got, 7890) {
+		t.Fatalf("compatProxyPorts()=%v, should exclude current port and non-ai-monitor proxy port", got)
+	}
+}
+
+func intSliceContains(xs []int, want int) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestManagedPresetProcessImage(t *testing.T) {

@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 )
@@ -91,5 +93,60 @@ func TestReporterFlushRecordedByServer(t *testing.T) {
 	}
 	if rp.Stats.TotalReported.Load() != 1 {
 		t.Fatalf("Stats.TotalReported = %d", rp.Stats.TotalReported.Load())
+	}
+}
+
+func TestResolveReportProxyAutoIgnoresEnvProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:18090")
+	proxyFunc := resolveReportProxy(&Config{
+		ServerURL: "https://otw.tech:59889",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://otw.tech:59889/api/clients/heartbeat", nil)
+	got, err := proxyFunc(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 核心断言：不能把请求路由回自身（18090 是 ai-monitor 本身的端口）。
+	// 若 install_state 保存了其他可达的上游代理（如 8089），允许使用它——行为正确。
+	if got != nil && isSelfProxy(got.String()) {
+		t.Fatalf("auto report proxy must not loop back to self (port 18090), got %s", got.Redacted())
+	}
+}
+
+func TestResolveReportProxyAutoUsesReachableLoopbackUpstream(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	upstream := "http://" + ln.Addr().String()
+	t.Setenv("HTTPS_PROXY", upstream)
+	proxyFunc := resolveReportProxy(&Config{
+		ServerURL: "https://otw.tech:59889",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://otw.tech:59889/api/collect", nil)
+	got, err := proxyFunc(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.String() != upstream {
+		t.Fatalf("auto report proxy=%v want %s", got, upstream)
+	}
+}
+
+func TestResolveReportProxyExplicitURL(t *testing.T) {
+	proxyFunc := resolveReportProxy(&Config{
+		ServerURL:   "https://otw.tech:59889",
+		ReportProxy: "http://proxy.example:8080",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://otw.tech:59889/api/collect", nil)
+	got, err := proxyFunc(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := url.Parse("http://proxy.example:8080")
+	if got.String() != want.String() {
+		t.Fatalf("proxy=%s want %s", got, want)
 	}
 }

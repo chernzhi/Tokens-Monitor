@@ -21,6 +21,14 @@ func TestDeepExtractUsageInChoices(t *testing.T) {
 	}
 }
 
+func TestDeepExtractUsageResponsesTokens(t *testing.T) {
+	const j = `{"type":"response.completed","response":{"model":"gpt-5.4-codex","usage":{"input_tokens":11,"output_tokens":13,"total_tokens":24}}}`
+	u := ExtractUsage("openai", []byte(j))
+	if u == nil || u.TotalTokens != 24 || u.PromptTokens != 11 || u.CompletionTokens != 13 || u.Model != "gpt-5.4-codex" {
+		t.Fatalf("got %+v", u)
+	}
+}
+
 func TestCursorVendorOpenAICompatibleJSON(t *testing.T) {
 	const j = `{"model":"cursor-small","usage":{"prompt_tokens":100,"completion_tokens":200,"total_tokens":300}}`
 	u := ExtractUsage("cursor", []byte(j))
@@ -59,6 +67,16 @@ func TestSSEUsageAndModelSplitAcrossEvents(t *testing.T) {
 		"data: [DONE]\n"
 	u := ExtractUsage("openai", []byte(sse))
 	if u == nil || u.TotalTokens != 17 || u.Model != "gpt-4o" {
+		t.Fatalf("got %+v", u)
+	}
+}
+
+func TestSSEResponsesUsageAndModelSplitAcrossEvents(t *testing.T) {
+	const sse = "data: {\"response\":{\"model\":\"gpt-5.4-codex\"},\"type\":\"response.started\"}\n\n" +
+		"data: {\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":9,\"total_tokens\":17}}}\n\n" +
+		"data: [DONE]\n"
+	u := ExtractUsage("openai", []byte(sse))
+	if u == nil || u.TotalTokens != 17 || u.PromptTokens != 8 || u.CompletionTokens != 9 || u.Model != "gpt-5.4-codex" {
 		t.Fatalf("got %+v", u)
 	}
 }

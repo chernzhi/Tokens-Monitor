@@ -79,7 +79,8 @@ type Reporter struct {
 }
 
 // resolveReportProxy determines the proxy function for the Reporter HTTP client.
-// Priority: config.report_proxy > smart detection (private=direct, otherwise upstream).
+// Auto mode uses an explicit/detected upstream when available, otherwise direct.
+// Loopback upstream candidates are probed before use so stale local developer proxies are ignored.
 func resolveReportProxy(cfg *Config) func(*http.Request) (*url.URL, error) {
 	directProxy := func(*http.Request) (*url.URL, error) { return nil, nil }
 
@@ -109,21 +110,17 @@ func resolveReportProxy(cfg *Config) func(*http.Request) (*url.URL, error) {
 		return directProxy
 
 	case "", "auto":
-		if isPrivateServerURL(cfg.ServerURL) {
-			log.Println("[reporter] 上报路由: 直连 (server_url 为内网地址)")
-			return directProxy
-		}
 		upstream := strings.TrimSpace(cfg.UpstreamProxy)
 		if upstream == "" {
 			upstream = detectUpstreamProxy(cfg)
 		}
 		if upstream != "" {
 			if u, err := url.Parse(upstream); err == nil {
-				log.Printf("[reporter] 上报路由: 走上游代理 %s (server_url 为外网，自动检测)", u.Redacted())
+				log.Printf("[reporter] 上报路由: 走上游代理 %s (report_proxy=auto)", u.Redacted())
 				return http.ProxyURL(u)
 			}
 		}
-		log.Println("[reporter] 上报路由: 直连 (未检测到上游代理)")
+		log.Println("[reporter] 上报路由: 直连 (report_proxy=auto, no upstream)")
 		return directProxy
 
 	default:

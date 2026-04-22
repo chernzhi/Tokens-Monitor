@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // detectUpstreamProxy discovers the user's existing proxy before ai-monitor sets itself up.
@@ -19,11 +21,14 @@ func detectUpstreamProxy(cfg *Config) string {
 
 	// 2. OS-specific system proxy read (Windows registry; no-op on other platforms)
 	if sysProxy := readCurrentSystemProxy(); sysProxy != "" {
-		if !isSelfProxy(sysProxy) {
+		if isSelfProxy(sysProxy) {
+			log.Printf("[upstream] ignoring system proxy %s (points to self)", sysProxy)
+		} else if !isUsableDetectedProxy(sysProxy) {
+			log.Printf("[upstream] ignoring system proxy %s (loopback proxy is not reachable)", sysProxy)
+		} else {
 			log.Printf("[upstream] auto-detected system proxy: %s", sysProxy)
 			return sysProxy
 		}
-		log.Printf("[upstream] ignoring system proxy %s (points to self)", sysProxy)
 	}
 
 	// 3. Standard proxy environment variables
@@ -40,14 +45,19 @@ func detectUpstreamProxy(cfg *Config) string {
 			log.Printf("[upstream] ignoring env %s=%s (points to self)", key, v)
 			continue
 		}
+		if !isUsableDetectedProxy(v) {
+			log.Printf("[upstream] ignoring env %s=%s (loopback proxy is not reachable)", key, v)
+			continue
+		}
 		log.Printf("[upstream] auto-detected env %s: %s", key, v)
 		return v
 	}
 
 	// 4. Fallback: install_state.json saved the upstream before install overwrote everything.
 	// This handles the case where system proxy + env vars now all point to ai-monitor.
+	// 同样做 TCP 可达性探测，避免上次安装时保存的本地代理已停止运行而影响上报。
 	if state := loadInstallState(); state != nil && state.PreviousUpstreamProxy != "" {
-		if !isSelfProxy(state.PreviousUpstreamProxy) {
+		if !isSelfProxy(state.PreviousUpstreamProxy) && isUsableDetectedProxy(state.PreviousUpstreamProxy) {
 			log.Printf("[upstream] recovered from install_state: %s", state.PreviousUpstreamProxy)
 			return state.PreviousUpstreamProxy
 		}
@@ -93,34 +103,75 @@ func patchConfigUpstreamProxy(configPath, upstream string) error {
 }
 
 // isSelfProxy returns true if the proxy URL points to ai-monitor's own listening range.
+// Other loopback proxies such as Clash/V2Ray on 127.0.0.1:7890 are valid upstreams
+// and must not be treated as self, otherwise full-proxy installs break internet access.
 func isSelfProxy(proxy string) bool {
-	raw := strings.TrimSpace(proxy)
-	if raw == "" {
+	host, port, ok := proxyHostPort(proxy)
+	if !ok {
 		return false
 	}
-	// Ensure the value is parseable as a URL; bare host:port needs a scheme.
+	host = strings.ToLower(host)
+	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		return false
+	}
+	return port >= 18090 && port <= 18090+mitmPortMaxFallback-1
+}
+
+func isUsableDetectedProxy(proxy string) bool {
+	host, port, ok := proxyHostPort(proxy)
+	if !ok {
+		return true
+	}
+	host = strings.ToLower(host)
+	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		return true
+	}
+	addr := net.JoinHostPort(host, intToString(port))
+	conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func proxyHostPort(proxy string) (string, int, bool) {
+	raw := strings.TrimSpace(proxy)
+	if raw == "" {
+		return "", 0, false
+	}
 	if !strings.Contains(raw, "://") {
 		raw = "http://" + raw
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return false
+		return "", 0, false
 	}
-	host := strings.ToLower(u.Hostname())
-	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-		return false
-	}
+	host := u.Hostname()
 	portStr := u.Port()
 	if portStr == "" {
-		return false
+		return "", 0, false
 	}
 	port := 0
 	for _, c := range portStr {
 		if c < '0' || c > '9' {
-			return false
+			return "", 0, false
 		}
 		port = port*10 + int(c-'0')
 	}
-	// ai-monitor uses port range 18090 – 18090+(mitmPortMaxFallback-1) = 18153
-	return port >= 18090 && port <= 18090+mitmPortMaxFallback-1
+	return host, port, true
+}
+
+func intToString(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
 }

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -35,12 +36,20 @@ var aiDomains = map[string]string{
 	"chatgpt.com":     "openai-codex",
 	"www.chatgpt.com": "openai-codex",
 
+	// ── ChatGPT Web (网页版，无标准 usage 字段，走体积估算) ──
+	"ab.chatgpt.com":  "chatgpt",
+	"chat.openai.com": "chatgpt",
+
 	// ── GitHub Copilot (VS Code, Visual Studio, Kiro 等) ──
 	"copilot-proxy.githubusercontent.com": "github-copilot",
 	"api.githubcopilot.com":               "github-copilot",
 	"api.individual.githubcopilot.com":    "github-copilot",
 	"api.business.githubcopilot.com":      "github-copilot",
 	"api.enterprise.githubcopilot.com":    "github-copilot",
+
+	// ── Kiro（官方核心服务：chat / code assistance）──
+	"runtime.us-east-1.kiro.dev":    "kiro",
+	"runtime.eu-central-1.kiro.dev": "kiro",
 
 	// ── GitHub Models ──
 	"models.inference.ai.azure.com": "github-models",
@@ -181,6 +190,8 @@ var aiWildcardDomains = []struct {
 	{suffix: ".amazonaws.com", prefix: "codewhisperer.", vendor: "aws-codewhisperer"},
 	// Amazon Q Developer API：q.<region>.amazonaws.com
 	{suffix: ".amazonaws.com", prefix: "q.", vendor: "aws-q"},
+	// Kiro GovCloud / Amazon Q FIPS endpoint：q-fips.<region>.amazonaws.com
+	{suffix: ".amazonaws.com", prefix: "q-fips.", vendor: "aws-q"},
 	// Azure AI Inference / Foundry 等：*.inference.azure.com
 	{suffix: ".inference.azure.com", vendor: "azure-inference"},
 	// Cursor 新增子域（如未来 api*.cursor.sh）
@@ -227,7 +238,7 @@ func isPinnedTLSHost(hostname string, cfg *Config) bool {
 
 // matchAIDomain 判断主机名是否应走 MITM，并返回供应商标签（内置表 + config 扩展）。
 func (s *ProxyServer) matchAIDomain(hostname string) (string, bool) {
-	hostname = strings.ToLower(hostname) // RFC 1123：hostname 大小写不敏感
+	hostname = normalizeProxyHostname(hostname) // ToLower + TrimSpace + 去除末尾点号
 	if vendor, ok := aiDomains[hostname]; ok {
 		return vendor, true
 	}
@@ -259,6 +270,12 @@ func (s *ProxyServer) matchAIDomain(hostname string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func normalizeProxyHostname(hostname string) string {
+	hostname = strings.TrimSpace(strings.ToLower(hostname))
+	hostname = strings.TrimSuffix(hostname, ".")
+	return hostname
 }
 
 // legacyRoutes maps vendor short names to upstream API base URLs.
@@ -395,7 +412,7 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(host, ":") {
 		host += ":443"
 	}
-	hostname := host[:strings.LastIndex(host, ":")]
+	hostname := normalizeProxyHostname(host[:strings.LastIndex(host, ":")])
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -417,6 +434,9 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if isAI && s.certMgr != nil {
 		log.Printf("[CONNECT] MITM → %s (%s)", hostname, vendor)
 		go safeGo("mitm "+hostname, func() { s.mitmConnection(clientConn, host, hostname, vendor) })
+	} else if isAI {
+		log.Printf("[CONNECT] tunnel → %s (%s, no cert manager)", hostname, vendor)
+		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host) })
 	} else {
 		if vendor != "" {
 			log.Printf("[CONNECT] tunnel → %s (钉证书主机，跳过 MITM)", hostname)
@@ -528,7 +548,7 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		// 与上游一致：Copilot / 多数云 API 默认 HTTP/2（ALPN h2）；仅 http/1.1 时客户端无法对话。
-		NextProtos: []string{"h2", "http/1.1"},
+		NextProtos: mitmClientALPN(vendor),
 		MinVersion: tls.VersionTLS12,
 	})
 	if err := tlsConn.Handshake(); err != nil {
@@ -566,6 +586,11 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 		req.Header.Del("Accept-Encoding")
 		endpoint := req.URL.Path
 
+		if isWebSocketUpgrade(req) {
+			s.handleWebSocketMITM(tlsConn, reader, req, host, hostname, vendor, endpoint, requestModel, sourceApp)
+			return
+		}
+
 		resp, err := s.transport.RoundTrip(req)
 		if err != nil {
 			log.Printf("[MITM] forward error %s%s: %v", hostname, endpoint, err)
@@ -602,6 +627,18 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 			return
 		}
 	}
+}
+
+func mitmClientALPN(vendor string) []string {
+	if isChatGPTLikeVendor(vendor) {
+		return []string{"http/1.1"}
+	}
+	return []string{"h2", "http/1.1"}
+}
+
+func isChatGPTLikeVendor(vendor string) bool {
+	vendor = strings.ToLower(strings.TrimSpace(vendor))
+	return vendor == "chatgpt" || vendor == "openai-codex"
 }
 
 // serveMitmHTTP2 在已协商 ALPN=h2 的 TLS 连接上处理 HTTP/2 请求（与 GitHub Copilot 等客户端一致）。
@@ -664,6 +701,435 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 			}
 		}),
 	})
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return headerHasToken(r.Header, "Connection", "upgrade") &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket")
+}
+
+func headerHasToken(h http.Header, key, token string) bool {
+	token = strings.ToLower(strings.TrimSpace(token))
+	for _, value := range h.Values(key) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.ToLower(strings.TrimSpace(part)) == token {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *ProxyServer) handleWebSocketMITM(clientConn net.Conn, clientReader *bufio.Reader, req *http.Request, host, hostname, vendor, endpoint, requestModel, sourceApp string) {
+	wsID := fmt.Sprintf("%x", time.Now().UnixNano())
+	started := time.Now()
+	diag := isCodexWebSocketEndpoint(vendor, endpoint)
+	clientBuffered := 0
+	if clientReader != nil {
+		clientBuffered = clientReader.Buffered()
+	}
+	if diag {
+		log.Printf("[MITM/ws/diag %s] start %s%s client_local=%s client_remote=%s buffered=%d key=%s protocol=%q client_extensions=%q forwarded_extensions=%q version=%q",
+			wsID, hostname, endpoint, safeAddr(clientConn.LocalAddr()), safeAddr(clientConn.RemoteAddr()), clientBuffered,
+			req.Header.Get("Sec-WebSocket-Key"),
+			req.Header.Get("Sec-WebSocket-Protocol"),
+			req.Header.Get("Sec-WebSocket-Extensions"),
+			"",
+			req.Header.Get("Sec-WebSocket-Version"),
+		)
+	}
+
+	upstreamConn, err := s.dialTLSUpstream(hostname, host)
+	if err != nil {
+		log.Printf("[MITM/ws] dial %s%s: %v", hostname, endpoint, err)
+		writeHTTPErrorToConn(clientConn, http.StatusBadGateway, fmt.Sprintf("proxy websocket dial: %v", err))
+		return
+	}
+	defer upstreamConn.Close()
+	if diag {
+		log.Printf("[MITM/ws/diag %s] upstream connected local=%s remote=%s", wsID, safeAddr(upstreamConn.LocalAddr()), safeAddr(upstreamConn.RemoteAddr()))
+	}
+
+	req.Header.Del("Proxy-Connection")
+	req.Header.Del("Accept-Encoding")
+	req.Header.Del("Sec-WebSocket-Extensions")
+	req.RequestURI = ""
+	req.URL.Scheme = "https"
+	req.URL.Host = hostname
+
+	if err := req.Write(upstreamConn); err != nil {
+		log.Printf("[MITM/ws] write request %s%s: %v", hostname, endpoint, err)
+		if diag {
+			log.Printf("[MITM/ws/diag %s] write request failed after=%s err=%v", wsID, time.Since(started), err)
+		}
+		return
+	}
+
+	upstreamReader := bufio.NewReader(upstreamConn)
+	resp, err := http.ReadResponse(upstreamReader, req)
+	if err != nil {
+		log.Printf("[MITM/ws] read response %s%s: %v", hostname, endpoint, err)
+		if diag {
+			log.Printf("[MITM/ws/diag %s] read response failed after=%s err=%v", wsID, time.Since(started), err)
+		}
+		writeHTTPErrorToConn(clientConn, http.StatusBadGateway, fmt.Sprintf("proxy websocket response: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	if diag {
+		log.Printf("[MITM/ws/diag %s] upstream response status=%d accept=%q protocol=%q extensions=%q conn=%q upgrade=%q buffered=%d after=%s",
+			wsID,
+			resp.StatusCode,
+			resp.Header.Get("Sec-WebSocket-Accept"),
+			resp.Header.Get("Sec-WebSocket-Protocol"),
+			resp.Header.Get("Sec-WebSocket-Extensions"),
+			resp.Header.Get("Connection"),
+			resp.Header.Get("Upgrade"),
+			upstreamReader.Buffered(),
+			time.Since(started),
+		)
+	}
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		peek, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		log.Printf("[MITM/ws] %s %s%s → %d body=%q", req.Method, hostname, endpoint, resp.StatusCode, string(peek))
+		resp.Body = io.NopCloser(bytes.NewReader(peek))
+		resp.ContentLength = int64(len(peek))
+		resp.Header.Del("Transfer-Encoding")
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(peek)))
+		if err := resp.Write(clientConn); err != nil {
+			return
+		}
+		return
+	}
+
+	log.Printf("[MITM/ws] %s %s%s → %d", req.Method, hostname, endpoint, resp.StatusCode)
+	if err := writeWebSocketSwitchResponse(clientConn, resp); err != nil {
+		if diag {
+			log.Printf("[MITM/ws/diag %s] write 101 to client failed after=%s err=%v", wsID, time.Since(started), err)
+		}
+		return
+	}
+	if diag {
+		log.Printf("[MITM/ws/diag %s] switched after=%s client_buffered=%d upstream_buffered=%d accept=%q protocol=%q extensions=%q",
+			wsID,
+			time.Since(started),
+			clientBuffered,
+			upstreamReader.Buffered(),
+			resp.Header.Get("Sec-WebSocket-Accept"),
+			resp.Header.Get("Sec-WebSocket-Protocol"),
+			resp.Header.Get("Sec-WebSocket-Extensions"),
+		)
+	}
+
+	done := make(chan wsCopyResult, 2)
+	go func() {
+		src := io.Reader(clientConn)
+		if clientReader != nil && clientReader.Buffered() > 0 {
+			src = io.MultiReader(clientReader, clientConn)
+		}
+		n, err := io.Copy(upstreamConn, src)
+		if diag {
+			log.Printf("[MITM/ws/diag %s] client->server ended bytes=%d after=%s err=%v closed=%v", wsID, n, time.Since(started), err, isClosedNetworkError(err))
+		}
+		if err != nil && !isClosedNetworkError(err) {
+			log.Printf("[MITM/ws] client->server copy ended %s%s: %v", hostname, endpoint, err)
+		}
+		done <- wsCopyResult{direction: "client->server", bytes: n, err: err}
+	}()
+	go func() {
+		serverToClient := &countingWriter{w: clientConn}
+		frameCount := 0
+		err := copyWebSocketServerToClientObserved(serverToClient, upstreamReader, func(payload []byte) {
+			s.processResponseData(vendor, endpoint, requestModel, sourceApp, payload)
+		}, func(frame websocketFrame, frameErr error) {
+			if !diag {
+				return
+			}
+			frameCount++
+			if frameCount <= 8 || frameErr != nil {
+				log.Printf("[MITM/ws/diag %s] server frame #%d opcode=%d fin=%v masked=%v payload=%d raw=%d err=%v",
+					wsID, frameCount, frame.opcode, frame.fin, frame.masked, len(frame.payload), len(frame.raw), frameErr)
+			}
+		})
+		if diag {
+			log.Printf("[MITM/ws/diag %s] server->client ended bytes=%d frames=%d after=%s err=%v closed=%v", wsID, serverToClient.n, frameCount, time.Since(started), err, isClosedNetworkError(err))
+		}
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF && !isClosedNetworkError(err) {
+			log.Printf("[MITM/ws] server->client copy ended %s%s: %v", hostname, endpoint, err)
+		}
+		done <- wsCopyResult{direction: "server->client", bytes: serverToClient.n, err: err}
+	}()
+	first := <-done
+	if diag {
+		log.Printf("[MITM/ws/diag %s] first direction ended=%s bytes=%d err=%v total_after=%s waiting peer", wsID, first.direction, first.bytes, first.err, time.Since(started))
+	}
+	second := <-done
+	if diag {
+		log.Printf("[MITM/ws/diag %s] second direction ended=%s bytes=%d err=%v total_after=%s closing tunnel", wsID, second.direction, second.bytes, second.err, time.Since(started))
+	}
+}
+
+func isClosedNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+type wsCopyResult struct {
+	direction string
+	bytes     int64
+	err       error
+}
+
+func isCodexWebSocketEndpoint(vendor, endpoint string) bool {
+	return strings.EqualFold(strings.TrimSpace(vendor), "openai-codex") &&
+		strings.Contains(strings.ToLower(endpoint), "/backend-api/codex/responses")
+}
+
+func safeAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func (s *ProxyServer) dialTLSUpstream(hostname, host string) (*tls.Conn, error) {
+	var rawConn net.Conn
+	var err error
+	if s.upstreamProxy != nil {
+		rawConn, err = s.dialViaUpstreamProxy(host)
+	} else {
+		rawConn, err = net.DialTimeout("tcp", host, 15*time.Second)
+	}
+	if err != nil {
+		return nil, err
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: hostname,
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func writeHTTPErrorToConn(conn net.Conn, status int, msg string) {
+	resp := &http.Response{
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{"Content-Type": {"text/plain; charset=utf-8"}, "Connection": {"close"}},
+		Body:          io.NopCloser(strings.NewReader(msg)),
+		ContentLength: int64(len(msg)),
+	}
+	_ = resp.Write(conn)
+}
+
+func writeWebSocketSwitchResponse(w io.Writer, resp *http.Response) error {
+	var b strings.Builder
+	b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	b.WriteString("Upgrade: websocket\r\n")
+	b.WriteString("Connection: Upgrade\r\n")
+	if accept := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Accept")); accept != "" {
+		b.WriteString("Sec-WebSocket-Accept: ")
+		b.WriteString(accept)
+		b.WriteString("\r\n")
+	}
+	if protocol := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Protocol")); protocol != "" {
+		b.WriteString("Sec-WebSocket-Protocol: ")
+		b.WriteString(protocol)
+		b.WriteString("\r\n")
+	}
+	if extensions := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Extensions")); extensions != "" {
+		b.WriteString("Sec-WebSocket-Extensions: ")
+		b.WriteString(extensions)
+		b.WriteString("\r\n")
+	}
+	b.WriteString("\r\n")
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+func copyWebSocketServerToClient(dst io.Writer, src *bufio.Reader, onMessage func([]byte)) error {
+	return copyWebSocketServerToClientObserved(dst, src, onMessage, nil)
+}
+
+func copyWebSocketServerToClientObserved(dst io.Writer, src *bufio.Reader, onMessage func([]byte), onFrame func(websocketFrame, error)) error {
+	var acc websocketMessageAccumulator
+	for {
+		frame, err := readWebSocketFrame(src)
+		if onFrame != nil {
+			onFrame(frame, err)
+		}
+		if len(frame.raw) > 0 {
+			if _, writeErr := dst.Write(frame.raw); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return err
+			}
+			if isClosedNetworkError(err) {
+				return err
+			}
+			// Inspection is best-effort only. Keep the WebSocket transparent
+			// when we hit an unsupported frame shape or an oversized payload.
+			_, copyErr := io.Copy(dst, src)
+			if copyErr != nil {
+				return fmt.Errorf("%w; raw fallback failed: %v", err, copyErr)
+			}
+			return err
+		}
+		acc.observe(frame, onMessage)
+	}
+}
+
+type websocketFrame struct {
+	raw     []byte
+	opcode  byte
+	fin     bool
+	masked  bool
+	maskKey [4]byte
+	payload []byte
+}
+
+func readWebSocketFrame(r *bufio.Reader) (websocketFrame, error) {
+	var f websocketFrame
+	header := make([]byte, 2)
+	if n, err := io.ReadFull(r, header); err != nil {
+		f.raw = append(f.raw, header[:n]...)
+		return f, err
+	}
+	f.raw = append(f.raw, header...)
+	f.fin = header[0]&0x80 != 0
+	f.opcode = header[0] & 0x0f
+	f.masked = header[1]&0x80 != 0
+	payloadLen := uint64(header[1] & 0x7f)
+
+	switch payloadLen {
+	case 126:
+		ext := make([]byte, 2)
+		if n, err := io.ReadFull(r, ext); err != nil {
+			f.raw = append(f.raw, ext[:n]...)
+			return f, err
+		}
+		f.raw = append(f.raw, ext...)
+		payloadLen = uint64(ext[0])<<8 | uint64(ext[1])
+	case 127:
+		ext := make([]byte, 8)
+		if n, err := io.ReadFull(r, ext); err != nil {
+			f.raw = append(f.raw, ext[:n]...)
+			return f, err
+		}
+		f.raw = append(f.raw, ext...)
+		payloadLen = 0
+		for _, b := range ext {
+			payloadLen = payloadLen<<8 | uint64(b)
+		}
+	}
+
+	if payloadLen > recordingBodyMaxBytes {
+		return f, fmt.Errorf("websocket frame too large: %d bytes", payloadLen)
+	}
+	if f.masked {
+		if n, err := io.ReadFull(r, f.maskKey[:]); err != nil {
+			f.raw = append(f.raw, f.maskKey[:n]...)
+			return f, err
+		}
+		f.raw = append(f.raw, f.maskKey[:]...)
+	}
+	f.payload = make([]byte, int(payloadLen))
+	if n, err := io.ReadFull(r, f.payload); err != nil {
+		f.payload = f.payload[:n]
+		f.raw = append(f.raw, f.payload...)
+		return f, err
+	}
+	f.raw = append(f.raw, f.payload...)
+	return f, nil
+}
+
+type websocketMessageAccumulator struct {
+	active bool
+	opcode byte
+	buf    bytes.Buffer
+}
+
+func (a *websocketMessageAccumulator) observe(frame websocketFrame, onMessage func([]byte)) {
+	if onMessage == nil {
+		return
+	}
+	payload := framePayloadForInspect(frame)
+	switch frame.opcode {
+	case 0x1, 0x2:
+		if frame.fin {
+			onMessage(payload)
+			return
+		}
+		a.active = true
+		a.opcode = frame.opcode
+		a.buf.Reset()
+		a.write(payload)
+	case 0x0:
+		if !a.active {
+			return
+		}
+		a.write(payload)
+		if frame.fin {
+			msg := make([]byte, a.buf.Len())
+			copy(msg, a.buf.Bytes())
+			a.active = false
+			a.buf.Reset()
+			onMessage(msg)
+		}
+	}
+}
+
+func (a *websocketMessageAccumulator) write(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	if a.buf.Len()+len(payload) > recordingBodyMaxBytes {
+		a.active = false
+		a.buf.Reset()
+		return
+	}
+	a.buf.Write(payload)
+}
+
+func framePayloadForInspect(frame websocketFrame) []byte {
+	if !frame.masked {
+		return frame.payload
+	}
+	payload := make([]byte, len(frame.payload))
+	for i, b := range frame.payload {
+		payload[i] = b ^ frame.maskKey[i%4]
+	}
+	return payload
 }
 
 // ── HTTP forward proxy ────────────────────────────────────────
@@ -960,6 +1426,12 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		return
 	}
 
+	// Codex WebSocket 会持续推送大量非 usage 文本帧。它们不是二进制黑盒流量，
+	// 不能按体积估算，否则会和后续 response.completed usage 精确记录重复计数。
+	if isCodexWebSocketEndpoint(vendor, endpoint) {
+		return
+	}
+
 	// gRPC/Protobuf 等：响应体非 JSON 或不含 usage，按配置做体积粗算，使 135 可见（非官方计费）。
 	if s.cfg == nil || !s.cfg.EffectiveReportOpaqueTraffic() {
 		return
@@ -968,7 +1440,7 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 	if modelHint == "" {
 		modelHint = inferModelHint(data)
 	}
-	if !shouldOpaqueEstimate(endpoint, modelHint, data) {
+	if !shouldOpaqueEstimateForVendor(vendor, endpoint, modelHint, data) {
 		return
 	}
 	pt, ct, tt := opaqueTokenSplit(data, endpoint)
