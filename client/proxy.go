@@ -1444,6 +1444,10 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		modelHint = inferModelHint(data)
 	}
 	if !shouldOpaqueEstimateForVendor(vendor, endpoint, modelHint, data) {
+		if !responseEndpointHasNoTokenUsage(endpoint) {
+			log.Printf("[opaque] skip %s %s: modelHint=%q data_len=%d json_valid=%v",
+				vendor, endpoint, modelHint, len(data), json.Valid(data))
+		}
 		return
 	}
 	pt, ct, tt := opaqueTokenSplit(data, endpoint)

@@ -105,7 +105,30 @@ func shouldOpaqueEstimateForVendor(vendor, endpoint, modelHint string, body []by
 	if isChatGPTLikeVendor(vendor) {
 		return shouldEstimateChatGPTWeb(endpoint, body)
 	}
+	// Cursor Agent 任务（Composer/Cmdk）不在请求体里显式带模型名（服务端选模型），
+	// 导致 modelHint 为空而跳过估算。对已知推理端点直接按体积估算。
+	if vendor == "cursor" {
+		return shouldEstimateCursorAgent(endpoint, body)
+	}
 	return false
+}
+
+// shouldEstimateCursorAgent 对 Cursor gRPC 推理端点（AiService/ComposerService/CmdkService）
+// 做体积估算。不要求 model hint，因为 Cursor Agent 任务通常由服务端决定用哪个模型。
+func shouldEstimateCursorAgent(endpoint string, body []byte) bool {
+	if len(body) < 32 {
+		return false
+	}
+	ep := strings.ToLower(endpoint)
+	for _, s := range opaqueEndpointDenylist {
+		if strings.Contains(ep, strings.ToLower(s)) {
+			return false
+		}
+	}
+	return strings.Contains(ep, "aiservice") ||
+		strings.Contains(ep, "composerservice") ||
+		strings.Contains(ep, "cmdkservice") ||
+		strings.Contains(ep, "streamchat")
 }
 
 func shouldEstimateChatGPTWeb(endpoint string, body []byte) bool {
