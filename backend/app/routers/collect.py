@@ -164,6 +164,25 @@ def _tokscale_input_tokens(tokens) -> int:
     )
 
 
+def _anthropic_effective_input(prompt_tokens: int, completion_tokens: int) -> int:
+    """折算 Anthropic 缓存 token 为等效正常输入 token 数。
+
+    Anthropic API 返回的 input_tokens 包含 cache_read（10% 价格）和
+    cache_creation（125% 价格），但这些字段不总会透传到本系统。
+    当 input:output ratio > 15 时（明显不合常规），说明大量 token 为缓存命中，
+    用启发式方法折算：
+      assumed_uncached = min(input, output × 10)   # 不超过 10:1 视为非缓存
+      assumed_cached   = max(0, input − uncached)  # 超出部分视为 cache_read
+      effective        = uncached × 1.0 + cached × 0.1
+    """
+    if completion_tokens <= 0 or prompt_tokens <= completion_tokens * 15:
+        return prompt_tokens  # ratio 正常，不修正
+    uncached = min(prompt_tokens, completion_tokens * 10)
+    cached = prompt_tokens - uncached
+    effective = int(uncached + cached * 0.1)
+    return max(effective, 1)
+
+
 def _tokscale_output_tokens(tokens) -> int:
     """output + reasoning (all output-side tokens)"""
     return (
@@ -390,6 +409,12 @@ async def collect_usage(
 
         provider_key = canonical_provider_key(rec.vendor)
 
+        # Anthropic 缓存折算：input_tokens 包含 cache_read（10%）和 cache_creation（125%），
+        # 若 ratio > 15 则按启发式折算为等效正常 token 数，避免成本虚高。
+        effective_prompt_tokens = rec.prompt_tokens
+        if provider_key == "anthropic" and source != ESTIMATE_SOURCE:
+            effective_prompt_tokens = _anthropic_effective_input(rec.prompt_tokens, rec.completion_tokens)
+
         # 估算补齐流量用于展示 token/request 规模，不参与成本统计。
         if source == ESTIMATE_SOURCE:
             cost_usd = 0.0
@@ -398,7 +423,7 @@ async def collect_usage(
             cost_usd = calc_cost_usd(
                 pricing,
                 rec.model,
-                rec.prompt_tokens,
+                effective_prompt_tokens,
                 rec.completion_tokens,
                 rec.total_tokens,
                 provider=provider_key,
@@ -422,7 +447,7 @@ async def collect_usage(
             source=source,
             source_app=source_app_value,
             endpoint=(rec.endpoint or "").strip() or None,
-            input_tokens=rec.prompt_tokens,
+            input_tokens=effective_prompt_tokens,
             output_tokens=rec.completion_tokens,
             total_tokens=rec.total_tokens,
             request_count=1,
