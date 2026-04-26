@@ -12,14 +12,12 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 # ── 引入后端模块（需要在 /app 目录下运行）──
-from app.config import get_settings
-from app.database import AsyncSessionLocal
+from app.config import settings
+from app.database import async_session
 from app.pricing import calc_cost_usd
-from app.canonical import canonical_provider_key
 from sqlalchemy import text
 
 ESTIMATE_SOURCE = "client-mitm-estimate"
-settings = get_settings()
 USD_TO_CNY = settings.USD_TO_CNY
 
 
@@ -31,14 +29,14 @@ async def load_pricing(session) -> dict[str, tuple[float, float]]:
 
 
 async def run():
-    async with AsyncSessionLocal() as session:
+    async with async_session() as session:
         pricing = await load_pricing(session)
         log.info(f"Loaded {len(pricing)} pricing entries")
 
         # 查所有 estimate 记录中 cost=0 且有 token 的
         rows = await session.execute(text("""
-            SELECT id, model_name, vendor, input_tokens, output_tokens, total_tokens,
-                   cost_multiplier, DATE(request_at) AS day
+            SELECT id, model_name, provider, input_tokens, output_tokens, total_tokens,
+                   DATE(request_at AT TIME ZONE 'Asia/Shanghai') AS day
             FROM token_usage_logs
             WHERE source = :src
               AND COALESCE(cost_usd, 0) = 0
@@ -54,8 +52,7 @@ async def run():
         model_stats: dict[str, list] = defaultdict(lambda: [0, 0.0])  # [count, cost_usd]
 
         for r in records:
-            rid, model_name, vendor, inp, out, total, mult, day = r
-            provider_key = canonical_provider_key(vendor)
+            rid, model_name, provider, inp, out, total, day = r
 
             cost_usd = calc_cost_usd(
                 pricing,
@@ -63,8 +60,7 @@ async def run():
                 int(inp or 0),
                 int(out or 0),
                 int(total or 0),
-                provider=provider_key,
-                cost_multiplier=float(mult) if mult else None,
+                provider=provider,
             )
 
             if cost_usd <= 0:
