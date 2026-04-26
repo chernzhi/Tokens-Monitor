@@ -297,6 +297,8 @@ func extractOpenAI(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
 	if info.TotalTokens == 0 {
 		info.TotalTokens = info.PromptTokens + info.CompletionTokens
 	}
+	// OpenAI 缓存折扣：cached_tokens 按 50% 计费，折算为等效 token 数
+	info.PromptTokens = openAIEffectiveInput(usage, info.PromptTokens)
 	return info
 }
 
@@ -305,10 +307,37 @@ func extractAnthropic(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
 	if !ok {
 		return nil
 	}
-	info.PromptTokens = toInt(usage["input_tokens"])
+	info.PromptTokens = anthropicEffectiveInput(usage)
 	info.CompletionTokens = toInt(usage["output_tokens"])
 	info.TotalTokens = info.PromptTokens + info.CompletionTokens
 	return info
+}
+
+// anthropicEffectiveInput 把 Anthropic 的 input_tokens（含缓存命中）折算为等效正常输入 token 数，
+// 以便直接与 input_price 相乘得出正确成本（无需后端感知缓存字段）。
+//
+//	普通输入：×1.0
+//	cache_creation_input_tokens：×1.25
+//	cache_read_input_tokens：×0.1
+func anthropicEffectiveInput(usage map[string]interface{}) int {
+	input := toInt(usage["input_tokens"])
+	cacheRead := toInt(usage["cache_read_input_tokens"])
+	cacheCreate := toInt(usage["cache_creation_input_tokens"])
+
+	if cacheRead == 0 && cacheCreate == 0 {
+		return input
+	}
+	// input_tokens 已包含 cache_read 和 cache_creation，先还原为普通部分
+	regular := input - cacheRead - cacheCreate
+	if regular < 0 {
+		regular = 0
+	}
+	effective := float64(regular) + float64(cacheCreate)*1.25 + float64(cacheRead)*0.1
+	result := int(effective)
+	if result < 1 && input > 0 {
+		result = 1
+	}
+	return result
 }
 
 func extractGoogle(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
@@ -440,7 +469,7 @@ func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 		case "message_start":
 			if msg, ok := e.data["message"].(map[string]interface{}); ok {
 				if u, ok := msg["usage"].(map[string]interface{}); ok {
-					if v := toInt(u["input_tokens"]); v > 0 {
+					if v := anthropicEffectiveInput(u); v > 0 {
 						info.PromptTokens = v
 						saw = true
 					}
@@ -460,7 +489,7 @@ func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 					info.CompletionTokens = v
 					saw = true
 				}
-				if v := toInt(u["input_tokens"]); v > 0 && info.PromptTokens == 0 {
+				if v := anthropicEffectiveInput(u); v > 0 && info.PromptTokens == 0 {
 					info.PromptTokens = v
 					saw = true
 				}
@@ -472,6 +501,34 @@ func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 	}
 	info.TotalTokens = info.PromptTokens + info.CompletionTokens
 	return info
+}
+
+// openAIEffectiveInput 把 OpenAI 的 prompt_tokens（含缓存命中）折算为等效正常输入 token 数。
+// prompt_tokens_details.cached_tokens 按 50% 计费。
+func openAIEffectiveInput(usage map[string]interface{}, promptTokens int) int {
+	cached := 0
+	if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+		cached = toInt(details["cached_tokens"])
+	}
+	// Responses API 的命名
+	if cached == 0 {
+		if details, ok := usage["input_tokens_details"].(map[string]interface{}); ok {
+			cached = toInt(details["cached_tokens"])
+		}
+	}
+	if cached <= 0 {
+		return promptTokens
+	}
+	regular := promptTokens - cached
+	if regular < 0 {
+		regular = 0
+	}
+	effective := float64(regular) + float64(cached)*0.5
+	result := int(effective)
+	if result < 1 && promptTokens > 0 {
+		result = 1
+	}
+	return result
 }
 
 func toInt(v interface{}) int {
