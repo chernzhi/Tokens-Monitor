@@ -23,6 +23,14 @@ var opaqueEndpointDenylist = []string{
 	"spend",
 	"cdn",
 	"download",
+	// Cursor gRPC 配置/元数据接口（非 LLM 推理，不计 token）：
+	"availablemodels",    // AiService/AvailableModels：模型列表查询
+	"getdefaultmodel",   // AiService/GetDefaultModelNudgeData 等配置接口
+	"nudgedata",         // AiService/GetDefaultModelNudgeData 后缀
+	"nudgeconfig",       // 类似配置接口
+	"getmodels",         // 各类模型枚举端点
+	"modelinfo",         // 模型元数据
+	"listmodels",        // 模型列表
 }
 
 var opaqueEndpointAllowlist = []string{

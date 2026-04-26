@@ -459,10 +459,13 @@ func extractFromSSE(vendor string, data []byte) *UsageInfo {
 //   - message_start: {"type":"message_start","message":{"model":"...","usage":{"input_tokens":N,"output_tokens":1}}}
 //   - message_delta: {"type":"message_delta","delta":{...},"usage":{"output_tokens":N}}
 //
-// 任一缺失也允许：只要总和 > 0 就当一次有效记录。
+// 若两者均缺失（部分 Copilot 配置会在 SSE 中剥离 usage 字段），则回退到
+// 从 content_block_delta 的文本内容估算输出 token（约 4 字节≈1 token）。
+// 这比按响应体积（body/4）估算更准确，因为文本内容不含 SSE 协议开销。
 func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 	info := &UsageInfo{Model: modelHint}
 	saw := false
+	var textBytes int // 用于 usage 缺失时从文本内容估算 completion tokens
 	for _, e := range events {
 		typ, _ := e.data["type"].(string)
 		switch typ {
@@ -494,9 +497,25 @@ func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 					saw = true
 				}
 			}
+		case "content_block_delta":
+			// 收集文本内容长度，供 usage 缺失时回退估算
+			if delta, ok := e.data["delta"].(map[string]interface{}); ok {
+				if text, ok := delta["text"].(string); ok {
+					textBytes += len(text)
+				}
+			}
 		}
 	}
 	if !saw {
+		// Usage 字段缺失（部分 Copilot/企业版可能剥离）：
+		// 从实际生成文本估算 completion_tokens，精度远高于 body_size/4。
+		if textBytes > 0 {
+			ct := textBytes / 4
+			if ct < 1 {
+				ct = 1
+			}
+			return &UsageInfo{Model: modelHint, CompletionTokens: ct, TotalTokens: ct}
+		}
 		return nil
 	}
 	info.TotalTokens = info.PromptTokens + info.CompletionTokens

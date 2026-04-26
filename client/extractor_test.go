@@ -164,3 +164,36 @@ func TestExtractAnthropicSSESplitUsage(t *testing.T) {
 		t.Fatalf("model=%q", u.Model)
 	}
 }
+
+// Copilot 等网关可能剥离 usage 字段——此时应从文本内容估算 completion tokens。
+func TestAnthropicSSENoUsageFallbackFromText(t *testing.T) {
+	// 40 个字节的 ASCII 文本 → 40/4 = 10 tokens
+	text := "1234567890123456789012345678901234567890" // 40 bytes
+	sse := "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{}}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"" + text + "\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	u := ExtractUsage("github-copilot", []byte(sse))
+	if u == nil {
+		t.Fatal("expected non-nil usage from text fallback, got nil")
+	}
+	if u.PromptTokens != 0 {
+		t.Fatalf("prompt_tokens should be 0 (unknown), got %d", u.PromptTokens)
+	}
+	if u.CompletionTokens != 10 {
+		t.Fatalf("completion_tokens=%d want 10 (40 bytes / 4)", u.CompletionTokens)
+	}
+	if u.TotalTokens != 10 {
+		t.Fatalf("total_tokens=%d want 10", u.TotalTokens)
+	}
+}
+
+// 完全没有文本且没有 usage：应返回 nil。
+func TestAnthropicSSENoUsageNoTextReturnsNil(t *testing.T) {
+	const sse = "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{}}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	u := ExtractUsage("github-copilot", []byte(sse))
+	if u != nil && u.TotalTokens > 0 {
+		t.Fatalf("expected nil or zero tokens for empty response, got %+v", u)
+	}
+}
