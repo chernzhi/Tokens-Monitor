@@ -415,21 +415,18 @@ async def collect_usage(
         if provider_key == "anthropic" and source != ESTIMATE_SOURCE:
             effective_prompt_tokens = _anthropic_effective_input(rec.prompt_tokens, rec.completion_tokens)
 
-        # 估算补齐流量用于展示 token/request 规模，不参与成本统计。
-        if source == ESTIMATE_SOURCE:
-            cost_usd = 0.0
-            cost_cny = 0.0
-        else:
-            cost_usd = calc_cost_usd(
-                pricing,
-                rec.model,
-                effective_prompt_tokens,
-                rec.completion_tokens,
-                rec.total_tokens,
-                provider=provider_key,
-                cost_multiplier=rec.cost_multiplier,
-            )
-            cost_cny = round(cost_usd * settings.USD_TO_CNY, 4)
+        # 估算记录同样参与成本计算：给用户呈现近似成本，避免订阅制工具出现 ¥0.00 误导。
+        # 估算 token 数有误差（体积/4），但附近似成本比完全不计费更有参考价值。
+        cost_usd = calc_cost_usd(
+            pricing,
+            rec.model,
+            effective_prompt_tokens,
+            rec.completion_tokens,
+            rec.total_tokens,
+            provider=provider_key,
+            cost_multiplier=rec.cost_multiplier,
+        )
+        cost_cny = round(cost_usd * settings.USD_TO_CNY, 4)
 
         try:
             request_at = datetime.fromisoformat(rec.request_time.replace("Z", "+00:00"))
