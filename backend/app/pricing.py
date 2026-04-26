@@ -1,9 +1,15 @@
 """模型定价：按目录价计算 USD 成本（每 1K token）。"""
 
 import logging
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Claude 版本号点号→短横线规范化正则：
+# claude-opus-4.7 → claude-opus-4-7；claude-sonnet-4.6 → claude-sonnet-4-6
+# 仅对 claude- 前缀生效，避免影响 gpt-4.1 / gemini-2.5 等其他模型中的合法点号。
+_CLAUDE_DOT_RE = re.compile(r"\.(\d)")
 
 
 GITHUB_COPILOT_PROVIDER_ALIASES = {
@@ -17,6 +23,7 @@ GITHUB_COPILOT_PROVIDER_ALIASES = {
 # GitHub Copilot 元数据里已观察到的折扣倍率。
 # 当客户端尚未上报精确倍率时，服务端用它做保守回退，避免按上游目录原价高估。
 GITHUB_COPILOT_COST_MULTIPLIERS = {
+    "gpt-5.5": 0.1,
     "gpt-5.4": 0.1,
     "gpt-5.3-codex": 0.1,
     "gpt-4.1": 0.1,
@@ -28,6 +35,12 @@ def _normalize_model_name(model: str) -> str:
     normalized = (model or "").strip()
     if "·" in normalized:
         normalized = normalized.split("·", 1)[0]
+    # Claude 模型名点号格式（Copilot 上报）→ 短横线格式（Anthropic API 标准）
+    # 例：claude-opus-4.7 → claude-opus-4-7
+    # 例：claude-sonnet-4.6 → claude-sonnet-4-6
+    # 仅对 claude- 前缀生效，避免影响 gpt-4.1 / gemini-2.5 等其他模型中的合法点号。
+    if normalized.lower().startswith("claude-"):
+        normalized = _CLAUDE_DOT_RE.sub(r"-\1", normalized)
     return normalized
 
 
