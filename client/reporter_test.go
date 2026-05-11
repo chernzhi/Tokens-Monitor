@@ -107,7 +107,7 @@ func TestResolveReportProxyAutoIgnoresEnvProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 核心断言：不能把请求路由回自身（18090 是 ai-monitor 本身的端口）。
-	// 若 install_state 保存了其他可达的上游代理（如 8089），允许使用它——行为正确。
+	// 若 install_state 保存了其他可达的上游代理（如 9099），允许使用它——行为正确。
 	if got != nil && isSelfProxy(got.String()) {
 		t.Fatalf("auto report proxy must not loop back to self (port 18090), got %s", got.Redacted())
 	}

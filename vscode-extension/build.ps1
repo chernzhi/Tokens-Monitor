@@ -140,7 +140,7 @@ function Clear-OldPackages([string]$vsceTarget, [string]$version) {
     }
 }
 
-function Build-Extension($name) {
+function New-ExtensionPackage($name) {
     $spec = $targetSpecs[$name]
     $vsceTarget = $spec.VsceTarget
     $sourceBinary = Resolve-ClientBinary $name
@@ -217,7 +217,7 @@ $buildList = if ($Platform -eq 'all') { @($targetSpecs.Keys) } else { @($Platfor
 $builtPackages = @()
 
 foreach ($name in $buildList) {
-    $builtPackages += Build-Extension $name
+    $builtPackages += New-ExtensionPackage $name
 }
 
 Write-Host "`n  ✅ Done! VSIX packages:" -ForegroundColor Yellow

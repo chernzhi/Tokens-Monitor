@@ -23,4 +23,3 @@ func startBackgroundInstance(_ string) error {
 func uninstallWatchdogTask() error {
 	return nil
 }
-

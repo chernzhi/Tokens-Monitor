@@ -5,13 +5,30 @@ import (
 	"strings"
 )
 
+// mandatoryBypassDomains must never be removed by config overrides. Loopback
+// traffic includes local editor bridges such as VS Code Codex's /responses
+// endpoint. Link-local metadata endpoints are also local-only probes; proxying
+// either class of traffic creates noise or breaks otherwise healthy AI streams.
+var mandatoryBypassDomains = []string{
+	"localhost",
+	"localhost.localdomain",
+	"127.0.0.1",
+	"127.*",
+	"::1",
+	"[::1]",
+	"169.254.169.254",
+}
+
 // bypassDomains 是系统代理 / NO_PROXY 共用的直连域名列表。
 // 保留内网直连的同时，让 VS Code 扩展市场、CDN、更新等走直连，
 // 避免未启动 MITM 或 MITM 仅处理 AI 域名时编辑器无法联网。
 var bypassDomains = []string{
 	"localhost",
+	"localhost.localdomain",
 	"127.0.0.1",
+	"127.*",
 	"::1",
+	"[::1]",
 	// RFC 1918 私有地址完整覆盖
 	"10.*",
 	"192.168.*",
@@ -21,6 +38,7 @@ var bypassDomains = []string{
 	"172.24.*", "172.25.*", "172.26.*", "172.27.*",
 	"172.28.*", "172.29.*", "172.30.*", "172.31.*",
 	// 链路本地
+	"169.254.169.254",
 	"169.254.*",
 	"*.local",
 	// VS Code / Marketplace / 更新（见官方网络文档常见域名）
@@ -42,7 +60,7 @@ var bypassDomains = []string{
 	"*.github.com",
 }
 
-// mergeBypassDomains returns bypassDomains + cfg.ExtraBypassDomains + existing system
+// mergeBypassDomains returns configured bypass domains + existing system
 // ProxyOverride entries (from install_state), all deduplicated.
 // This ensures the user's existing bypass entries (e.g. corporate intranet domains)
 // are preserved even after we overwrite ProxyOverride.
@@ -61,8 +79,9 @@ var bypassDomains = []string{
 // Without that guard, a re-install would snapshot our own bypass list as the
 // "user's original", causing unbounded growth on every subsequent re-install.
 func mergeBypassDomains(cfg *Config) []string {
-	seen := make(map[string]struct{}, len(bypassDomains)+32)
-	merged := make([]string, 0, len(bypassDomains)+32)
+	base := effectiveBypassDomains(cfg)
+	seen := make(map[string]struct{}, len(base)+32)
+	merged := make([]string, 0, len(base)+32)
 
 	addUnique := func(d string) {
 		d = strings.TrimSpace(d)
@@ -76,16 +95,15 @@ func mergeBypassDomains(cfg *Config) []string {
 		}
 	}
 
-	// 1. Built-in bypass
-	for _, d := range bypassDomains {
+	// 1. Mandatory local bypass entries. These stay even if bypass_domains in
+	// config.json intentionally replaces the built-in list.
+	for _, d := range mandatoryBypassDomains {
 		addUnique(d)
 	}
 
-	// 2. Config extra bypass
-	if cfg != nil {
-		for _, d := range cfg.ExtraBypassDomains {
-			addUnique(d)
-		}
+	// 2. Configured/default bypass
+	for _, d := range base {
+		addUnique(d)
 	}
 
 	// 3. User's existing ProxyOverride entries (from install_state snapshot)

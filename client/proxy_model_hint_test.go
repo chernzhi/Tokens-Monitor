@@ -17,7 +17,7 @@ func TestProcessRequestBodyInfersModelFromBinaryPayload(t *testing.T) {
 		ContentLength: int64(len(body)),
 	}
 
-	got := (&ProxyServer{}).processRequestBody(r)
+	got, _ := (&ProxyServer{}).processRequestBody(r)
 	if got != "gpt-5.4" {
 		t.Fatalf("got %q", got)
 	}

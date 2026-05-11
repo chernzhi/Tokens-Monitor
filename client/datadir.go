@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,4 +32,13 @@ func appDataDir() string {
 		}
 	}
 	return "ai-monitor"
+}
+
+func cleanupInstallDataDir() error {
+	dir := filepath.Clean(appDataDir())
+	if dir == "." || dir == string(os.PathSeparator) || dir == filepath.VolumeName(dir)+string(os.PathSeparator) {
+		return fmt.Errorf("refusing to remove unsafe data dir %q", dir)
+	}
+	closeFileLogging()
+	return os.RemoveAll(dir)
 }

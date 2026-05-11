@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -85,6 +86,31 @@ func TestLoadConfig_JSON(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_JSONCLineComments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	raw := `{
+  // server_url 的 https:// 不应被注释剥离逻辑误删
+  "server_url": "https://otw.tech:59889", // 上报服务
+  // 本机监听端口
+  "port": 18090,
+  "upstream_proxy": "http://127.0.0.1:7890" // 上游代理 URL 也包含 //
+}`
+	if err := os.WriteFile(path, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != "https://otw.tech:59889" {
+		t.Fatalf("ServerURL = %q", cfg.ServerURL)
+	}
+	if cfg.UpstreamProxy != "http://127.0.0.1:7890" {
+		t.Fatalf("UpstreamProxy = %q", cfg.UpstreamProxy)
+	}
+}
+
 func TestEffectiveReportOpaqueTraffic(t *testing.T) {
 	b := func(v bool) *bool { return &v }
 	if !(&Config{}).EffectiveReportOpaqueTraffic() {
@@ -140,6 +166,117 @@ func TestLoadConfig_ValidatesOptionalUpstreamProxy(t *testing.T) {
 	if cfg.UpstreamProxy != "socks5://127.0.0.1:7890" {
 		t.Fatalf("UpstreamProxy = %q", cfg.UpstreamProxy)
 	}
+}
+
+func TestSaveConfigWritesAnnotatedSingleConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := &Config{
+		ServerURL:  "https://otw.tech:59889",
+		UserName:   "Alice",
+		UserID:     "alice@example.com",
+		Department: "Dev",
+		Port:       18090,
+		AuthToken:  "token-123",
+	}
+	if err := SaveConfig(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		`// server_url: Token 上报服务地址`,
+		`// auth_token: 用户登录/注册后得到的个人令牌`,
+		`// monitor_hosts: 完整精确监控域名表`,
+		`"api.openai.com": "openai"`,
+		`"suffix": ".openai.azure.com"`,
+		`"bypass_domains": [`,
+		`"report_opaque_traffic": true`,
+		`"install_system_proxy": false`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("saved config missing %s:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, `"_说明_`) {
+		t.Fatalf("saved config should use // comments, got legacy _说明 fields:\n%s", text)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AuthToken != "token-123" || loaded.UserID != "alice@example.com" {
+		t.Fatalf("loaded annotated config incorrectly: %+v", loaded)
+	}
+}
+
+func TestConfigDomainListsOverrideBuiltins(t *testing.T) {
+	cfg := &Config{
+		MonitorHosts: map[string]string{
+			"custom.api.example.com": "my-vendor",
+		},
+		MonitorSuffixes: []MonitoredSuffix{
+			{Suffix: ".corp.llm", Vendor: "corp-llm"},
+		},
+		BypassDomains: []string{"*.corp.local"},
+	}
+	if _, ok := effectiveMonitorHosts(cfg)["api.openai.com"]; ok {
+		t.Fatal("explicit monitor_hosts should override built-in exact host list")
+	}
+	if got := effectiveMonitorHosts(cfg)["custom.api.example.com"]; got != "my-vendor" {
+		t.Fatalf("custom host vendor = %q", got)
+	}
+	if len(effectiveMonitorSuffixes(cfg)) != 1 || effectiveMonitorSuffixes(cfg)[0].Vendor != "corp-llm" {
+		t.Fatalf("explicit monitor_suffixes should override built-in suffix list: %+v", effectiveMonitorSuffixes(cfg))
+	}
+	bypass := effectiveBypassDomains(cfg)
+	for _, want := range []string{"localhost", "127.0.0.1", "127.*", "::1", "*.corp.local"} {
+		if !containsString(bypass, want) {
+			t.Fatalf("effective bypass_domains missing %q: %+v", want, bypass)
+		}
+	}
+	if containsString(bypass, "github.com") {
+		t.Fatalf("explicit bypass_domains should override non-mandatory built-in bypass list: %+v", bypass)
+	}
+
+	server := NewProxyServer(cfg, nil, nil, "")
+	if _, ok := server.matchAIDomain("api.openai.com"); ok {
+		t.Fatal("api.openai.com should not match after removing it from monitor_hosts")
+	}
+	if vendor, ok := server.matchAIDomain("svc.corp.llm"); !ok || vendor != "corp-llm" {
+		t.Fatalf("suffix config did not match: vendor=%q ok=%v", vendor, ok)
+	}
+}
+
+func TestConfigExampleListsBuiltinDomains(t *testing.T) {
+	cfg, err := LoadConfig("config.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.MonitorHosts) < len(aiDomains) {
+		t.Fatalf("config.example monitor_hosts = %d, want at least %d", len(cfg.MonitorHosts), len(aiDomains))
+	}
+	if cfg.MonitorHosts["api.openai.com"] != "openai" {
+		t.Fatalf("config.example missing api.openai.com: %+v", cfg.MonitorHosts["api.openai.com"])
+	}
+	if len(cfg.MonitorSuffixes) < len(aiWildcardDomains) {
+		t.Fatalf("config.example monitor_suffixes = %d, want at least %d", len(cfg.MonitorSuffixes), len(aiWildcardDomains))
+	}
+	if len(cfg.BypassDomains) < len(bypassDomains) {
+		t.Fatalf("config.example bypass_domains = %d, want at least %d", len(cfg.BypassDomains), len(bypassDomains))
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestIsSelfProxyOnlyTreatsAIMonitorPortsAsSelf(t *testing.T) {

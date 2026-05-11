@@ -696,28 +696,13 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 			}
 		}
 
-		// Save config.json
+		// Save the single annotated config.json used by both ai-monitor and the VS Code extension.
 		absConfigPath, _ := filepath.Abs(configPath)
-		data, err := json.MarshalIndent(cfg, "", "  ")
-		if err != nil {
-			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "配置序列化失败: " + err.Error()})
-			return
-		}
-		if err := os.WriteFile(absConfigPath, data, 0644); err != nil {
+		if err := SaveConfig(cfg, absConfigPath); err != nil {
 			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "保存配置失败: " + err.Error()})
 			return
 		}
-
-		// Save identity.json for VSCode extension to read
-		identityPath := filepath.Join(appDataDir(), "identity.json")
-		os.MkdirAll(filepath.Dir(identityPath), 0755)
-		identityData, _ := json.MarshalIndent(map[string]string{
-			"user_id":     cfg.UserID,
-			"user_name":   cfg.UserName,
-			"department":  cfg.Department,
-			"auth_token":  cfg.AuthToken,
-		}, "", "  ")
-		os.WriteFile(identityPath, identityData, 0644)
+		_ = os.Remove(filepath.Join(appDataDir(), "identity.json"))
 
 		// Run global install (CA + env vars + auto-start)
 		var messages []string
@@ -764,8 +749,7 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 			if strings.TrimSpace(cfg.UpstreamProxy) == "" {
 				cfg.UpstreamProxy = detectedUpstream
 				// Re-save config with upstream_proxy
-				data, _ = json.MarshalIndent(cfg, "", "  ")
-				os.WriteFile(absConfigPath, data, 0644)
+				_ = SaveConfig(cfg, absConfigPath)
 			}
 		}
 
@@ -785,6 +769,9 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 			"HTTP_PROXY":           httpProxy,
 			"HTTPS_PROXY":          httpProxy,
 			"NO_PROXY":             noProxy,
+			"http_proxy":           httpProxy,
+			"https_proxy":          httpProxy,
+			"no_proxy":             noProxy,
 			"NODE_EXTRA_CA_CERTS":  certMgr.CACertPath(),
 			"SSL_CERT_FILE":        certMgr.CACertPath(),
 			"CODEX_CA_CERTIFICATE": certMgr.CACertPath(),
@@ -1001,15 +988,9 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 			s.cfg.Port = req.Port
 		}
 
-		// Save config.json
+		// Save the single annotated config.json.
 		absConfigPath, _ := filepath.Abs(s.configPath)
-		data, err := json.MarshalIndent(s.cfg, "", "  ")
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "配置序列化失败: " + err.Error()})
-			return
-		}
-		if err := os.WriteFile(absConfigPath, data, 0644); err != nil {
+		if err := SaveConfig(s.cfg, absConfigPath); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(setupResponse{Success: false, Message: "保存配置失败: " + err.Error()})
 			return

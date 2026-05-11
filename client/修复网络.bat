@@ -27,7 +27,7 @@ if defined EXE (
   )
   if errorlevel 1 (
     echo.
-    echo   --heal 未正常结束，请根据上方提示处理，或再试「全局卸载」。
+    echo   --heal 未正常结束，请根据上方提示处理，或再试「卸载.bat」。
     pause
     exit /b 1
   )
@@ -38,7 +38,7 @@ if defined EXE (
 
 echo   未在脚本同目录、dist\ 或 ..\dist\ 下找到 ai-monitor.exe。
 echo   本步骤仅会关闭 WinINet「使用代理服务器」^（ProxyEnable=0^），
-echo   不还原你之前备份的代理地址；若依赖 PAC/HTTP_PROXY，请用「全局卸载」或 ai-monitor --global-uninstall 处理。
+echo   不还原你之前备份的代理地址；若依赖 PAC/HTTP_PROXY，请用「卸载.bat」或 ai-monitor --global-uninstall 处理。
 echo.
 set /p _ok=  是否继续仅置 ProxyEnable=0? [Y/n] 
 if /i "%_ok%"=="n" (

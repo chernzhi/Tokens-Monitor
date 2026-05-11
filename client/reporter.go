@@ -284,7 +284,7 @@ func (r *Reporter) Add(record UsageRecord) {
 	r.mu.Unlock()
 
 	if record.Source == "client-mitm-estimate" {
-		log.Printf("[记录·估算] %s | %s | 输入:%d 输出:%d 总计:%d（响应非 JSON，按体积粗算，非官方计费）",
+		log.Printf("[记录·估算] %s | %s | 输入:%d 输出:%d 总计:%d（响应未提供 usage，按可见内容估算，非官方计费）",
 			record.Vendor, record.Model,
 			record.PromptTokens, record.CompletionTokens, record.TotalTokens)
 	} else {

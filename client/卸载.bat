@@ -5,7 +5,7 @@ echo   AI Token 监控客户端 - 卸载
 echo   ══════════════════════════
 echo.
 
-%~dp0ai-monitor.exe --uninstall
+"%~dp0ai-monitor.exe" --global-uninstall
 
 echo.
 echo   正在移除开机自启...

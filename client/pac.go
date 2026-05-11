@@ -85,8 +85,11 @@ func generatePACContent(listenPort int, monitorHosts []monitorHostEntry, upstrea
 	}
 
 	b.WriteString("function FindProxyForURL(url, host) {\n")
+	b.WriteString("    host = (host || \"\").toLowerCase();\n")
 	b.WriteString("    // Plain hostnames (no dots) always go direct\n")
 	b.WriteString("    if (isPlainHostName(host)) return \"DIRECT\";\n")
+	b.WriteString("    // Loopback/local editor bridges and cloud metadata probes must never go through MITM or upstream proxies\n")
+	b.WriteString("    if (host === \"localhost\" || host === \"localhost.localdomain\" || host === \"127.0.0.1\" || host === \"::1\" || host === \"[::1]\" || host === \"169.254.169.254\" || shExpMatch(host, \"127.*\")) return \"DIRECT\";\n")
 	b.WriteString("\n")
 
 	// ── Emit whitelist conditions: only AI domains go through MITM ──

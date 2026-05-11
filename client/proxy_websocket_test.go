@@ -49,7 +49,7 @@ func TestCopyWebSocketServerToClientRecordsResponsesUsage(t *testing.T) {
 
 	var forwarded bytes.Buffer
 	err := copyWebSocketServerToClient(&forwarded, bufio.NewReader(bytes.NewReader(rawFrame)), func(msg []byte) {
-		proxy.processResponseData("openai", "/v1/responses", "gpt-5.4-codex", "codex", msg)
+		proxy.processResponseData("openai", "/v1/responses", "gpt-5.4-codex", "codex", msg, 0)
 	})
 	if err == nil {
 		t.Fatal("expected EOF after single frame")

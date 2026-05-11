@@ -195,11 +195,10 @@ func resolveLocalUpstreamWithFallback(cfg *Config, configPath string, sctx *self
 		}
 		return
 	}
-	log.Println("[config] 警告: 无可用本机回退; 已清空 upstream_proxy，出网将尝试直连。若需公司/本地代理，请填正确且已监听的地址。")
-	cfg.UpstreamProxy = ""
-	if err := patchConfigUpstreamProxy(configPath, ""); err != nil {
-		log.Printf("[config] 无法清空 config.json 中的 upstream_proxy: %v", err)
-	}
+	// 不主动清空 upstream_proxy！用户明确配置了上游代理，短暂不可达
+	// 不代表它永久坏了（可能是 sing-box/Clash 正在重启）。
+	// 保留用户配置值并持续重试，比直接切直连（导致全部外网请求失败）安全得多。
+	log.Printf("[config] 警告: 本机上游代理 %s 当前不可达，保留原配置不修改。后续请求将重试连接。", cfg.UpstreamProxy)
 }
 
 // hintMismatchedGatewayPort 在常见误填 gateway 端口(18091 等)时给出一行说明。

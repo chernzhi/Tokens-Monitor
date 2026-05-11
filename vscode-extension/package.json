@@ -2,7 +2,7 @@
   "name": "ai-token-monitor",
   "displayName": "腾轩旅游集团 - AI Token 监控",
   "description": "腾轩旅游集团 AI 编程助手用量监控平台 — 支持 Copilot、Cursor、Claude、Continue 等 10+ 工具的 Token 统计与上报",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "publisher": "txly",
   "author": {
     "name": "Zhi.Chen",
@@ -230,7 +230,7 @@
         "aiTokenMonitor.authToken": {
           "type": "string",
           "default": "",
-          "description": "登录后 long-lived token，与 %APPDATA%\\\\ai-monitor\\\\config.json 中 auth_token 相同；不填时尝试读同目录 identity.json"
+          "description": "登录后 long-lived token，与 %APPDATA%\\\\ai-monitor\\\\config.json 中 auth_token 相同；不填时自动读取共享 config.json"
         }
       }
     }

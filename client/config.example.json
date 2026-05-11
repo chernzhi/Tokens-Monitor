@@ -1,21 +1,181 @@
 {
-  "_说明": "内置已含 OpenAI/Copilot/Cursor/Anthropic/OpenRouter/Tabnine/Codeium/JetBrains AI/Cody/Augment/AWS Q/CodeWhisperer 等常见开发工具域名；内网或新厂商请用 extra_monitor_* 扩展。服务端要求 auth_token 有效后才接受用量上报与心跳。",
-  "_身份说明": "登录后请保留 auth_token；user_id 须为登录邮箱。无 auth_token 且 user_id 非邮箱时，服务端会丢弃匿名上报。",
-  "server_url": "https://otw.tech:59889",
-  "user_name": "张三",
-  "user_id": "zhangsan@company.com",
-  "department": "研发部",
+  // 这是 ai-monitor 唯一需要用户理解和修改的配置文件。
+  // 配置文件使用 JSONC 风格：// 开头的是说明注释，ai-monitor 和 VS Code 扩展都会自动忽略。
+  // 复制为 config.json 后使用；安装向导生成的正式配置默认位于 %APPDATA%/ai-monitor/config.json。
+  // server_url: Token 上报服务地址，客户端会向这里发送心跳和用量记录。
+  "server_url": "https://your-server.com:59889",
+  // user_name: 员工姓名，用于后台和大屏展示。
+  "user_name": "姓名",
+  // user_id: 员工唯一标识，建议填写登录邮箱或工号；为空时会按本机账号生成匿名 ID。
+  "user_id": "your-id@company.com",
+  // department: 部门名称，用于统计分组；可留空。
+  "department": "部门",
+  // port: 本机 MITM HTTP 代理监听端口，默认 18090；端口被占用时程序可能自动顺延。
   "port": 18090,
-  "auth_token": "",
-  "api_key": "",
-  "upstream_proxy": "",
+  // gateway_port: 可选 API Gateway 端口。大于 0 时该端口只提供 /v1/* 与 /vendor/* 反向代理，不做 HTTPS MITM。
+  "gateway_port": 0,
+  // upstream_proxy: ai-monitor 访问外网 AI 服务时使用的上游代理。支持 http://、https://、socks5://；没有本地代理可留空。
+  "upstream_proxy": "http://127.0.0.1:8089",
+  // report_proxy: 上报到 server_url 时使用的代理策略：auto 或空=自动判断，direct=直连，upstream=走 upstream_proxy，也可填写具体代理 URL。
+  "report_proxy": "",
+  // install_system_proxy: 为 true 时安装会写入 Windows 系统 PAC/代理，让浏览器、Visual Studio 等自动经过监控；默认 false 更保守。
   "install_system_proxy": false,
+  // install_ide_proxy: 为 true 时安装会写入 VS Code/Cursor 等 IDE 的 http.proxy 设置；通常保持 false，避免与系统代理重复。
   "install_ide_proxy": false,
+  // report_opaque_traffic: 为 true 时，对 gRPC/Protobuf 等无法解析 usage 的响应按可见内容估算 token 并上报；非官方计费口径。
   "report_opaque_traffic": true,
-  "extra_monitor_hosts": {
-    "llm-gateway.internal.example.com": "internal-llm"
+  // mitm_cursor: 为 true 时尝试解密 Cursor 流量；如 Cursor 因证书钉扎断连，可改为 false 透传。
+  "mitm_cursor": true,
+  // chain_existing_pac: 为 true 时保留并串联用户原有企业 PAC；建议保持 true，避免丢失公司内网代理策略。
+  "chain_existing_pac": true,
+  // strict_policy_check: 为 true 时检测到公司策略级代理会拒绝全局安装，避免覆盖管理员策略；建议保持 true。
+  "strict_policy_check": true,
+  // monitor_hosts: 完整精确监控域名表。键是主机名，值是供应商标签；可直接增删改，删除后该精确域名不再 MITM。
+  "monitor_hosts": {
+    "api.openai.com": "openai",
+    "chatgpt.com": "openai-codex",
+    "www.chatgpt.com": "openai-codex",
+    "ab.chatgpt.com": "chatgpt",
+    "chat.openai.com": "chatgpt",
+    "copilot-proxy.githubusercontent.com": "github-copilot",
+    "api.githubcopilot.com": "github-copilot",
+    "api.individual.githubcopilot.com": "github-copilot",
+    "api.business.githubcopilot.com": "github-copilot",
+    "api.enterprise.githubcopilot.com": "github-copilot",
+    "runtime.us-east-1.kiro.dev": "kiro",
+    "runtime.eu-central-1.kiro.dev": "kiro",
+    "models.inference.ai.azure.com": "github-models",
+    "api2.cursor.sh": "cursor",
+    "api3.cursor.sh": "cursor",
+    "api.cursor.com": "cursor",
+    "metrics.cursor.sh": "cursor",
+    "api.anthropic.com": "anthropic",
+    "claude.ai": "anthropic",
+    "platform.claude.com": "anthropic",
+    "www.claude.ai": "anthropic",
+    "console.anthropic.com": "anthropic",
+    "generativelanguage.googleapis.com": "google",
+    "aiplatform.googleapis.com": "google-vertex",
+    "api.mistral.ai": "mistral",
+    "codestral.mistral.ai": "mistral",
+    "api.cohere.com": "cohere",
+    "api.x.ai": "xai",
+    "api.perplexity.ai": "perplexity",
+    "api.together.xyz": "together",
+    "api.together.ai": "together",
+    "api.groq.com": "groq",
+    "api.replicate.com": "replicate",
+    "api-inference.huggingface.co": "huggingface",
+    "router.huggingface.co": "huggingface",
+    "api.fireworks.ai": "fireworks",
+    "openrouter.ai": "openrouter",
+    "api.openrouter.ai": "openrouter",
+    "api.tabnine.com": "tabnine",
+    "api.codeium.com": "codeium",
+    "server.codeium.com": "codeium",
+    "api.jetbrains.ai": "jetbrains-ai",
+    "llm.api.jetbrains.ai": "jetbrains-ai",
+    "cody-gateway.sourcegraph.com": "sourcegraph-cody",
+    "api.augmentcode.com": "augment",
+    "dialapi.augmentcode.com": "augment",
+    "api.deepinfra.com": "deepinfra",
+    "api.cerebras.ai": "cerebras",
+    "api.sambanova.ai": "sambanova",
+    "api.novita.ai": "novita",
+    "fal.run": "fal",
+    "api.fal.ai": "fal",
+    "api.deepseek.com": "deepseek",
+    "api.moonshot.cn": "moonshot",
+    "open.bigmodel.cn": "zhipu",
+    "aip.baidubce.com": "baidu",
+    "api.minimax.chat": "minimax",
+    "dashscope.aliyuncs.com": "qwen",
+    "dashscope-intl.aliyuncs.com": "qwen",
+    "portal.qwen.ai": "qwen",
+    "chat.qwen.ai": "qwen",
+    "api.lingyiwanwu.com": "yi",
+    "ark.cn-beijing.volces.com": "doubao",
+    "api.baichuan-ai.com": "baichuan",
+    "hunyuan.tencentcloudapi.com": "hunyuan",
+    "spark-api-open.xf-yun.com": "spark",
+    "api.sensenova.cn": "sensetime",
+    "api.stepfun.com": "stepfun",
+    "api.tiangong.cn": "skywork",
+    "api.siliconflow.cn": "siliconflow",
+    "api2.qoder.sh": "qoder",
+    "api3.qoder.sh": "qoder",
+    "api.qoder.sh": "qoder",
+    "center.qoder.sh": "qoder",
+    "api.qoder.com": "qoder",
+    "api.ofox.ai": "ofox"
   },
-  "extra_monitor_suffixes": [
-    { "suffix": ".inference.company.net", "vendor": "company-gateway" }
-  ]
+  // monitor_suffixes: 完整后缀/前缀监控规则。suffix 必填，prefix 可选；用于 Azure/OpenAI、Bedrock、Cursor、Copilot 等通配域名。
+  "monitor_suffixes": [
+    { "suffix": ".openai.azure.com", "vendor": "azure" },
+    { "suffix": ".amazonaws.com", "prefix": "bedrock-runtime.", "vendor": "aws-bedrock" },
+    { "suffix": ".amazonaws.com", "prefix": "bedrock.", "vendor": "aws-bedrock" },
+    { "suffix": "-aiplatform.googleapis.com", "vendor": "google-vertex" },
+    { "suffix": ".sagemaker.aws", "vendor": "aws-sagemaker" },
+    { "suffix": ".amazonaws.com", "prefix": "codewhisperer.", "vendor": "aws-codewhisperer" },
+    { "suffix": ".amazonaws.com", "prefix": "q.", "vendor": "aws-q" },
+    { "suffix": ".amazonaws.com", "prefix": "q-fips.", "vendor": "aws-q" },
+    { "suffix": ".inference.azure.com", "vendor": "azure-inference" },
+    { "suffix": ".cursor.sh", "vendor": "cursor" },
+    { "suffix": ".githubcopilot.com", "vendor": "github-copilot" },
+    { "suffix": ".qwen.ai", "vendor": "qwen" },
+    { "suffix": ".qoder.sh", "vendor": "qoder" },
+    { "suffix": ".qoder.com", "vendor": "qoder" }
+  ],
+  // bypass_domains: 完整直连域名/通配列表，不经过 ai-monitor；本机回环 localhost/127.* 和链路本地 169.254.169.254 会强制保留，适合 GitHub、VS Code 更新、公司内网、VPN、文件服务器等。
+  "bypass_domains": [
+    "localhost",
+    "localhost.localdomain",
+    "127.0.0.1",
+    "127.*",
+    "::1",
+    "[::1]",
+    "169.254.169.254",
+    "10.*",
+    "192.168.*",
+    "172.16.*",
+    "172.17.*",
+    "172.18.*",
+    "172.19.*",
+    "172.20.*",
+    "172.21.*",
+    "172.22.*",
+    "172.23.*",
+    "172.24.*",
+    "172.25.*",
+    "172.26.*",
+    "172.27.*",
+    "172.28.*",
+    "172.29.*",
+    "172.30.*",
+    "172.31.*",
+    "169.254.*",
+    "*.local",
+    "*.vscode-cdn.net",
+    "*.gallery.vsassets.io",
+    "marketplace.visualstudio.com",
+    "*.vsassets.io",
+    "vscodeexperiments.azureedge.net",
+    "az764295.vo.msecnd.net",
+    "*.vo.msecnd.net",
+    "*.vscode-unpkg.net",
+    "vscode.blob.core.windows.net",
+    "default.exp-tas.com",
+    "login.microsoftonline.com",
+    "*.microsoftonline.com",
+    "github.com",
+    "*.github.com"
+  ],
+  // api_key: 服务端如果配置了 COLLECT_API_KEY，可在这里填写；多数登录态场景留空即可。
+  "api_key": "",
+  // auth_token: 用户登录/注册后得到的个人令牌，上报优先使用它。属于敏感信息，不要公开分享。
+  "auth_token": "",
+  // watchdog_interval_sec: ai-monitor 进程内自检间隔秒数；默认 10。不是 Windows 计划任务，不会弹黑框。
+  "watchdog_interval_sec": 10,
+  // watchdog_failures: 连续自检失败多少次后触发网络恢复；默认 2。
+  "watchdog_failures": 2
 }

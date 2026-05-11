@@ -58,6 +58,42 @@ func removeInstanceInfo() {
 	os.Remove(instanceInfoPath())
 }
 
+func stopExistingInstanceForUninstall() {
+	info, err := readInstanceInfo()
+	if err != nil || info.PID <= 0 {
+		return
+	}
+	if info.PID == os.Getpid() {
+		removeInstanceInfo()
+		return
+	}
+	if !isProcessAlive(info.PID) {
+		removeInstanceInfo()
+		return
+	}
+	if info.Port <= 0 || !probeInstanceStatus(info.Port) {
+		fmt.Printf("    ⚠ instance.json 指向 PID %d，但 /status 不可达，跳过终止以避免误杀。\n", info.PID)
+		return
+	}
+	proc, err := os.FindProcess(info.PID)
+	if err != nil {
+		fmt.Printf("    ⚠ 找不到旧实例 PID %d: %v\n", info.PID, err)
+		return
+	}
+	if err := proc.Kill(); err != nil {
+		fmt.Printf("    ⚠ 停止旧实例 PID %d 失败: %v\n", info.PID, err)
+		return
+	}
+	for i := 0; i < 20; i++ {
+		if !isProcessAlive(info.PID) {
+			fmt.Printf("    ✓ 已停止旧实例 PID %d\n", info.PID)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Printf("    ⚠ 已发送停止信号，但 PID %d 仍在运行。\n", info.PID)
+}
+
 // checkExistingInstance reads the PID file, checks if the process is alive,
 // and probes the /status endpoint to verify the instance is healthy.
 // Returns (port, true) if a healthy instance exists; (0, false) otherwise.

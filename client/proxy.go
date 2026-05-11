@@ -242,33 +242,22 @@ func isPinnedTLSHost(hostname string, cfg *Config) bool {
 // matchAIDomain 判断主机名是否应走 MITM，并返回供应商标签（内置表 + config 扩展）。
 func (s *ProxyServer) matchAIDomain(hostname string) (string, bool) {
 	hostname = normalizeProxyHostname(hostname) // ToLower + TrimSpace + 去除末尾点号
-	if vendor, ok := aiDomains[hostname]; ok {
-		return vendor, true
-	}
-	if s.cfg != nil && len(s.cfg.ExtraMonitorHosts) > 0 {
-		if v, ok := s.cfg.ExtraMonitorHosts[hostname]; ok {
-			v = strings.TrimSpace(v)
-			if v != "" {
-				return v, true
-			}
+	if vendor, ok := effectiveMonitorHosts(s.cfg)[hostname]; ok {
+		vendor = strings.TrimSpace(vendor)
+		if vendor != "" {
+			return vendor, true
 		}
 	}
-	for _, w := range aiWildcardDomains {
-		if strings.HasSuffix(hostname, w.suffix) {
-			if w.prefix == "" || strings.HasPrefix(hostname, w.prefix) {
-				return w.vendor, true
-			}
+	for _, w := range effectiveMonitorSuffixes(s.cfg) {
+		suffix := strings.TrimSpace(strings.ToLower(w.Suffix))
+		prefix := strings.TrimSpace(strings.ToLower(w.Prefix))
+		vendor := strings.TrimSpace(w.Vendor)
+		if suffix == "" || vendor == "" {
+			continue
 		}
-	}
-	if s.cfg != nil {
-		for _, e := range s.cfg.ExtraMonitorSuffixes {
-			suf := strings.TrimSpace(e.Suffix)
-			vend := strings.TrimSpace(e.Vendor)
-			if suf == "" || vend == "" {
-				continue
-			}
-			if strings.HasSuffix(hostname, suf) {
-				return vend, true
+		if strings.HasSuffix(hostname, suffix) {
+			if prefix == "" || strings.HasPrefix(hostname, prefix) {
+				return vendor, true
 			}
 		}
 	}
@@ -326,6 +315,20 @@ type ProxyServer struct {
 	copilotDiscounts map[string]float64
 }
 
+var (
+	upstreamDialTimeout              = 15 * time.Second
+	upstreamProxyConnectTimeout      = 20 * time.Second
+	upstreamTLSHandshakeTimeout      = 20 * time.Second
+	upstreamBodyIdleTimeout          = 5 * time.Minute
+	proxyTunnelIdleTimeout           = 5 * time.Minute
+	// 上游在返回任何响应头之前的最大等待时间（HTTP/2：timeout awaiting response headers）。
+	// Codex /chatgpt backend 的 responses/compact 可能由服务端长时间计算后才下发头；
+	// 过短会导致 MITM forward error，即便随后直连重试已成功。
+	upstreamResponseHeaderTimeout    = 15 * time.Minute
+	tunnelRetryInitialBackoff        = 500 * time.Millisecond
+	upstreamProxyRetryInitialBackoff = 300 * time.Millisecond
+)
+
 func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager, configPath string) *ProxyServer {
 	// Auto-detect upstream proxy (config > system proxy > env vars)
 	upstreamAddr := detectUpstreamProxy(cfg)
@@ -343,6 +346,10 @@ func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager, confi
 	} else {
 		log.Printf("[proxy] no upstream proxy detected, using direct connection")
 	}
+	// 配置了 sing-box / Clash 等上游时，Transport 不能用裸 http.ProxyURL：否则对本机目标的
+	// outbound（含误送入 MITM 的 http://localhost:*/responses），会被再次转发上游而失败，
+	// VS Code Codex「stream disconnected」「error sending request for localhost …」即为典型症状。
+	proxyFunc = upstreamProxyPreserveLoopback(proxyFunc)
 	return &ProxyServer{
 		cfg:              cfg,
 		configPath:       configPath,
@@ -351,14 +358,7 @@ func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager, confi
 		upstreamProxy:    upstreamURL,
 		startedAt:        time.Now(),
 		copilotDiscounts: map[string]float64{},
-		transport: &http.Transport{
-			// 默认直连，避免外连 AI 再次进本机代理形成环路；仅在显式配置或自动检测到 upstream_proxy 时走上游代理。
-			Proxy:               proxyFunc,
-			TLSHandshakeTimeout: 15 * time.Second,
-			MaxIdleConns:        200,
-			IdleConnTimeout:     90 * time.Second,
-			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-		},
+		transport:        buildUpstreamTransport(proxyFunc),
 	}
 }
 
@@ -469,20 +469,45 @@ func (s *ProxyServer) tunnelConnection(clientConn net.Conn, host string) {
 	var serverConn net.Conn
 	var err error
 
-	if s.upstreamProxy != nil {
-		serverConn, err = s.dialViaUpstreamProxy(host)
-	} else {
-		serverConn, err = net.DialTimeout("tcp", host, 15*time.Second)
+	// 上游代理不通时（如 sing-box 重启中），以退避重试 3 次。
+	// 避免一次 TCP 失败就直接放弃整条 MITM 连接。
+	const maxRetries = 3
+	retryBackoff := tunnelRetryInitialBackoff
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("[tunnel] retry %d/%d dialing %s (last error: %v)", attempt, maxRetries, host, err)
+			time.Sleep(retryBackoff)
+			retryBackoff *= 2
+			// 重试前刷新传输层的空闲连接池，防止复用死连接
+			s.transport.CloseIdleConnections()
+		}
+		if s.upstreamProxy != nil {
+			serverConn, err = s.dialViaUpstreamProxy(host)
+		} else {
+			serverConn, err = net.DialTimeout("tcp", host, upstreamDialTimeout)
+		}
+		if err == nil {
+			break
+		}
 	}
 	if err != nil {
-		log.Printf("[tunnel] dial %s: %v", host, err)
+		log.Printf("[tunnel] dial %s failed after %d retries: %v", host, maxRetries+1, err)
 		return
 	}
 	defer serverConn.Close()
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(serverConn, clientConn); done <- struct{}{} }()
-	go func() { io.Copy(clientConn, serverConn); done <- struct{}{} }()
-	<-done
+	done := make(chan wsCopyResult, 2)
+	go func() {
+		n, copyErr := copyConnWithIdleTimeout(serverConn, clientConn)
+		done <- wsCopyResult{direction: "client->server", bytes: n, err: copyErr}
+	}()
+	go func() {
+		n, copyErr := copyConnWithIdleTimeout(clientConn, serverConn)
+		done <- wsCopyResult{direction: "server->client", bytes: n, err: copyErr}
+	}()
+	first := <-done
+	if first.err != nil && !isClosedNetworkError(first.err) && !isTimeoutNetworkError(first.err) {
+		log.Printf("[tunnel] copy ended %s %s: bytes=%d err=%v", first.direction, host, first.bytes, first.err)
+	}
 }
 
 // dialViaUpstreamProxy establishes a TCP tunnel through the upstream HTTP proxy
@@ -502,9 +527,24 @@ func (s *ProxyServer) dialViaUpstreamProxy(targetHost string) (net.Conn, error) 
 		proxyAddr = net.JoinHostPort(s.upstreamProxy.Hostname(), port)
 	}
 
-	proxyConn, err := net.DialTimeout("tcp", proxyAddr, 15*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("connect upstream proxy %s: %w", proxyAddr, err)
+	// 到上游代理的连接重试 2 次（sing-box 可能在重启中）
+	const maxRetries = 2
+	var proxyConn net.Conn
+	var dialErr error
+	retryBackoff := upstreamProxyRetryInitialBackoff
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("[upstream] retry %d/%d connecting to %s (last: %v)", attempt, maxRetries, proxyAddr, dialErr)
+			time.Sleep(retryBackoff)
+			retryBackoff *= 2
+		}
+		proxyConn, dialErr = net.DialTimeout("tcp", proxyAddr, upstreamDialTimeout)
+		if dialErr == nil {
+			break
+		}
+	}
+	if dialErr != nil {
+		return nil, fmt.Errorf("connect upstream proxy %s after %d retries: %w", proxyAddr, maxRetries+1, dialErr)
 	}
 
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetHost, targetHost)
@@ -517,6 +557,10 @@ func (s *ProxyServer) dialViaUpstreamProxy(targetHost string) (net.Conn, error) 
 	}
 	connectReq += "\r\n"
 
+	if err := proxyConn.SetDeadline(time.Now().Add(upstreamProxyConnectTimeout)); err != nil {
+		proxyConn.Close()
+		return nil, fmt.Errorf("set CONNECT deadline on upstream: %w", err)
+	}
 	if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
 		proxyConn.Close()
 		return nil, fmt.Errorf("write CONNECT to upstream: %w", err)
@@ -533,6 +577,10 @@ func (s *ProxyServer) dialViaUpstreamProxy(targetHost string) (net.Conn, error) 
 	if resp.StatusCode != http.StatusOK {
 		proxyConn.Close()
 		return nil, fmt.Errorf("upstream proxy CONNECT returned %d", resp.StatusCode)
+	}
+	if err := proxyConn.SetDeadline(time.Time{}); err != nil {
+		proxyConn.Close()
+		return nil, fmt.Errorf("clear CONNECT deadline on upstream: %w", err)
 	}
 
 	return proxyConn, nil
@@ -570,11 +618,14 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 	for {
 		req, err := http.ReadRequest(reader)
 		if err != nil {
+			if isExpectedDisconnectError(err) {
+				return
+			}
 			// Check if client tried HTTP/2
 			if reader.Buffered() > 0 {
 				peek, _ := reader.Peek(reader.Buffered())
 				log.Printf("[MITM] read error %s: %v (buffered=%d, prefix=%q)", hostname, err, len(peek), string(peek[:min(len(peek), 24)]))
-			} else if err.Error() != "EOF" {
+			} else {
 				log.Printf("[MITM] read error %s: %v", hostname, err)
 			}
 			return
@@ -584,19 +635,26 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 		req.URL.Host = hostname
 		req.RequestURI = ""
 
-		requestModel := s.processRequestBody(req)
-		sourceApp := inferSourceAppFromHeaders(req.Header)
-		req.Header.Del("Accept-Encoding")
 		endpoint := req.URL.Path
+		monitorUsage := shouldMonitorAIEndpoint(endpoint)
+		requestModel, reqPromptBytes := "", 0
+		sourceApp := ""
+		if monitorUsage {
+			requestModel, reqPromptBytes = s.processRequestBody(req)
+			sourceApp = inferSourceAppFromHeaders(req.Header)
+			req.Header.Del("Accept-Encoding")
+		}
 
 		if isWebSocketUpgrade(req) {
 			s.handleWebSocketMITM(tlsConn, reader, req, host, hostname, vendor, endpoint, requestModel, sourceApp)
 			return
 		}
 
-		resp, err := s.transport.RoundTrip(req)
+		resp, err := s.roundTripUpstream(req)
 		if err != nil {
-			log.Printf("[MITM] forward error %s%s: %v", hostname, endpoint, err)
+			if !shouldSuppressForwardError(endpoint, monitorUsage, err) {
+				log.Printf("[MITM] forward error %s%s: %v", hostname, endpoint, err)
+			}
 			errResp := &http.Response{
 				StatusCode: http.StatusBadGateway,
 				Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
@@ -610,23 +668,25 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 
 		log.Printf("[MITM] %s %s%s → %d", req.Method, hostname, endpoint, resp.StatusCode)
 
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 400 && monitorUsage {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 			resp.Body.Close()
 			log.Printf("[MITM] error response %s%s: status=%d body=%q", hostname, endpoint, resp.StatusCode, string(errBody))
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
-		} else {
+		} else if monitorUsage {
 			var buf bytes.Buffer
 			resp.Body = &recordingBody{
 				ReadCloser: resp.Body,
 				buf:        &buf,
 				onClose: func(data []byte) {
-					s.processResponseData(vendor, endpoint, requestModel, sourceApp, data)
+					s.processResponseData(vendor, endpoint, requestModel, sourceApp, data, reqPromptBytes)
 				},
 			}
 		}
 
-		if err := resp.Write(tlsConn); err != nil {
+		writeErr := resp.Write(tlsConn)
+		_ = resp.Body.Close()
+		if writeErr != nil {
 			return
 		}
 	}
@@ -656,14 +716,21 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 			}
 			r.RequestURI = ""
 
-			requestModel := s.processRequestBody(r)
-			sourceApp := inferSourceAppFromHeaders(r.Header)
-			r.Header.Del("Accept-Encoding")
 			endpoint := r.URL.Path
+			monitorUsage := shouldMonitorAIEndpoint(endpoint)
+			requestModel, reqPromptBytes := "", 0
+			sourceApp := ""
+			if monitorUsage {
+				requestModel, reqPromptBytes = s.processRequestBody(r)
+				sourceApp = inferSourceAppFromHeaders(r.Header)
+				r.Header.Del("Accept-Encoding")
+			}
 
-			resp, err := s.transport.RoundTrip(r)
+			resp, err := s.roundTripUpstream(r)
 			if err != nil {
-				log.Printf("[MITM/h2] forward error %s%s: %v", hostname, endpoint, err)
+				if !shouldSuppressForwardError(endpoint, monitorUsage, err) {
+					log.Printf("[MITM/h2] forward error %s%s: %v", hostname, endpoint, err)
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadGateway)
 				_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"proxy: %v"}`, err)))
@@ -672,18 +739,18 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 
 			log.Printf("[MITM/h2] %s %s%s → %d", r.Method, hostname, endpoint, resp.StatusCode)
 
-			if resp.StatusCode >= 400 {
+			if resp.StatusCode >= 400 && monitorUsage {
 				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 				resp.Body.Close()
 				log.Printf("[MITM/h2] error response %s%s: status=%d body=%q", hostname, endpoint, resp.StatusCode, string(errBody))
 				resp.Body = io.NopCloser(bytes.NewReader(errBody))
-			} else {
+			} else if monitorUsage {
 				var buf bytes.Buffer
 				resp.Body = &recordingBody{
 					ReadCloser: resp.Body,
 					buf:        &buf,
 					onClose: func(data []byte) {
-						s.processResponseData(vendor, endpoint, requestModel, sourceApp, data)
+						s.processResponseData(vendor, endpoint, requestModel, sourceApp, data, reqPromptBytes)
 					},
 				}
 			}
@@ -829,25 +896,35 @@ func (s *ProxyServer) handleWebSocketMITM(clientConn net.Conn, clientReader *buf
 	}
 
 	done := make(chan wsCopyResult, 2)
+	streamEstimator := newCopilotResponsesStreamEstimator(
+		vendor,
+		endpoint,
+		requestModel,
+		sourceApp,
+		s.githubCopilotDiscountMultiplier(requestModel),
+		s.reporter,
+	)
 	go func() {
-		src := io.Reader(clientConn)
+		src := io.Reader(&idleDeadlineReader{r: clientConn, conn: clientConn, idle: proxyTunnelIdleTimeout})
 		if clientReader != nil && clientReader.Buffered() > 0 {
-			src = io.MultiReader(clientReader, clientConn)
+			src = io.MultiReader(clientReader, src)
 		}
-		n, err := io.Copy(upstreamConn, src)
+		n, err := io.Copy(&idleDeadlineWriter{w: upstreamConn, conn: upstreamConn, idle: proxyTunnelIdleTimeout}, src)
 		if diag {
 			log.Printf("[MITM/ws/diag %s] client->server ended bytes=%d after=%s err=%v closed=%v", wsID, n, time.Since(started), err, isClosedNetworkError(err))
 		}
-		if err != nil && !isClosedNetworkError(err) {
+		if err != nil && !isClosedNetworkError(err) && !isTimeoutNetworkError(err) {
 			log.Printf("[MITM/ws] client->server copy ended %s%s: %v", hostname, endpoint, err)
 		}
 		done <- wsCopyResult{direction: "client->server", bytes: n, err: err}
 	}()
 	go func() {
-		serverToClient := &countingWriter{w: clientConn}
+		serverToClient := &countingWriter{w: &idleDeadlineWriter{w: clientConn, conn: clientConn, idle: proxyTunnelIdleTimeout}}
 		frameCount := 0
-		err := copyWebSocketServerToClientObserved(serverToClient, upstreamReader, func(payload []byte) {
-			s.processResponseData(vendor, endpoint, requestModel, sourceApp, payload)
+		serverReader := &idleDeadlineReader{r: upstreamReader, conn: upstreamConn, idle: proxyTunnelIdleTimeout}
+		err := copyWebSocketServerToClientObserved(serverToClient, serverReader, func(payload []byte) {
+			s.processResponseData(vendor, endpoint, requestModel, sourceApp, payload, 0)
+			streamEstimator.Observe(payload)
 		}, func(frame websocketFrame, frameErr error) {
 			if !diag {
 				return
@@ -861,9 +938,10 @@ func (s *ProxyServer) handleWebSocketMITM(clientConn net.Conn, clientReader *buf
 		if diag {
 			log.Printf("[MITM/ws/diag %s] server->client ended bytes=%d frames=%d after=%s err=%v closed=%v", wsID, serverToClient.n, frameCount, time.Since(started), err, isClosedNetworkError(err))
 		}
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF && !isClosedNetworkError(err) {
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF && !isClosedNetworkError(err) && !isTimeoutNetworkError(err) {
 			log.Printf("[MITM/ws] server->client copy ended %s%s: %v", hostname, endpoint, err)
 		}
+		streamEstimator.Flush()
 		done <- wsCopyResult{direction: "server->client", bytes: serverToClient.n, err: err}
 	}()
 	first := <-done
@@ -883,7 +961,23 @@ func isClosedNetworkError(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
-	return strings.Contains(err.Error(), "use of closed network connection")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "forcibly closed by the remote host") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+func isExpectedDisconnectError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isClosedNetworkError(err)
+}
+
+func isTimeoutNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 type wsCopyResult struct {
@@ -921,9 +1015,13 @@ func (s *ProxyServer) dialTLSUpstream(hostname, host string) (*tls.Conn, error) 
 	if s.upstreamProxy != nil {
 		rawConn, err = s.dialViaUpstreamProxy(host)
 	} else {
-		rawConn, err = net.DialTimeout("tcp", host, 15*time.Second)
+		rawConn, err = net.DialTimeout("tcp", host, upstreamDialTimeout)
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err := rawConn.SetDeadline(time.Now().Add(upstreamTLSHandshakeTimeout)); err != nil {
+		rawConn.Close()
 		return nil, err
 	}
 	tlsConn := tls.Client(rawConn, &tls.Config{
@@ -933,6 +1031,10 @@ func (s *ProxyServer) dialTLSUpstream(hostname, host string) (*tls.Conn, error) 
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		rawConn.Close()
+		return nil, err
+	}
+	if err := rawConn.SetDeadline(time.Time{}); err != nil {
+		tlsConn.Close()
 		return nil, err
 	}
 	return tlsConn, nil
@@ -977,11 +1079,11 @@ func writeWebSocketSwitchResponse(w io.Writer, resp *http.Response) error {
 	return err
 }
 
-func copyWebSocketServerToClient(dst io.Writer, src *bufio.Reader, onMessage func([]byte)) error {
+func copyWebSocketServerToClient(dst io.Writer, src io.Reader, onMessage func([]byte)) error {
 	return copyWebSocketServerToClientObserved(dst, src, onMessage, nil)
 }
 
-func copyWebSocketServerToClientObserved(dst io.Writer, src *bufio.Reader, onMessage func([]byte), onFrame func(websocketFrame, error)) error {
+func copyWebSocketServerToClientObserved(dst io.Writer, src io.Reader, onMessage func([]byte), onFrame func(websocketFrame, error)) error {
 	var acc websocketMessageAccumulator
 	for {
 		frame, err := readWebSocketFrame(src)
@@ -1021,7 +1123,7 @@ type websocketFrame struct {
 	payload []byte
 }
 
-func readWebSocketFrame(r *bufio.Reader) (websocketFrame, error) {
+func readWebSocketFrame(r io.Reader) (websocketFrame, error) {
 	var f websocketFrame
 	header := make([]byte, 2)
 	if n, err := io.ReadFull(r, header); err != nil {
@@ -1139,19 +1241,26 @@ func framePayloadForInspect(frame websocketFrame) []byte {
 
 func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) {
 	hostname := r.URL.Hostname()
+	if isLinkLocalMetadataHost(hostname) {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 	vendor, isAI := s.matchAIDomain(hostname)
+	monitorUsage := isAI && shouldMonitorAIEndpoint(r.URL.Path)
 
 	requestModel := ""
 	sourceApp := ""
-	if isAI {
-		requestModel = s.processRequestBody(r)
+	if monitorUsage {
+		requestModel, _ = s.processRequestBody(r)
 		sourceApp = inferSourceAppFromHeaders(r.Header)
 		r.Header.Del("Accept-Encoding")
 	}
 
-	resp, err := s.transport.RoundTrip(r)
+	resp, err := s.roundTripUpstream(r)
 	if err != nil {
-		log.Printf("[HTTP] forward error %s %s: %v", r.Method, r.URL.String(), err)
+		if !shouldSuppressForwardError(r.URL.Path, monitorUsage, err) {
+			log.Printf("[HTTP] forward error %s %s: %v", r.Method, r.URL.String(), err)
+		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -1159,7 +1268,7 @@ func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) 
 
 	log.Printf("[HTTP] %s %s → %d", r.Method, r.URL.String(), resp.StatusCode)
 
-	if isAI && resp.StatusCode >= 400 {
+	if monitorUsage && resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		log.Printf("[HTTP] error response %s %s: status=%d body=%q", r.Method, r.URL.String(), resp.StatusCode, string(errBody))
 		resp.Body = io.NopCloser(bytes.NewReader(errBody))
@@ -1172,7 +1281,7 @@ func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) 
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	if isAI && resp.StatusCode < 400 {
+	if monitorUsage && resp.StatusCode < 400 {
 		var buf bytes.Buffer
 		tee := io.TeeReader(resp.Body, &buf)
 		if isStreamingResponse(resp.Header) {
@@ -1180,7 +1289,7 @@ func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) 
 		} else {
 			io.Copy(w, tee)
 		}
-		go s.processResponseData(vendor, r.URL.Path, requestModel, sourceApp, buf.Bytes())
+		go s.processResponseData(vendor, r.URL.Path, requestModel, sourceApp, buf.Bytes(), 0)
 	} else {
 		if isStreamingResponse(resp.Header) {
 			streamCopy(w, resp.Body)
@@ -1218,7 +1327,7 @@ func (s *ProxyServer) handleLegacy(w http.ResponseWriter, r *http.Request, vendo
 		return
 	}
 
-	requestModel := s.processRequestBody(r)
+	requestModel, _ := s.processRequestBody(r)
 	sourceApp := inferSourceAppFromHeaders(r.Header)
 
 	target, err := url.Parse(targetBase)
@@ -1246,14 +1355,17 @@ func (s *ProxyServer) handleLegacy(w http.ResponseWriter, r *http.Request, vendo
 			var buf bytes.Buffer
 			resp.Body = &recordingBody{
 				ReadCloser: resp.Body, buf: &buf,
-				onClose: func(data []byte) { s.processResponseData(vendor, remaining, requestModel, sourceApp, data) },
+				onClose: func(data []byte) { s.processResponseData(vendor, remaining, requestModel, sourceApp, data, 0) },
 			}
 			return nil
 		},
 		FlushInterval: -1,
-		Transport:     s.transport,
+		Transport:     upstreamRoundTripper{server: s},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
-			log.Printf("[legacy] forward error %s: %v", targetBase+remaining, err)
+			s.closeIdleUpstreamConnections()
+			if !shouldSuppressForwardError(remaining, shouldMonitorAIEndpoint(remaining), err) {
+				log.Printf("[legacy] forward error %s: %v", targetBase+remaining, err)
+			}
 			rw.Header().Set("Content-Type", "application/json")
 			rw.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(rw).Encode(map[string]string{"error": err.Error()})
@@ -1307,27 +1419,47 @@ func shouldInjectOpenAIStreamOptions(r *http.Request, reqData map[string]interfa
 	return false
 }
 
-func (s *ProxyServer) processRequestBody(r *http.Request) string {
+func (s *ProxyServer) processRequestBody(r *http.Request) (model string, promptTextBytes int) {
 	if r.Body == nil || r.ContentLength == 0 {
-		return ""
+		return "", 0
 	}
 	bodyBytes, err := io.ReadAll(r.Body)
 	r.Body.Close()
 	if err != nil || len(bodyBytes) == 0 {
-		return ""
+		return "", 0
 	}
 
 	var reqData map[string]interface{}
 	if json.Unmarshal(bodyBytes, &reqData) != nil {
+		// gRPC / protobuf 请求：从 proto 帧中提取文本字节作为 prompt tokens 估算基准
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		r.ContentLength = int64(len(bodyBytes))
 		r.TransferEncoding = nil // 已完整读取，移除 chunked 标记，避免上游收到两套 framing 信号
-		return inferModelHint(bodyBytes)
+		return inferModelHint(bodyBytes), extractGRPCTextBytes(bodyBytes)
 	}
 
-	model, _ := reqData["model"].(string)
+	model, _ = reqData["model"].(string)
 	if model == "" {
 		model = deepFindModel(reqData)
+	}
+
+	// 将旧式 thinking.type=enabled+budget_tokens 改写为新式 thinking.type=adaptive+output_config.effort。
+	// GitHub Copilot 后端（claude-opus-4-7 等新模型）已不接受旧格式，返回 400 invalid_request_error。
+	if rewriteThinkingEnabled(reqData) {
+		if modified, err := json.Marshal(reqData); err == nil {
+			bodyBytes = modified
+			log.Printf("[proxy] rewrite: thinking.type=enabled → thinking.type=adaptive (host=%s)", r.URL.Hostname())
+		}
+	}
+
+	// 规范化 output_config.effort：VS Code Copilot 扩展会直接发 "xhigh"，
+	// 该值不是 Anthropic 合法枚举（合法值：low/medium/high），GitHub Copilot
+	// 后端会返回 400 invalid_reasoning_effort；统一降为 "high"。
+	if from, to, ok := rewriteOutputConfigEffort(reqData); ok {
+		if modified, err := json.Marshal(reqData); err == nil {
+			bodyBytes = modified
+			log.Printf("[proxy] rewrite: output_config.effort %q → %q (host=%s)", from, to, r.URL.Hostname())
+		}
 	}
 
 	// 仅对 OpenAI Chat Completions 类 API 注入 stream_options（含 include_usage）。
@@ -1341,31 +1473,63 @@ func (s *ProxyServer) processRequestBody(r *http.Request) string {
 		}
 	}
 
+	// 对于 JSON 请求，累加 messages[*].content 的字节数作为 prompt 估算基准。
+	// 这给后续 opaque 路径提供更精确的 prompt tokens（当 usage 字段缺失时）。
+	if msgs, ok := reqData["messages"].([]interface{}); ok {
+		for _, m := range msgs {
+			if msg, ok := m.(map[string]interface{}); ok {
+				switch c := msg["content"].(type) {
+				case string:
+					promptTextBytes += len(c)
+				case []interface{}:
+					// 多模态 content blocks
+					for _, block := range c {
+						if b, ok := block.(map[string]interface{}); ok {
+							if t, ok := b["text"].(string); ok {
+								promptTextBytes += len(t)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	r.ContentLength = int64(len(bodyBytes))
 	r.TransferEncoding = nil // 已完整读取，移除 chunked 标记
 	if model == "" {
 		model = inferModelHint(bodyBytes)
 	}
-	return model
+	return model, promptTextBytes
 }
 
 // responseEndpointHasNoTokenUsage 为账户/支付/内部服务等响应（无 OpenAI/Anthropic 式 usage 字段）的 API，不打印「extract failed」避免刷屏。
 // 无 usage 时后面仍会走 opaque 粗算逻辑（若配置开启且 shouldOpaqueEstimate 为真）。
 func responseEndpointHasNoTokenUsage(endpoint string) bool {
-	ep := strings.ToLower(endpoint)
+	ep := strings.TrimRight(strings.ToLower(endpoint), "/")
+	if ep == "" {
+		ep = "/"
+	}
 	// 复用 opaque denylist：这些接口天然无 token usage
 	for _, kw := range opaqueEndpointDenylist {
 		if strings.Contains(ep, strings.ToLower(kw)) {
 			return true
 		}
 	}
+	// 观测/导出（OpenTelemetry OTLP）：无 ChatGPT/OpenAI usage 语义，不配「extract failed」刷屏
+	if strings.Contains(ep, "/otlp/") {
+		return true
+	}
 	// 账户/支付接口
 	if strings.Contains(ep, "full_stripe_profile") || strings.Contains(ep, "stripe") {
 		return true
 	}
-	// Cursor 内部仪表板/元数据接口（如 DashboardService/GetGlassEarlyPreviewEnrollment）
 	if strings.Contains(ep, "dashboardservice") || strings.Contains(ep, "dashboard") {
+		return true
+	}
+	// 模型/Agent 枚举和 session bootstrap 只返回元数据或临时 token，没有用量字段。
+	if isNoUsageMetadataEndpoint(ep) {
 		return true
 	}
 	// 认证/账户管理类
@@ -1383,14 +1547,40 @@ func responseEndpointHasNoTokenUsage(endpoint string) bool {
 	return false
 }
 
-func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, sourceApp string, data []byte) {
+func isNoUsageMetadataEndpoint(ep string) bool {
+	if ep == "/models" || ep == "/v1/models" || ep == "/api/v1/models" ||
+		ep == "/models/session" || strings.HasSuffix(ep, "/models/session") ||
+		ep == "/agents" || strings.HasSuffix(ep, "/agents") {
+		return true
+	}
+	if strings.HasSuffix(ep, "/models") && (strings.Contains(ep, "/agents/") || strings.Contains(ep, "/agent/")) {
+		return true
+	}
+	return false
+}
+
+func shouldSuppressForwardError(endpoint string, monitorUsage bool, err error) bool {
+	return !monitorUsage && responseEndpointHasNoTokenUsage(endpoint) && isExpectedDisconnectError(err)
+}
+
+func isLinkLocalMetadataHost(hostname string) bool {
+	hostname = normalizeProxyHostname(hostname)
+	return hostname == "169.254.169.254"
+}
+
+func shouldMonitorAIEndpoint(endpoint string) bool {
+	return !responseEndpointHasNoTokenUsage(endpoint)
+}
+
+func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, sourceApp string, data []byte, promptTextBytes int) {
 	if vendor == "github-copilot" {
 		s.updateGitHubCopilotDiscounts(data)
 	}
 
 	usage := ExtractUsage(vendor, data)
+	streamEvent := isCopilotResponsesStreamEvent(vendor, endpoint, data)
 	if usage == nil {
-		if !responseEndpointHasNoTokenUsage(endpoint) {
+		if !streamEvent && !responseEndpointHasNoTokenUsage(endpoint) {
 			prefix := data
 			if len(prefix) > 120 {
 				prefix = prefix[:120]
@@ -1444,13 +1634,13 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		modelHint = inferModelHint(data)
 	}
 	if !shouldOpaqueEstimateForVendor(vendor, endpoint, modelHint, data) {
-		if !responseEndpointHasNoTokenUsage(endpoint) {
+		if !streamEvent && !responseEndpointHasNoTokenUsage(endpoint) {
 			log.Printf("[opaque] skip %s %s: modelHint=%q data_len=%d json_valid=%v",
 				vendor, endpoint, modelHint, len(data), json.Valid(data))
 		}
 		return
 	}
-	pt, ct, tt := opaqueTokenSplit(data, endpoint)
+	pt, ct, tt := opaqueTokenSplit(data, endpoint, promptTextBytes)
 	if tt <= 0 {
 		return
 	}
@@ -1473,22 +1663,20 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":                 "running",
-		"version":                Version,
-		"mode":                   "transparent-mitm",
-		"pid":                    os.Getpid(),
-		"port":                   s.listenPort,
-		"wizard_url":             fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
-		"uptime_seconds":         int(time.Since(s.startedAt).Seconds()),
-		"upstream_proxy":         upstreamLabel,
-		"user":                   s.cfg.UserName,
-		"department":             s.cfg.Department,
-		"source_app":             s.reporter.sourceApp,
-		"server":                 s.cfg.ServerURL,
-		"ai_domains":             len(aiDomains),
-		"ai_wildcard_patterns":   len(aiWildcardDomains),
-		"extra_monitor_hosts":    len(s.cfg.ExtraMonitorHosts),
-		"extra_monitor_suffixes": len(s.cfg.ExtraMonitorSuffixes),
+		"status":           "running",
+		"version":          Version,
+		"mode":             "transparent-mitm",
+		"pid":              os.Getpid(),
+		"port":             s.listenPort,
+		"wizard_url":       fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
+		"uptime_seconds":   int(time.Since(s.startedAt).Seconds()),
+		"upstream_proxy":   upstreamLabel,
+		"user":             s.cfg.UserName,
+		"department":       s.cfg.Department,
+		"source_app":       s.reporter.sourceApp,
+		"server":           s.cfg.ServerURL,
+		"monitor_hosts":    len(effectiveMonitorHosts(s.cfg)),
+		"monitor_suffixes": len(effectiveMonitorSuffixes(s.cfg)),
 		"stats": map[string]interface{}{
 			"total_reported": s.reporter.Stats.TotalReported.Load(),
 			"total_tokens":   s.reporter.Stats.TotalTokens.Load(),
@@ -1503,9 +1691,11 @@ const recordingBodyMaxBytes = 4 * 1024 * 1024 // 4MB
 
 type recordingBody struct {
 	io.ReadCloser
-	buf     *bytes.Buffer
-	onClose func([]byte)
-	dropped bool
+	buf       *bytes.Buffer
+	onClose   func([]byte)
+	dropped   bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (r *recordingBody) Read(p []byte) (int, error) {
@@ -1531,13 +1721,15 @@ func (r *recordingBody) Read(p []byte) (int, error) {
 }
 
 func (r *recordingBody) Close() error {
-	err := r.ReadCloser.Close()
-	if r.onClose != nil {
-		data := make([]byte, r.buf.Len())
-		copy(data, r.buf.Bytes())
-		go safeGo("recordingBody.onClose", func() { r.onClose(data) })
-	}
-	return err
+	r.closeOnce.Do(func() {
+		r.closeErr = r.ReadCloser.Close()
+		if r.onClose != nil {
+			data := make([]byte, r.buf.Len())
+			copy(data, r.buf.Bytes())
+			go safeGo("recordingBody.onClose", func() { r.onClose(data) })
+		}
+	})
+	return r.closeErr
 }
 
 // streamCopy 将 src 拷到 dst，适用于 SSE / chunked 等需要实时下发的响应。
@@ -1562,6 +1754,173 @@ func streamCopy(dst http.ResponseWriter, src io.Reader) {
 	}
 }
 
+func (s *ProxyServer) roundTripUpstream(req *http.Request) (*http.Response, error) {
+	if s == nil || s.transport == nil {
+		return nil, errors.New("upstream transport not configured")
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	resp, err := s.transport.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		cancel()
+		s.closeIdleUpstreamConnections()
+		return nil, err
+	}
+	if resp.Body != nil {
+		resp.Body = &idleTimeoutReadCloser{
+			ReadCloser: resp.Body,
+			cancel:     cancel,
+			idle:       upstreamBodyIdleForReq(req),
+			label:      req.URL.String(),
+		}
+	} else {
+		cancel()
+	}
+	return resp, nil
+}
+
+// upstreamBodyIdleForReq 控制从上游读取响应体时的「连续无字节」超时（见 idleTimeoutReadCloser）。
+//
+// ChatGPT/Codex Responses API（/backend-api/codex/responses…）可能出现极长时间静默：
+// remote compact、长推理、SSE/分块下发前的首包等待等；若沿用默认 5 分钟「无字节即取消」，会
+// cancel 请求 context 并关闭 body，Codex 常见报错：stream disconnected before completion。
+// 对上述路径禁用 idle timer，交由上游或服务端正常结束或由客户端断开。
+func upstreamBodyIdleForReq(req *http.Request) time.Duration {
+	if req == nil || req.URL == nil {
+		return upstreamBodyIdleTimeout
+	}
+	p := strings.ToLower(req.URL.Path)
+	if strings.Contains(p, "/backend-api/codex/responses") {
+		return 0
+	}
+	return upstreamBodyIdleTimeout
+}
+
+func (s *ProxyServer) closeIdleUpstreamConnections() {
+	if s != nil && s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
+}
+
+type upstreamRoundTripper struct {
+	server *ProxyServer
+}
+
+func (t upstreamRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.server.roundTripUpstream(req)
+}
+
+type idleTimeoutReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	idle   time.Duration
+	label  string
+
+	mu     sync.Mutex
+	timer  *time.Timer
+	closed bool
+}
+
+func (r *idleTimeoutReadCloser) Read(p []byte) (int, error) {
+	r.arm()
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		r.arm()
+	}
+	if err != nil {
+		r.stopTimer()
+	}
+	return n, err
+}
+
+func (r *idleTimeoutReadCloser) Close() error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	cancel := r.cancel
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return r.ReadCloser.Close()
+}
+
+func (r *idleTimeoutReadCloser) arm() {
+	if r.idle <= 0 || r.cancel == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	if r.timer == nil {
+		r.timer = time.AfterFunc(r.idle, func() {
+			if r.label != "" {
+				log.Printf("[proxy] upstream body idle timeout after %s: %s", r.idle, r.label)
+			}
+			r.cancel()
+		})
+		return
+	}
+	r.timer.Reset(r.idle)
+}
+
+func (r *idleTimeoutReadCloser) stopTimer() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+}
+
+type idleDeadlineReader struct {
+	r    io.Reader
+	conn interface{ SetReadDeadline(time.Time) error }
+	idle time.Duration
+}
+
+func (r *idleDeadlineReader) Read(p []byte) (int, error) {
+	if r.idle > 0 && r.conn != nil {
+		_ = r.conn.SetReadDeadline(time.Now().Add(r.idle))
+	}
+	n, err := r.r.Read(p)
+	if err != nil && r.conn != nil {
+		_ = r.conn.SetReadDeadline(time.Time{})
+	}
+	return n, err
+}
+
+type idleDeadlineWriter struct {
+	w    io.Writer
+	conn interface{ SetWriteDeadline(time.Time) error }
+	idle time.Duration
+}
+
+func (w *idleDeadlineWriter) Write(p []byte) (int, error) {
+	if w.idle > 0 && w.conn != nil {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(w.idle))
+	}
+	n, err := w.w.Write(p)
+	if err != nil && w.conn != nil {
+		_ = w.conn.SetWriteDeadline(time.Time{})
+	}
+	return n, err
+}
+
+func copyConnWithIdleTimeout(dst, src net.Conn) (int64, error) {
+	return io.Copy(
+		&idleDeadlineWriter{w: dst, conn: dst, idle: proxyTunnelIdleTimeout},
+		&idleDeadlineReader{r: src, conn: src, idle: proxyTunnelIdleTimeout},
+	)
+}
+
 // isStreamingResponse 判断响应是否属于需要即时下发的类型。
 func isStreamingResponse(h http.Header) bool {
 	ct := h.Get("Content-Type")
@@ -1573,4 +1932,140 @@ func isStreamingResponse(h http.Header) bool {
 		return true
 	}
 	return false
+}
+
+// rewriteThinkingEnabled 将旧式 thinking 格式转换为新式格式，返回是否做了改写。
+//
+// 旧格式（claude-3-7-sonnet 时代）：
+//
+//	{"thinking": {"type": "enabled", "budget_tokens": 10000}}
+//
+// 新格式（claude-opus-4-7 等新模型要求）：
+//
+//	{"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+//
+// GitHub Copilot 后端已升级为仅接受新格式，旧格式会收到 400:
+// "thinking.type.enabled is not supported for this model."
+func rewriteThinkingEnabled(reqData map[string]interface{}) bool {
+	thinking, ok := reqData["thinking"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if t, _ := thinking["type"].(string); t != "enabled" {
+		return false
+	}
+	// budget_tokens → effort 映射（参考 Anthropic 文档建议值）
+	budget := toInt(thinking["budget_tokens"])
+	effort := "high"
+	if budget > 0 && budget <= 2048 {
+		effort = "low"
+	} else if budget <= 8192 {
+		effort = "medium"
+	}
+	reqData["thinking"] = map[string]interface{}{"type": "adaptive"}
+	if _, has := reqData["output_config"]; !has {
+		reqData["output_config"] = map[string]interface{}{"effort": effort}
+	}
+	return true
+}
+
+// rewriteOutputConfigEffort 规范化 output_config.effort 字段。
+// VS Code Copilot 等客户端会发送非标准值（如 "xhigh"），GitHub Copilot 后端
+// 仅接受 Anthropic 合法枚举：low / medium / high。
+// 返回 (原值, 新值, 是否做了改写)。
+func rewriteOutputConfigEffort(reqData map[string]interface{}) (string, string, bool) {
+	outCfg, ok := reqData["output_config"].(map[string]interface{})
+	if !ok {
+		return "", "", false
+	}
+	effort, ok := outCfg["effort"].(string)
+	if !ok {
+		return "", "", false
+	}
+	switch effort {
+	case "low", "medium", "high":
+		return effort, effort, false // 合法值，无需改写
+	case "xhigh":
+		outCfg["effort"] = "high"
+		return effort, "high", true
+	default:
+		// 其他未知值统一降为 medium，避免 400
+		outCfg["effort"] = "medium"
+		return effort, "medium", true
+	}
+}
+
+// upstreamProxyPreserveLoopback 包装 Transport.Proxy：环回与链路本地地址永远不走上游代理。
+// 上游 http.ProxyURL 会对所有 host 返回代理地址；若某请求（例如被误配置为走系统代理的
+// HTTP 客户端）将 http://localhost:PORT 送到本 MITM，则二次 RoundTrip 仍会走 sing-box，
+// 常被上游丢弃或阻断，导致 Codex 扩展本机 /responses 桥接流中断。
+func upstreamProxyPreserveLoopback(base func(*http.Request) (*url.URL, error)) func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		if shouldDialUpstreamTargetDirect(req) {
+			return nil, nil
+		}
+		if base == nil {
+			return nil, nil
+		}
+		return base(req)
+	}
+}
+
+func shouldDialUpstreamTargetDirect(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	host := strings.TrimSpace(req.URL.Hostname())
+	if host == "" {
+		return false
+	}
+	h := strings.ToLower(strings.Trim(host, "[]"))
+	switch h {
+	case "localhost", "localhost.localdomain", "::1":
+		return true
+	}
+	ip := net.ParseIP(h)
+	if ip != nil {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			return true
+		}
+		return ip.Equal(net.IPv4(169, 254, 169, 254))
+	}
+	return strings.HasSuffix(h, ".localhost")
+}
+
+// buildUpstreamTransport 创建向上游 AI API 发请求的 Transport。
+// 核心：设置了 TLSClientConfig 后 Go 不再自动注册 HTTP/2，需显式调用
+// http2.ConfigureTransport，否则每条 MITM 连接都要单独完成一次 TLS 握手，
+// 并发量稍高就会出现 "TLS handshake timeout"。
+//
+// 连接池配置说明（与上游 sing-box/Clash 等本地代理配合）：
+//   - IdleConnTimeout 设为 30s，必须短于上游代理的空闲超时，避免持有已
+//     被上游关闭的"半死连接"导致请求卡住；
+//   - MaxConnsPerHost 限制对每个 AI API 域名的总连接数，防止耗尽上游代理
+//     的文件描述符或连接限制；
+//   - ResponseHeaderTimeout：避免永远等不到头；但 Codex compact 等可能 >1min，见 upstreamResponseHeaderTimeout。
+func buildUpstreamTransport(proxyFunc func(*http.Request) (*url.URL, error)) *http.Transport {
+	t := &http.Transport{
+		// 默认直连；仅在检测到 upstream_proxy 时走上游代理，避免环路。
+		Proxy:                 proxyFunc,
+		TLSHandshakeTimeout:   20 * time.Second,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       50,               // 防止耗尽上游代理连接数
+		IdleConnTimeout:       30 * time.Second, // 短于 sing-box/Clash 的默认空闲超时
+		ResponseHeaderTimeout: upstreamResponseHeaderTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		DialContext: (&net.Dialer{
+			Timeout:   upstreamDialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	// 显式启用 HTTP/2，使代理能与上游（如 GitHub Copilot、Anthropic）做 H2 多路复用，
+	// 大幅减少并发 TLS 握手次数，消除高并发下的握手超时。
+	if err := http2.ConfigureTransport(t); err != nil {
+		log.Printf("[proxy] http2.ConfigureTransport: %v (falling back to HTTP/1.1 upstream)", err)
+	}
+	return t
 }

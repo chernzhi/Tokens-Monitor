@@ -9,11 +9,12 @@ export interface MonitorConfig {
     department: string;
     copilotOrg: string;
     apiKey: string;
-    /** 优先于 identity.json 的显式工作区项（如设置 aiTokenMonitor.authToken） */
+    /** 优先于共享 config.json 的显式工作区项（如设置 aiTokenMonitor.authToken） */
     authToken: string;
 }
 
 interface IdentityInfo {
+    server_url?: string;
     user_id?: string;
     user_name?: string;
     department?: string;
@@ -33,23 +34,74 @@ export const DEFAULT_SERVER_URL = 'https://otw.tech:59889';
 
 function loadIdentity(): IdentityInfo | null {
     if (_identityCache !== undefined) { return _identityCache; }
+    const appData = process.env.APPDATA;
+    if (!appData) { _identityCache = null; return null; }
+
+    const configPath = path.join(appData, 'ai-monitor', 'config.json');
     try {
-        const appData = process.env.APPDATA;
-        if (!appData) { _identityCache = null; return null; }
-        const p = path.join(appData, 'ai-monitor', 'identity.json');
-        const raw = fs.readFileSync(p, 'utf8');
-        _identityCache = JSON.parse(raw) as IdentityInfo;
+        const raw = fs.readFileSync(configPath, 'utf8');
+        _identityCache = parseJSONWithLineComments<IdentityInfo>(raw);
+        return _identityCache;
+    } catch {
+        // Legacy fallback for older ai-monitor installs that wrote identity.json.
+    }
+
+    try {
+        const identityPath = path.join(appData, 'ai-monitor', 'identity.json');
+        const raw = fs.readFileSync(identityPath, 'utf8');
+        _identityCache = parseJSONWithLineComments<IdentityInfo>(raw);
     } catch {
         _identityCache = null;
     }
     return _identityCache;
 }
 
+function parseJSONWithLineComments<T>(raw: string): T {
+    return JSON.parse(stripJSONLineComments(raw)) as T;
+}
+
+function stripJSONLineComments(raw: string): string {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        if (inString) {
+            out += ch;
+            if (escaped) {
+                escaped = false;
+            } else if (ch === '\\') {
+                escaped = true;
+            } else if (ch === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            out += ch;
+            continue;
+        }
+        if (ch === '/' && raw[i + 1] === '/') {
+            while (i < raw.length && raw[i] !== '\n') {
+                i++;
+            }
+            if (i < raw.length) {
+                out += raw[i];
+            }
+            continue;
+        }
+        out += ch;
+    }
+    return out;
+}
+
 export function getConfig(): MonitorConfig {
     const cfg = vscode.workspace.getConfiguration('aiTokenMonitor');
     const identity = loadIdentity();
+    const serverUrl = cfg.get<string>('serverUrl', '') || identity?.server_url || DEFAULT_SERVER_URL;
     return {
-        serverUrl: cfg.get<string>('serverUrl', DEFAULT_SERVER_URL).replace(/\/+$/, ''),
+        serverUrl: serverUrl.replace(/\/+$/, ''),
         userId: cfg.get<string>('userId', '') || identity?.user_id || '',
         userName: cfg.get<string>('userName', '') || identity?.user_name || '',
         department: cfg.get<string>('department', '') || identity?.department || '',

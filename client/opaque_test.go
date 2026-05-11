@@ -44,8 +44,20 @@ func TestShouldOpaqueEstimateForChatGPTWeb(t *testing.T) {
 
 func TestOpaqueTokenSplit(t *testing.T) {
 	body := bytesRepeat(100)
-	pt, ct, tt := opaqueTokenSplit(body, "/v1/chat/completions")
+	pt, ct, tt := opaqueTokenSplit(body, "/v1/chat/completions", 0)
 	if tt <= 0 || pt+ct != tt {
+		t.Fatalf("pt=%d ct=%d tt=%d", pt, ct, tt)
+	}
+}
+
+func TestOpaqueTokenSplitWithPromptHint(t *testing.T) {
+	body := bytesRepeat(100)
+	// 提供 promptTextBytes 时，prompt 应来自 hint 而非比例推算
+	pt, ct, tt := opaqueTokenSplit(body, "/v1/chat/completions", 400)
+	if pt != 100 { // 400/4 = 100
+		t.Fatalf("expected prompt=100, got %d", pt)
+	}
+	if pt+ct != tt {
 		t.Fatalf("pt=%d ct=%d tt=%d", pt, ct, tt)
 	}
 }

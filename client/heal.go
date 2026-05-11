@@ -20,8 +20,9 @@ import (
 //     仅当确实没有 config.json 时才清掉 install_state（说明用户已不打算再用本程序）。
 //
 // 退出码：
-//   0  成功（无事可做或修复完成）
-//   1  发现需要恢复但执行失败
+//
+//	0  成功（无事可做或修复完成）
+//	1  发现需要恢复但执行失败
 func runHealMode(configPath string) int {
 	st := loadInstallState()
 	if st == nil || !st.SystemProxySet {
@@ -104,15 +105,13 @@ func portIsListening(port int) bool {
 // 主动触发 restoreSessionManagedProxyOnShutdown 并退出，让用户网络立即恢复。
 //
 // 不替代 OS 的 graceful shutdown — 只兜底「listener 死了但进程还在」的边缘场景。
-func startSelfWatchdog(port int) {
+func startSelfWatchdog(port int, cfg *Config) {
 	if runtime.GOOS != "windows" {
 		return
 	}
 	go func() {
-		const (
-			interval        = 30 * time.Second
-			failureThreshold = 3
-		)
+		interval := time.Duration(cfg.EffectiveWatchdogInterval()) * time.Second
+		failureThreshold := cfg.EffectiveWatchdogFailures()
 		client := &http.Client{Timeout: 3 * time.Second}
 		failures := 0
 		// 启动后先等 interval，避免冷启动期间偶发失败误触发。

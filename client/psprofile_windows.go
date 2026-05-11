@@ -14,12 +14,13 @@ const psProfileMarker = "# ── AI Monitor 代理包装 (ai-monitor managed) �
 const psProfileEndMarker = "# ── END AI Monitor 代理包装 ──"
 
 // psProfileBlock 返回要写入 PowerShell Profile 的代理包装代码块。
-func psProfileBlock(proxyAddr, caCertPath string) string {
+func psProfileBlock(proxyAddr, caCertPath, noProxy string) string {
 	return fmt.Sprintf(`%s
 # 此段由 ai-monitor --install 自动生成，卸载时自动移除。
 # 让 claude / codex 等 Node.js CLI 工具走本地 MITM 代理，无需每次手动设置。
 $_aiMonitorProxy  = "%s"
 $_aiMonitorCACert = "%s"
+$_aiMonitorNoProxy = "%s"
 
 function _Invoke-AIMonitorProxy {
     param([string]$Cmd, [string[]]$CmdArgs)
@@ -30,27 +31,40 @@ function _Invoke-AIMonitorProxy {
         Write-Error "ai-monitor: 找不到外部命令 '$Cmd'，请确认已安装并在 PATH 中。"
         return
     }
-    $env:HTTPS_PROXY         = $_aiMonitorProxy
-    $env:HTTP_PROXY          = $_aiMonitorProxy
-    $env:ANTHROPIC_BASE_URL  = "$_aiMonitorProxy/anthropic"
-    $env:OPENAI_BASE_URL     = "$_aiMonitorProxy/openai/v1"
-    $env:OPENAI_API_BASE     = "$_aiMonitorProxy/openai/v1"
-    if (Test-Path $_aiMonitorCACert) {
-        $env:NODE_EXTRA_CA_CERTS = $_aiMonitorCACert
-        $env:SSL_CERT_FILE       = $_aiMonitorCACert
+	try {
+		$env:HTTPS_PROXY         = $_aiMonitorProxy
+		$env:HTTP_PROXY          = $_aiMonitorProxy
+		$env:https_proxy         = $_aiMonitorProxy
+		$env:http_proxy          = $_aiMonitorProxy
+		$env:NO_PROXY            = $_aiMonitorNoProxy
+		$env:no_proxy            = $_aiMonitorNoProxy
+		$env:ANTHROPIC_BASE_URL  = "$_aiMonitorProxy/anthropic"
+		$env:OPENAI_BASE_URL     = "$_aiMonitorProxy/openai/v1"
+		$env:OPENAI_API_BASE     = "$_aiMonitorProxy/openai/v1"
+		if (Test-Path $_aiMonitorCACert) {
+			$env:NODE_EXTRA_CA_CERTS   = $_aiMonitorCACert
+			$env:SSL_CERT_FILE         = $_aiMonitorCACert
+			$env:CODEX_CA_CERTIFICATE  = $_aiMonitorCACert
+		}
+		& $realPath @CmdArgs
+	} finally {
+		Remove-Item Env:HTTPS_PROXY        -ErrorAction SilentlyContinue
+		Remove-Item Env:HTTP_PROXY         -ErrorAction SilentlyContinue
+		Remove-Item Env:https_proxy        -ErrorAction SilentlyContinue
+		Remove-Item Env:http_proxy         -ErrorAction SilentlyContinue
+		Remove-Item Env:NO_PROXY           -ErrorAction SilentlyContinue
+		Remove-Item Env:no_proxy           -ErrorAction SilentlyContinue
+		Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
+		Remove-Item Env:OPENAI_BASE_URL    -ErrorAction SilentlyContinue
+		Remove-Item Env:OPENAI_API_BASE    -ErrorAction SilentlyContinue
+		Remove-Item Env:CODEX_CA_CERTIFICATE -ErrorAction SilentlyContinue
     }
-    & $realPath @CmdArgs
-    Remove-Item Env:HTTPS_PROXY        -ErrorAction SilentlyContinue
-    Remove-Item Env:HTTP_PROXY         -ErrorAction SilentlyContinue
-    Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
-    Remove-Item Env:OPENAI_BASE_URL    -ErrorAction SilentlyContinue
-    Remove-Item Env:OPENAI_API_BASE    -ErrorAction SilentlyContinue
 }
 
 function claude { _Invoke-AIMonitorProxy "claude" $args }
 function codex  { _Invoke-AIMonitorProxy "codex"  $args }
 %s
-`, psProfileMarker, proxyAddr, caCertPath, psProfileEndMarker)
+`, psProfileMarker, proxyAddr, caCertPath, noProxy, psProfileEndMarker)
 }
 
 // powershellProfilePath 返回当前用户的 PowerShell 5 和 PowerShell 7 Profile 路径。
@@ -71,9 +85,9 @@ func powershellProfilePaths() []string {
 }
 
 // InstallPowerShellProfile 向用户的 PowerShell Profile 注入代理包装函数。
-// 幂等：已存在则跳过，不会重复写入。
-func InstallPowerShellProfile(proxyAddr, caCertPath string) error {
-	block := psProfileBlock(proxyAddr, caCertPath)
+// 幂等：已存在则替换为当前版本，不会重复写入。
+func InstallPowerShellProfile(proxyAddr, caCertPath, noProxy string) error {
+	block := psProfileBlock(proxyAddr, caCertPath, noProxy)
 	var lastErr error
 	installed := 0
 
@@ -88,9 +102,26 @@ func InstallPowerShellProfile(proxyAddr, caCertPath string) error {
 			existing = string(data)
 		}
 
-		// 已经有标记，跳过
+		// 已经有标记则替换，确保旧安装能拿到 NO_PROXY 等修复。
 		if strings.Contains(existing, psProfileMarker) {
-			log.Printf("[psprofile] 已存在，跳过: %s", profilePath)
+			start := strings.Index(existing, psProfileMarker)
+			end := strings.Index(existing, psProfileEndMarker)
+			if start == -1 || end == -1 || end < start {
+				lastErr = fmt.Errorf("PowerShell Profile 标记不完整: %s", profilePath)
+				log.Printf("[psprofile] 标记不完整，跳过: %s", profilePath)
+				continue
+			}
+			end += len(psProfileEndMarker)
+			for end < len(existing) && (existing[end] == '\n' || existing[end] == '\r') {
+				end++
+			}
+			newContent := existing[:start] + block + existing[end:]
+			if err := os.WriteFile(profilePath, []byte(newContent), 0644); err != nil {
+				lastErr = err
+				log.Printf("[psprofile] 更新失败 %s: %v", profilePath, err)
+				continue
+			}
+			log.Printf("[psprofile] 已更新: %s", profilePath)
 			installed++
 			continue
 		}

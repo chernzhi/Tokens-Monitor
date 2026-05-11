@@ -5,6 +5,7 @@
  */
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { getConfig, getAppName, getNormalizedAppName, _resetIdentityCache } from '../config';
 
 jest.mock('fs', () => ({
@@ -13,6 +14,7 @@ jest.mock('fs', () => ({
 
 // Helper: cast the mocked workspace.getConfiguration to a jest.Mock
 const mockGetConfiguration = vscode.workspace.getConfiguration as jest.Mock;
+const mockReadFileSync = fs.readFileSync as jest.Mock;
 
 describe('config', () => {
     beforeEach(() => {
@@ -78,6 +80,40 @@ describe('config', () => {
             expect(cfg.copilotOrg).toBe('my-org');
             expect(cfg.apiKey).toBe('test-key-123');
             expect(cfg.authToken).toBe('token-from-workspace');
+        });
+
+        test('falls back to shared ai-monitor config.json', () => {
+            const originalAppData = process.env.APPDATA;
+            process.env.APPDATA = 'C:\\Users\\tester\\AppData\\Roaming';
+            try {
+                mockReadFileSync.mockImplementation((file: string) => {
+                    if (String(file).endsWith('config.json')) {
+                        return `{
+                            // server_url includes https:// and should not be truncated by comment stripping.
+                            "server_url": "https://from-config.example///",
+                            "user_id": "u-config", // inline comment
+                            "user_name": "Config User",
+                            "department": "Config Dept",
+                            "api_key": "api-from-config",
+                            "auth_token": "token-from-config"
+                        }`;
+                    }
+                    throw new Error('ENOENT');
+                });
+                mockGetConfiguration.mockReturnValue({
+                    get: jest.fn((_key: string, defaultVal: any) => defaultVal),
+                });
+
+                const cfg = getConfig();
+                expect(cfg.serverUrl).toBe('https://from-config.example');
+                expect(cfg.userId).toBe('u-config');
+                expect(cfg.userName).toBe('Config User');
+                expect(cfg.department).toBe('Config Dept');
+                expect(cfg.apiKey).toBe('api-from-config');
+                expect(cfg.authToken).toBe('token-from-config');
+            } finally {
+                process.env.APPDATA = originalAppData;
+            }
         });
     });
 

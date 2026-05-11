@@ -22,9 +22,11 @@ var Version = "dev"
 // proxyEnvKeys lists environment variables cleared by --uninstall（含旧版曾写入的 HTTP_PROXY 等）.
 var proxyEnvKeys = []string{
 	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+	"http_proxy", "https_proxy", "no_proxy",
 	"OPENAI_BASE_URL", "OPENAI_API_BASE",
 	"ANTHROPIC_BASE_URL",
 	"NODE_EXTRA_CA_CERTS",
+	"CODEX_CA_CERTIFICATE",
 }
 
 func selfBinaryName() string {
@@ -51,11 +53,11 @@ func main() {
 	installCertOnly := flag.Bool("install-cert-only", false, "与 --install 合用: 仅安装 CA，不改系统代理(与 Proxifier 共存时用)")
 	installIDE := flag.Bool("install-ide", false, "与 --install 合用: 强制写入 VS Code/Cursor 的 http.proxy（默认不写，仅用系统代理）")
 	globalInstall := flag.Bool("global-install", false, "全局安装: 安装 CA + 设用户级 HTTP_PROXY 环境变量 + 注册开机自启（推荐，一键覆盖所有开发工具）")
-	globalUninstall := flag.Bool("global-uninstall", false, "全局卸载: 移除 CA + 清除环境变量 + 移除开机自启")
+	globalUninstall := flag.Bool("global-uninstall", false, "全局卸载: 移除 CA + 恢复代理/环境变量 + 移除开机自启 + 删除安装配置")
 	launch := flag.Bool("launch", false, "启动本地 MITM，并仅对子进程注入代理环境变量；不修改系统代理或用户环境变量")
 	launchPreset := flag.String("launch-preset", "", "按预设启动受管应用，例如 vscode、cursor、powershell、cmd")
 	listLaunchPresets := flag.Bool("list-launch-presets", false, "列出可用的受管应用启动预设")
-	uninstall := flag.Bool("uninstall", false, "卸载: 移除CA证书, 清除系统代理和环境变量")
+	uninstall := flag.Bool("uninstall", false, "卸载: 移除 CA 证书，恢复代理/环境变量，并删除安装配置")
 	setup := flag.Bool("setup", false, "傻瓜式配置向导：生成 config.json 并安装证书/代理")
 	heal := flag.Bool("heal", false, "自愈：如果上次 ai-monitor 崩溃/被杀导致系统代理指向 dead 端口，还原原始网络配置")
 	defaultConfigPath := filepath.Join(appDataDir(), "config.json")
@@ -142,6 +144,15 @@ func main() {
 	}
 	resolveLocalUpstreamWithFallback(cfg, *configPath, nil)
 
+	// 自动检测配置缺失并尝试恢复（配置单一化的自愈机制）
+	healWarnings := ValidateAndHealConfig(cfg, *configPath)
+	for _, w := range healWarnings {
+		fmt.Printf("  %s\n", w)
+	}
+	if len(healWarnings) > 0 {
+		fmt.Println()
+	}
+
 	bypass := buildProxyBypassWithConfig(cfg)
 	noProxy := buildNoProxyEnvWithConfig(cfg)
 
@@ -180,7 +191,7 @@ func main() {
 		log.Printf("[singleton] 写入 instance.json 失败: %v", err)
 	}
 	applySessionManagedProxy(cfg, certMgr, runtime.listenPort)
-	startSelfWatchdog(runtime.listenPort)
+	startSelfWatchdog(runtime.listenPort, cfg)
 	if runtime.listenPort != cfg.Port {
 		log.Printf("[提示] 配置端口 %d 已被占用，已自动改用 %d（定向启动应用时请指向新端口）", cfg.Port, runtime.listenPort)
 	}
@@ -203,15 +214,8 @@ func main() {
 	if strings.TrimSpace(cfg.UpstreamProxy) != "" {
 		fmt.Printf("  上游代理透传: %s\n", cfg.UpstreamProxy)
 	}
-	eh, es := 0, 0
-	if cfg.ExtraMonitorHosts != nil {
-		eh = len(cfg.ExtraMonitorHosts)
-	}
-	if cfg.ExtraMonitorSuffixes != nil {
-		es = len(cfg.ExtraMonitorSuffixes)
-	}
-	fmt.Printf("  内置监控: %d 个精确域名 + %d 条通配规则；config 额外: %d 主机 + %d 后缀\n",
-		len(aiDomains), len(aiWildcardDomains), eh, es)
+	fmt.Printf("  监控域名: %d 个精确域名 + %d 条通配规则；直连列表: %d 条（均来自 config 可编辑默认表）\n",
+		len(effectiveMonitorHosts(cfg)), len(effectiveMonitorSuffixes(cfg)), len(effectiveBypassDomains(cfg)))
 	fmt.Printf("  CA 证书: %s\n", certMgr.CACertPath())
 	fmt.Println()
 	fmt.Println("  说明: 默认不修改系统代理；推荐用 `--launch <程序>` 仅对子进程注入代理环境变量。")
@@ -315,52 +319,73 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 	// Detect existing upstream BEFORE overwriting so we can chain through it
 	detectedUpstream := detectUpstreamProxy(cfg)
 	previousProxy := readCurrentSystemProxy()
+	previousAutoConfigURL := ReadCurrentAutoConfigURL()
 	previousEnvVars := snapshotProxyEnvVars()
 
 	if detectedUpstream != "" {
 		fmt.Printf("    ℹ 检测到已有代理: %s（将作为上游保留）\n", detectedUpstream)
 		if strings.TrimSpace(cfg.UpstreamProxy) == "" {
 			cfg.UpstreamProxy = detectedUpstream
-			// Best-effort write to config file
-			patchConfigUpstreamProxy(filepath.Join(filepath.Dir(os.Args[0]), "config.json"), detectedUpstream)
+			if err := SaveConfig(cfg, filepath.Join(filepath.Dir(os.Args[0]), "config.json")); err != nil {
+				log.Printf("    ⚠ 写入 upstream_proxy 到 config.json 失败: %v", err)
+			}
 		}
 	}
+
+	// 解析实际监听端口，PAC 文件需要它
+	actualPort := resolveActualPort(cfg)
 
 	saveInstallState(&InstallState{
 		SystemProxySet:        true,
 		PreviousProxyAddr:     previousProxy,
-		PreviousProxyEnabled:  previousProxy != "",
+		PreviousProxyEnabled:  previousProxy != "" && !isSelfProxy(previousProxy),
 		IDESettingsPatched:    patchIDE,
 		PreviousUpstreamProxy: detectedUpstream,
 		PreviousEnvVars:       previousEnvVars,
+		PACFileSet:            true,
+		PACFilePath:           pacFilePath(),
+		PreviousAutoConfigURL: previousAutoConfigURL,
 	})
 
-	fmt.Println("  [2/4] 设置系统代理...")
-	if previousProxy != "" {
+	fmt.Println("  [2/4] 设置系统代理 (PAC 白名单模式)...")
+	if previousProxy != "" && !isSelfProxy(previousProxy) {
 		fmt.Printf("    ℹ 检测到现有系统代理: %s（已备份，卸载时将恢复）\n", previousProxy)
 	}
-	if err := EnableSystemProxy(proxyAddr, bypass); err != nil {
-		log.Printf("    ✗ 系统代理设置失败: %v", err)
+	if previousAutoConfigURL != "" {
+		fmt.Printf("    ℹ 检测到现有 PAC: %s（已备份，卸载时将恢复）\n", previousAutoConfigURL)
+	}
+	pacURL, err := writePACFile(actualPort, cfg, "")
+	if err != nil {
+		log.Printf("    ✗ PAC 文件生成失败: %v", err)
+	} else if err := EnableSystemProxyPAC(pacURL); err != nil {
+		log.Printf("    ✗ 系统代理 (PAC) 设置失败: %v", err)
 	} else {
-		fmt.Printf("    ✓ 系统代理: %s\n", proxyAddr)
+		fmt.Printf("    ✓ PAC 文件: %s\n", pacFilePath())
+		fmt.Printf("    ✓ 系统代理: %s\n", pacURL)
+		fmt.Println("      → 仅 AI 域名走 MITM；浏览器/内网/其他软件全部 DIRECT")
+		fmt.Println("      → MITM 异常时 PAC 自动回退 DIRECT，不影响整机网络")
 	}
 
 	fmt.Println("  [3/4] 设置环境变量（HTTP(S)_PROXY 指向本程序 + NO_PROXY 与系统代理例外一致）...")
 	fmt.Println("    — 未列入 NO_PROXY 的域名（如各 AI API）经 Node/CLI 也会走本机 MITM；GitHub/VS Code/CDN 走直连。")
 	envVars := map[string]string{
-		"HTTP_PROXY":          httpProxy,
-		"HTTPS_PROXY":         httpProxy,
-		"NO_PROXY":            noProxy,
-		"OPENAI_BASE_URL":     httpProxy + "/openai/v1",
-		"OPENAI_API_BASE":     httpProxy + "/openai/v1",
-		"ANTHROPIC_BASE_URL":  httpProxy + "/anthropic",
-		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
+		"HTTP_PROXY":           httpProxy,
+		"HTTPS_PROXY":          httpProxy,
+		"NO_PROXY":             noProxy,
+		"http_proxy":           httpProxy,
+		"https_proxy":          httpProxy,
+		"no_proxy":             noProxy,
+		"OPENAI_BASE_URL":      httpProxy + "/openai/v1",
+		"OPENAI_API_BASE":      httpProxy + "/openai/v1",
+		"ANTHROPIC_BASE_URL":   httpProxy + "/anthropic",
+		"NODE_EXTRA_CA_CERTS":  resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
+		"CODEX_CA_CERTIFICATE": certMgr.CACertPath(),
 	}
 	if err := SetEnvProxy(envVars); err != nil {
 		log.Printf("    ✗ 环境变量设置失败: %v", err)
 	} else {
 		fmt.Println("    ✓ 已设置:")
-		envOrder := []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL", "NODE_EXTRA_CA_CERTS"}
+		envOrder := []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL", "NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE"}
 		for _, k := range envOrder {
 			v := envVars[k]
 			if k == "NO_PROXY" && len(v) > 120 {
@@ -392,6 +417,14 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 	fmt.Println("  ══════════════════════════════════════════")
 	fmt.Println("  ✓ 安装完成!")
 	fmt.Println()
+	// 确保 %APPDATA% 中的 config.json 与当前配置完全同步（配置单一化）
+	roamingConfig := filepath.Join(appDataDir(), "config.json")
+	if err := SaveConfig(cfg, roamingConfig); err != nil {
+		log.Printf("    ⚠ 同步配置到 %s 失败: %v", roamingConfig, err)
+	} else {
+		fmt.Printf("    ✓ 配置已同步到: %s\n", roamingConfig)
+	}
+	fmt.Println()
 	fmt.Println("  注意: 需重新打开终端窗口，环境变量才生效。")
 	fmt.Printf("  运行 %s 即可启动监控。\n", selfBinaryName())
 	fmt.Println("  Token 记录发往 config.json 中的 server_url（默认 otw.tech:59889）。")
@@ -402,29 +435,33 @@ func doInstall(certMgr *CertManager, cfg *Config, proxyAddr, bypass, noProxy str
 func doUninstall(certMgr *CertManager) {
 	state := loadInstallState()
 
-	fmt.Println("  [1/4] 移除 CA 证书...")
+	fmt.Println("  [1/6] 停止后台实例...")
+	stopExistingInstanceForUninstall()
+	fmt.Println("    ✓ done")
+
+	fmt.Println("  [2/6] 移除 CA 证书...")
 	certMgr.UninstallCA()
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [2/4] 清除系统代理...")
-	restoreWinInetProxyFromState(state)
+	fmt.Println("  [3/6] 恢复系统代理...")
+	restoreProxyFromState(state)
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [3/4] 恢复环境变量...")
+	fmt.Println("  [4/6] 恢复环境变量...")
 	restoreOrClearEnvVars(state)
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [4/4] 清除 IDE 代理配置...")
+	fmt.Println("  [5/6] 清除 IDE 代理配置...")
 	removeIDEProxy()
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [5/5] 移除 PowerShell Profile 代理包装...")
+	fmt.Println("  [6/6] 移除 PowerShell Profile 代理包装并清理安装配置...")
 	RemovePowerShellProfile()
-	fmt.Println("    ✓ done")
-
-	// Clean up state files
-	clearInstallState()
-	removeInstanceInfo()
+	if err := cleanupInstallDataDir(); err != nil {
+		log.Printf("    ⚠ 清理安装目录失败: %v", err)
+	} else {
+		fmt.Printf("    ✓ 已删除安装配置目录: %s\n", appDataDir())
+	}
 
 	fmt.Println()
 	fmt.Println("  ✓ 卸载完成! 重新打开终端窗口和 IDE 使更改生效。")
@@ -494,18 +531,22 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 	fmt.Println("  [2/4] 设置用户级环境变量...")
 	noProxy := buildNoProxyEnvWithConfig(cfg)
 	envVars := map[string]string{
-		"HTTP_PROXY":          httpProxy,
-		"HTTPS_PROXY":         httpProxy,
-		"NO_PROXY":            noProxy,
-		"OPENAI_BASE_URL":     httpProxy + "/openai/v1",
-		"OPENAI_API_BASE":     httpProxy + "/openai/v1",
-		"ANTHROPIC_BASE_URL":  httpProxy + "/anthropic",
-		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
+		"HTTP_PROXY":           httpProxy,
+		"HTTPS_PROXY":          httpProxy,
+		"NO_PROXY":             noProxy,
+		"http_proxy":           httpProxy,
+		"https_proxy":          httpProxy,
+		"no_proxy":             noProxy,
+		"OPENAI_BASE_URL":      httpProxy + "/openai/v1",
+		"OPENAI_API_BASE":      httpProxy + "/openai/v1",
+		"ANTHROPIC_BASE_URL":   httpProxy + "/anthropic",
+		"NODE_EXTRA_CA_CERTS":  resolveNodeExtraCACerts(certMgr.CACertPath(), previousEnvVars),
+		"CODEX_CA_CERTIFICATE": certMgr.CACertPath(),
 	}
 	if err := SetEnvProxy(envVars); err != nil {
 		log.Printf("    ✗ 环境变量设置失败: %v", err)
 	} else {
-		fmt.Println("    ✓ 已设置 HTTP_PROXY / HTTPS_PROXY / ANTHROPIC_BASE_URL / OPENAI_BASE_URL / NODE_EXTRA_CA_CERTS")
+		fmt.Println("    ✓ 已设置 HTTP_PROXY / HTTPS_PROXY / ANTHROPIC_BASE_URL / OPENAI_BASE_URL / NODE_EXTRA_CA_CERTS / CODEX_CA_CERTIFICATE")
 		fmt.Println("      → VS Code/Cursor/JetBrains/Claude Code/Aider/Codex 等 CLI 工具自动走监控")
 	}
 
@@ -554,7 +595,7 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 
 	// Step 5: Inject PowerShell Profile wrapper for claude / codex CLI tools
 	fmt.Println("  [5/5] 写入 PowerShell Profile（claude / codex 命令自动带代理）...")
-	if err := InstallPowerShellProfile(httpProxy, certMgr.CACertPath()); err != nil {
+	if err := InstallPowerShellProfile(httpProxy, certMgr.CACertPath(), noProxy); err != nil {
 		log.Printf("    ✗ PowerShell Profile 写入失败: %v", err)
 	} else {
 		fmt.Println("    ✓ 已写入: 重新打开 PowerShell 后 claude / codex 直接使用即可")
@@ -575,9 +616,23 @@ func doGlobalInstall(certMgr *CertManager, cfg *Config, configPath string) {
 		fmt.Println("  ✓ ai-monitor 已在运行中")
 	}
 
+	// PAC 已带 DIRECT 回退，不再注册每分钟运行的外部 watchdog；
+	// 同时清理旧版本遗留任务，避免控制台窗口定时闪现。
+	if err := uninstallWatchdogTask(); err != nil {
+		log.Printf("    ⚠ 清理旧 watchdog 计划任务失败: %v", err)
+	}
+
 	fmt.Println()
 	fmt.Println("  ══════════════════════════════════════════")
 	fmt.Println("  ✓ 全局安装完成!")
+	fmt.Println()
+	// 确保 %APPDATA% 中的 config.json 与当前配置完全同步（配置单一化）
+	roamingConfig := filepath.Join(appDataDir(), "config.json")
+	if err := SaveConfig(cfg, roamingConfig); err != nil {
+		log.Printf("    ⚠ 同步配置到 %s 失败: %v", roamingConfig, err)
+	} else {
+		fmt.Printf("    ✓ 配置已同步到: %s\n", roamingConfig)
+	}
 	fmt.Println()
 	fmt.Println("  覆盖范围:")
 	fmt.Println("    ✓ VS Code / Cursor / Windsurf / Kiro / Trae  (环境变量)")
@@ -603,19 +658,23 @@ func doGlobalUninstall(certMgr *CertManager) {
 
 	state := loadInstallState()
 
-	fmt.Println("  [1/4] 移除 CA 证书...")
+	fmt.Println("  [1/7] 停止后台实例...")
+	stopExistingInstanceForUninstall()
+	fmt.Println("    ✓ done")
+
+	fmt.Println("  [2/7] 移除 CA 证书...")
 	certMgr.UninstallCA()
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [2/4] 恢复用户级环境变量...")
+	fmt.Println("  [3/7] 恢复用户级环境变量...")
 	restoreOrClearEnvVars(state)
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [3/4] 恢复系统代理...")
+	fmt.Println("  [4/7] 恢复系统代理...")
 	restoreProxyFromState(state)
 	fmt.Println("    ✓ done")
 
-	fmt.Println("  [4/4] 移除计划任务（开机自启 + 旧看门狗清理）...")
+	fmt.Println("  [5/7] 移除计划任务（开机自启 + 旧看门狗清理）...")
 	if err := uninstallAutoStart(); err != nil {
 		log.Printf("    ⚠ 开机自启: %v", err)
 	} else {
@@ -628,12 +687,17 @@ func doGlobalUninstall(certMgr *CertManager) {
 		fmt.Println("    ✓ 已移除看门狗（如有）")
 	}
 
-	fmt.Println("  [5/5] 移除 PowerShell Profile 代理包装...")
-	RemovePowerShellProfile()
+	fmt.Println("  [6/7] 清除 IDE 代理配置...")
+	removeIDEProxy()
 	fmt.Println("    ✓ done")
 
-	clearInstallState()
-	removeInstanceInfo()
+	fmt.Println("  [7/7] 移除 PowerShell Profile 代理包装并清理安装配置...")
+	RemovePowerShellProfile()
+	if err := cleanupInstallDataDir(); err != nil {
+		log.Printf("    ⚠ 清理安装目录失败: %v", err)
+	} else {
+		fmt.Printf("    ✓ 已删除安装配置目录: %s\n", appDataDir())
+	}
 
 	fmt.Println()
 	fmt.Println("  ✓ 全局卸载完成! 重新打开终端窗口和 IDE 使更改生效。")
@@ -642,7 +706,7 @@ func doGlobalUninstall(certMgr *CertManager) {
 // restoreOrClearEnvVars restores previously saved environment variables, or
 // clears ai-monitor's env vars if no previous state was saved.
 func restoreOrClearEnvVars(state *InstallState) {
-	keysToManage := []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS"}
+	keysToManage := append([]string(nil), proxyEnvKeys...)
 
 	if state != nil && len(state.PreviousEnvVars) > 0 {
 		// Restore previous values for keys that had values before install
@@ -717,10 +781,14 @@ func applySessionManagedProxy(cfg *Config, certMgr *CertManager, listenPort int)
 	var prevEnv map[string]string
 	prevEnv = st.PreviousEnvVars
 	envVars := map[string]string{
-		"HTTP_PROXY":          httpProxy,
-		"HTTPS_PROXY":         httpProxy,
-		"NO_PROXY":            noProxy,
-		"NODE_EXTRA_CA_CERTS": resolveNodeExtraCACerts(certMgr.CACertPath(), prevEnv),
+		"HTTP_PROXY":           httpProxy,
+		"HTTPS_PROXY":          httpProxy,
+		"NO_PROXY":             noProxy,
+		"http_proxy":           httpProxy,
+		"https_proxy":          httpProxy,
+		"no_proxy":             noProxy,
+		"NODE_EXTRA_CA_CERTS":  resolveNodeExtraCACerts(certMgr.CACertPath(), prevEnv),
+		"CODEX_CA_CERTIFICATE": certMgr.CACertPath(),
 	}
 
 	if st.PACFileSet {

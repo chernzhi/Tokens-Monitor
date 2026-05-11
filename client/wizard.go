@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
@@ -107,11 +106,7 @@ func runSetupWizard(configPath string, certMgr *CertManager) error {
 	f := false
 	cfg.InstallIDEProxy = &f
 
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
+	if err := SaveConfig(cfg, configPath); err != nil {
 		return fmt.Errorf("保存配置失败: %v", err)
 	}
 	fmt.Printf("\n  ✓ 已保存 %s\n\n", configPath)

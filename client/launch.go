@@ -93,8 +93,9 @@ var managedLaunchPresets = []launchPreset{
 	{
 		Name:        "codex",
 		Description: "启动 Codex CLI（仅当前进程走本地 MITM）",
-		Candidates:  []string{"codex.exe", "codex"},
+		Candidates:  []string{"codex.cmd", "codex.exe", "codex"},
 		KnownPaths: []string{
+			"%APPDATA%\\npm\\codex.cmd",
 			"/usr/local/bin/codex",
 			"/opt/homebrew/bin/codex",
 		},
@@ -353,10 +354,14 @@ func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetN
 	}()
 
 	httpProxy := "http://" + runtime.proxyAddr
+	noProxy := buildNoProxyEnvWithConfig(cfg)
 	envVars := map[string]string{
 		"HTTP_PROXY":             httpProxy,
 		"HTTPS_PROXY":            httpProxy,
-		"NO_PROXY":               buildNoProxyEnvWithConfig(cfg),
+		"NO_PROXY":               noProxy,
+		"http_proxy":             httpProxy,
+		"https_proxy":            httpProxy,
+		"no_proxy":               noProxy,
 		"OPENAI_BASE_URL":        httpProxy + "/openai/v1",
 		"OPENAI_API_BASE":        httpProxy + "/openai/v1",
 		"ANTHROPIC_BASE_URL":     httpProxy + "/anthropic",
@@ -398,10 +403,14 @@ func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetN
 func launchChildWithExistingProxy(cfg *Config, certMgr *CertManager, commandArgs []string, preset *launchPreset, port int) error {
 	sourceApp := inferSourceApp(commandArgs, preset)
 	httpProxy := fmt.Sprintf("http://127.0.0.1:%d", port)
+	noProxy := buildNoProxyEnvWithConfig(cfg)
 	envVars := map[string]string{
 		"HTTP_PROXY":             httpProxy,
 		"HTTPS_PROXY":            httpProxy,
-		"NO_PROXY":               buildNoProxyEnvWithConfig(cfg),
+		"NO_PROXY":               noProxy,
+		"http_proxy":             httpProxy,
+		"https_proxy":            httpProxy,
+		"no_proxy":               noProxy,
 		"OPENAI_BASE_URL":        httpProxy + "/openai/v1",
 		"OPENAI_API_BASE":        httpProxy + "/openai/v1",
 		"ANTHROPIC_BASE_URL":     httpProxy + "/anthropic",

@@ -32,6 +32,16 @@ func setupFileLogging(dataDir string) {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
+func closeFileLogging() {
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
+	if logFile != nil {
+		_ = logFile.Close()
+		logFile = nil
+	}
+	log.SetOutput(os.Stderr)
+}
+
 func openLogFile(dataDir string) *os.File {
 	path := filepath.Join(dataDir, "ai-monitor.log")
 	rotateIfTooLarge(path)

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"net"
 	"net/url"
@@ -70,12 +69,12 @@ func detectUpstreamProxy(cfg *Config) string {
 // BEFORE installation overwrites them. Used for restoration on uninstall.
 func snapshotProxyEnvVars() map[string]string {
 	snapshot := make(map[string]string)
-	for _, key := range []string{
-		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+	keys := append([]string(nil), proxyEnvKeys...)
+	keys = append(keys,
 		"http_proxy", "https_proxy", "no_proxy",
 		"ALL_PROXY", "all_proxy",
-		"NODE_EXTRA_CA_CERTS",
-	} {
+	)
+	for _, key := range keys {
 		if v := os.Getenv(key); v != "" && !isSelfProxy(v) {
 			snapshot[key] = v
 		}
@@ -84,22 +83,13 @@ func snapshotProxyEnvVars() map[string]string {
 }
 
 // patchConfigUpstreamProxy reads config.json, sets upstream_proxy, and writes it back.
-// Preserves all other fields and formatting.
 func patchConfigUpstreamProxy(configPath, upstream string) error {
-	data, err := os.ReadFile(configPath)
+	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		return err
 	}
-	var raw map[string]interface{}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	raw["upstream_proxy"] = upstream
-	out, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(configPath, out, 0600)
+	cfg.UpstreamProxy = upstream
+	return SaveConfig(cfg, configPath)
 }
 
 // isSelfProxy returns true if the proxy URL points to ai-monitor's own listening range.

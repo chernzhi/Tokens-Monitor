@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 )
 
@@ -16,8 +17,9 @@ const DefaultServerURL = "https://otw.tech:59889"
 
 // MonitoredSuffix 按主机名后缀匹配并打上供应商标签（用于公司自建网关、新厂商域名等）。
 type MonitoredSuffix struct {
-	Suffix string `json:"suffix"` // 例如 ".internal-ai.company.com"
-	Vendor string `json:"vendor"` // 大屏上显示的供应商名，如 "internal-llm"
+	Suffix string `json:"suffix"`           // 例如 ".internal-ai.company.com"
+	Prefix string `json:"prefix,omitempty"` // 可选：主机名前缀，例如 "bedrock-runtime."
+	Vendor string `json:"vendor"`           // 大屏上显示的供应商名，如 "internal-llm"
 }
 
 type Config struct {
@@ -29,9 +31,17 @@ type Config struct {
 	// UpstreamProxy 为本地 MITM 外联时使用的上游代理（可选），用于保留用户原本的公司代理或本地代理链路。
 	// 支持 http://、https://、socks5://。
 	UpstreamProxy string `json:"upstream_proxy,omitempty"`
+	// MonitorHosts 是完整的精确监控域名表。字段不存在时使用内置默认表；字段存在时以配置为准，方便删除/改 vendor。
+	MonitorHosts map[string]string `json:"monitor_hosts,omitempty"`
+	// MonitorSuffixes 是完整的后缀/前缀+后缀监控规则。字段不存在时使用内置默认规则；字段存在时以配置为准。
+	MonitorSuffixes []MonitoredSuffix `json:"monitor_suffixes,omitempty"`
+	// BypassDomains 是完整的直连域名/通配列表。字段不存在时使用内置默认直连列表；字段存在时以配置为准，但本机回环保护会始终保留。
+	BypassDomains []string `json:"bypass_domains,omitempty"`
 	// ExtraMonitorHosts 精确主机名 → 供应商（与内置 aiDomains 合并，适合内网网关、新 API 域名）。
+	// Deprecated: 新配置请直接修改 monitor_hosts。
 	ExtraMonitorHosts map[string]string `json:"extra_monitor_hosts,omitempty"`
 	// ExtraMonitorSuffixes 后缀匹配，在通配规则之后评估。
+	// Deprecated: 新配置请直接修改 monitor_suffixes。
 	ExtraMonitorSuffixes []MonitoredSuffix `json:"extra_monitor_suffixes,omitempty"`
 	// InstallSystemProxy 为 true 时，--install 写入 WinINet 与 setx。
 	// 省略该字段时默认 false：优先采用非侵入式模式，不修改本机系统代理与持久环境变量。
@@ -55,6 +65,7 @@ type Config struct {
 	AuthToken string `json:"auth_token,omitempty"`
 	// ExtraBypassDomains 企业管理员可添加的额外直连域名/通配，与内置 bypassDomains 合并。
 	// 适合公司内网域名（如 "*.corp.company.com"）、VPN 地址等。
+	// Deprecated: 新配置请直接修改 bypass_domains。
 	ExtraBypassDomains []string `json:"extra_bypass_domains,omitempty"`
 	// ReportProxy 上报服务器流量使用的代理。"auto" 或空值 = 智能判断（内网直连，外网走上游代理）；
 	// "direct" = 强制直连；"upstream" = 强制走 upstream_proxy；也可填具体代理地址。
@@ -149,7 +160,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(stripJSONLineComments(data), &cfg); err != nil {
 		return nil, fmt.Errorf("配置文件格式错误: %v", err)
 	}
 
@@ -223,4 +234,205 @@ func getOSUserName() string {
 		name = name[:i]
 	}
 	return name
+}
+
+func stripJSONLineComments(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	var b strings.Builder
+	b.Grow(len(data))
+	inString := false
+	escaped := false
+	for i := 0; i < len(data); i++ {
+		ch := data[i]
+		if inString {
+			b.WriteByte(ch)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == '/' && i+1 < len(data) && data[i+1] == '/' {
+			for i < len(data) && data[i] != '\n' {
+				i++
+			}
+			if i < len(data) {
+				b.WriteByte(data[i])
+			}
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return []byte(b.String())
+}
+
+// SaveConfig 将完整 Config 写回 JSONC 风格的配置文件，并在每个配置项前写入 // 注释。
+func SaveConfig(cfg *Config, path string) error {
+	data, err := marshalAnnotatedConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+type configJSONEntry struct {
+	key     string
+	value   interface{}
+	comment string
+}
+
+func marshalAnnotatedConfig(cfg *Config) ([]byte, error) {
+	entries := annotatedConfigEntries(cfg)
+	var b strings.Builder
+	b.WriteString("{\n")
+	for _, comment := range []string{
+		"这是 ai-monitor 唯一需要用户理解和修改的配置文件。",
+		"配置文件使用 JSONC 风格：// 开头的是说明注释，ai-monitor 和 VS Code 扩展都会自动忽略。",
+		"默认位于 %APPDATA%/ai-monitor/config.json；修改端口、代理、安装模式后请重新运行安装或重启 ai-monitor。",
+	} {
+		b.WriteString("  // ")
+		b.WriteString(comment)
+		b.WriteString("\n")
+	}
+	for i, entry := range entries {
+		if entry.comment != "" {
+			b.WriteString("  // ")
+			b.WriteString(entry.comment)
+			b.WriteString("\n")
+		}
+		raw, err := json.MarshalIndent(entry.value, "  ", "  ")
+		if err != nil {
+			return nil, err
+		}
+		b.WriteString("  ")
+		key, _ := json.Marshal(entry.key)
+		b.Write(key)
+		b.WriteString(": ")
+		b.Write(raw)
+		if i < len(entries)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("}\n")
+	return []byte(b.String()), nil
+}
+
+func annotatedConfigEntries(cfg *Config) []configJSONEntry {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	serverURL := strings.TrimSpace(strings.TrimRight(cfg.ServerURL, "/"))
+	if serverURL == "" {
+		serverURL = DefaultServerURL
+	}
+	port := cfg.Port
+	if port <= 0 {
+		port = 18090
+	}
+	userName := strings.TrimSpace(cfg.UserName)
+	if userName == "" {
+		userName = getOSUserName()
+	}
+	userID := strings.TrimSpace(cfg.UserID)
+	if userID == "" {
+		userID = generateUserID()
+	}
+	return []configJSONEntry{
+		{"server_url", serverURL, "server_url: Token 上报服务地址，客户端会向这里发送心跳和用量记录。"},
+		{"user_name", userName, "user_name: 员工姓名，用于后台和大屏展示。"},
+		{"user_id", userID, "user_id: 员工唯一标识，建议填写登录邮箱或工号；为空时会按本机账号生成匿名 ID。"},
+		{"department", cfg.Department, "department: 部门名称，用于统计分组；可留空。"},
+		{"port", port, "port: 本机 MITM HTTP 代理监听端口，默认 18090；端口被占用时程序可能自动顺延。"},
+		{"gateway_port", cfg.GatewayPort, "gateway_port: 可选 API Gateway 端口。大于 0 时该端口只提供 /v1/* 与 /vendor/* 反向代理，不做 HTTPS MITM。"},
+		{"upstream_proxy", strings.TrimSpace(cfg.UpstreamProxy), "upstream_proxy: ai-monitor 访问外网 AI 服务时使用的上游代理。支持 http://、https://、socks5://；没有本地代理可留空。"},
+		{"report_proxy", strings.TrimSpace(cfg.ReportProxy), "report_proxy: 上报到 server_url 时使用的代理策略：auto 或空=自动判断，direct=直连，upstream=走 upstream_proxy，也可填写具体代理 URL。"},
+		{"install_system_proxy", boolConfigValue(cfg.InstallSystemProxy, false), "install_system_proxy: 为 true 时安装会写入 Windows 系统 PAC/代理，让浏览器、Visual Studio 等自动经过监控；默认 false 更保守。"},
+		{"install_ide_proxy", boolConfigValue(cfg.InstallIDEProxy, false), "install_ide_proxy: 为 true 时安装会写入 VS Code/Cursor 等 IDE 的 http.proxy 设置；通常保持 false，避免与系统代理重复。"},
+		{"report_opaque_traffic", boolConfigValue(cfg.ReportOpaqueTraffic, true), "report_opaque_traffic: 为 true 时，对 gRPC/Protobuf 等无法解析 usage 的响应按可见内容估算 token 并上报；非官方计费口径。"},
+		{"mitm_cursor", boolConfigValue(cfg.MitmCursor, true), "mitm_cursor: 为 true 时尝试解密 Cursor 流量；如 Cursor 因证书钉扎断连，可改为 false 透传。"},
+		{"chain_existing_pac", boolConfigValue(cfg.ChainExistingPAC, true), "chain_existing_pac: 为 true 时保留并串联用户原有企业 PAC；建议保持 true，避免丢失公司内网代理策略。"},
+		{"strict_policy_check", boolConfigValue(cfg.StrictPolicyCheck, true), "strict_policy_check: 为 true 时检测到公司策略级代理会拒绝全局安装，避免覆盖管理员策略；建议保持 true。"},
+		{"monitor_hosts", effectiveMonitorHosts(cfg), "monitor_hosts: 完整精确监控域名表。键是主机名，值是供应商标签；可直接增删改，删除后该精确域名不再 MITM。"},
+		{"monitor_suffixes", effectiveMonitorSuffixes(cfg), "monitor_suffixes: 完整后缀/前缀监控规则。suffix 必填，prefix 可选；用于 Azure/OpenAI、Bedrock、Cursor、Copilot 等通配域名。"},
+		{"bypass_domains", effectiveBypassDomains(cfg), "bypass_domains: 完整直连域名/通配列表，不经过 ai-monitor；本机回环 localhost/127.* 和链路本地 169.254.169.254 会强制保留，适合 GitHub、VS Code 更新、公司内网、VPN、文件服务器等。"},
+		{"api_key", strings.TrimSpace(cfg.APIKey), "api_key: 服务端如果配置了 COLLECT_API_KEY，可在这里填写；多数登录态场景留空即可。"},
+		{"auth_token", strings.TrimSpace(cfg.AuthToken), "auth_token: 用户登录/注册后得到的个人令牌，上报优先使用它。属于敏感信息，不要公开分享。"},
+		{"watchdog_interval_sec", cfg.EffectiveWatchdogInterval(), "watchdog_interval_sec: ai-monitor 进程内自检间隔秒数；默认 10。不是 Windows 计划任务，不会弹黑框。"},
+		{"watchdog_failures", cfg.EffectiveWatchdogFailures(), "watchdog_failures: 连续自检失败多少次后触发网络恢复；默认 2。"},
+	}
+}
+
+func boolConfigValue(v *bool, defaultValue bool) bool {
+	if v == nil {
+		return defaultValue
+	}
+	return *v
+}
+
+func stringMapConfigValue(v map[string]string) map[string]string {
+	if v == nil {
+		return map[string]string{}
+	}
+	return v
+}
+
+func suffixListConfigValue(v []MonitoredSuffix) []MonitoredSuffix {
+	if v == nil {
+		return []MonitoredSuffix{}
+	}
+	return v
+}
+
+func stringSliceConfigValue(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
+}
+
+// ValidateAndHealConfig 检测关键配置字段是否缺失，并尝试从 install_state 恢复。
+// 返回值是需要提示用户的警告信息列表。不会修改用户已手动配置的值。
+func ValidateAndHealConfig(cfg *Config, configPath string) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+
+	// upstream_proxy 是国际 AI API 出口的关键字段，缺失会直接导致 Copilot/OpenAI 等不可用
+	if strings.TrimSpace(cfg.UpstreamProxy) == "" {
+		if st := loadInstallState(); st != nil && st.PreviousUpstreamProxy != "" {
+			cfg.UpstreamProxy = st.PreviousUpstreamProxy
+			if err := SaveConfig(cfg, configPath); err != nil {
+				warnings = append(warnings,
+					fmt.Sprintf("upstream_proxy 已从安装记录恢复到内存，但写入配置文件失败: %v", err))
+			} else {
+				warnings = append(warnings,
+					fmt.Sprintf("upstream_proxy 已从安装记录恢复 (%s)，并同步到配置文件", st.PreviousUpstreamProxy))
+			}
+		} else {
+			warnings = append(warnings,
+				"⚠ upstream_proxy 未设置：国际 AI API（Copilot / OpenAI / Anthropic 等）可能无法访问。"+
+					"请执行 ai-monitor.exe --setup 或在 config.json 中配置 upstream_proxy 字段。")
+		}
+	}
+
+	return warnings
 }

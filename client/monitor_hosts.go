@@ -9,50 +9,36 @@ import (
 // should route through the local MITM proxy. Everything else goes DIRECT or
 // through the user's original proxy chain — never through our MITM.
 //
-// The list is derived from aiDomains (exact) + aiWildcardDomains (suffix/prefix)
-// + config ExtraMonitorHosts/ExtraMonitorSuffixes so that the PAC stays in sync
-// with the MITM CONNECT handler in proxy.go.
+// The list is derived from the effective monitor_hosts + monitor_suffixes config
+// so that the PAC stays in sync with the MITM CONNECT handler in proxy.go.
 func monitorHostsForPAC(cfg *Config) []monitorHostEntry {
-	entries := make([]monitorHostEntry, 0, len(aiDomains)+len(aiWildcardDomains)+16)
+	hosts := effectiveMonitorHosts(cfg)
+	suffixes := effectiveMonitorSuffixes(cfg)
+	entries := make([]monitorHostEntry, 0, len(hosts)+len(suffixes))
 
-	// Exact hostnames from built-in table (sorted for deterministic PAC output)
-	builtinHosts := make([]string, 0, len(aiDomains))
-	for host := range aiDomains {
-		builtinHosts = append(builtinHosts, host)
+	// Exact hostnames from config/effective table (sorted for deterministic PAC output)
+	exactHosts := make([]string, 0, len(hosts))
+	for host := range hosts {
+		host = strings.TrimSpace(host)
+		if host != "" {
+			exactHosts = append(exactHosts, host)
+		}
 	}
-	sort.Strings(builtinHosts)
-	for _, host := range builtinHosts {
+	sort.Strings(exactHosts)
+	for _, host := range exactHosts {
 		entries = append(entries, monitorHostEntry{Kind: mhExact, Pattern: host})
 	}
 
-	// Suffix/prefix patterns from built-in wildcards
-	for _, w := range aiWildcardDomains {
-		if w.prefix == "" {
-			entries = append(entries, monitorHostEntry{Kind: mhSuffix, Pattern: w.suffix})
+	for _, w := range suffixes {
+		suffix := strings.TrimSpace(w.Suffix)
+		prefix := strings.TrimSpace(w.Prefix)
+		if suffix == "" {
+			continue
+		}
+		if prefix == "" {
+			entries = append(entries, monitorHostEntry{Kind: mhSuffix, Pattern: suffix})
 		} else {
-			entries = append(entries, monitorHostEntry{Kind: mhPrefixSuffix, Prefix: w.prefix, Pattern: w.suffix})
-		}
-	}
-
-	// Config-supplied exact hosts (sorted for deterministic PAC output)
-	if cfg != nil {
-		extraHosts := make([]string, 0, len(cfg.ExtraMonitorHosts))
-		for host := range cfg.ExtraMonitorHosts {
-			host = strings.TrimSpace(host)
-			if host != "" {
-				extraHosts = append(extraHosts, host)
-			}
-		}
-		sort.Strings(extraHosts)
-		for _, host := range extraHosts {
-			entries = append(entries, monitorHostEntry{Kind: mhExact, Pattern: host})
-		}
-		// Config-supplied suffix patterns
-		for _, s := range cfg.ExtraMonitorSuffixes {
-			suf := strings.TrimSpace(s.Suffix)
-			if suf != "" {
-				entries = append(entries, monitorHostEntry{Kind: mhSuffix, Pattern: suf})
-			}
+			entries = append(entries, monitorHostEntry{Kind: mhPrefixSuffix, Prefix: prefix, Pattern: suffix})
 		}
 	}
 
