@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -227,10 +226,10 @@ func (cm *CertManager) InstallCA() error {
 	case "windows":
 		// Use PowerShell Import-Certificate to avoid Windows security dialog popup
 		psCmd := fmt.Sprintf(`Import-Certificate -FilePath "%s" -CertStoreLocation Cert:\CurrentUser\Root`, cm.CACertPath())
-		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).CombinedOutput()
+		out, err := newHiddenCmd("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).CombinedOutput()
 		if err != nil {
 			// Fallback to certutil if PowerShell fails
-			out2, err2 := exec.Command("certutil", "-addstore", "-user", "-f", "Root", cm.CACertPath()).CombinedOutput()
+			out2, err2 := newHiddenCmd("certutil", "-addstore", "-user", "-f", "Root", cm.CACertPath()).CombinedOutput()
 			if err2 != nil {
 				return fmt.Errorf("powershell: %s; certutil: %s: %w", string(out), string(out2), err2)
 			}
@@ -240,7 +239,7 @@ func (cm *CertManager) InstallCA() error {
 	case "darwin":
 		// Without -d flag: modifies user-level Trust Settings,
 		// which triggers a GUI authentication dialog automatically.
-		out, err := exec.Command("security", "add-trusted-cert",
+		out, err := newHiddenCmd("security", "add-trusted-cert",
 			"-r", "trustRoot",
 			cm.CACertPath()).CombinedOutput()
 		if err != nil {
@@ -260,7 +259,7 @@ func (cm *CertManager) UninstallCA() {
 
 	// Try PowerShell first
 	psCmd := `Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Subject -like "*AI Monitor Local CA*" } | Remove-Item -Force`
-	exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Run()
+	newHiddenCmd("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Run()
 	// Also try certutil as fallback
-	exec.Command("certutil", "-delstore", "-user", "Root", "AI Monitor Local CA").Run()
+	newHiddenCmd("certutil", "-delstore", "-user", "Root", "AI Monitor Local CA").Run()
 }

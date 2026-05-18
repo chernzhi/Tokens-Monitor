@@ -82,6 +82,12 @@ func main() {
 		os.Exit(0)
 	}
 
+	// 安装 stdout/stderr 管道：所有日志、banner、log.Printf 都同时进
+	// (a) 原 console（dev/带控制台构建）和 (b) 内存环形缓冲，供 WebView2
+	// 内嵌窗口里的「运行日志」面板通过 /wizard/logs/stream 实时拉取。
+	// 必须在第一行 fmt.Println / log.Printf 之前调用。
+	initLogCapture(2000)
+
 	fmt.Println()
 	fmt.Println("  ╔══════════════════════════════════════════╗")
 	fmt.Printf("  ║   AI Token 监控客户端 %-20s║\n", "v"+Version)
@@ -140,13 +146,14 @@ func main() {
 
 	// When no config exists and no explicit flags are given, launch the web wizard automatically.
 	// This handles the "double-click ai-monitor.exe" scenario for first-time users.
+	// 安装完成后不退出：直接 fall-through 进入正常代理启动流程，避免用户「装完了发现窗口没了」。
 	if defaultRunMode {
 		if _, err := os.Stat(*configPath); os.IsNotExist(err) {
 			fmt.Println("  未找到 config.json，正在打开安装向导...")
 			if err := runWebWizard(*configPath, certMgr); err != nil {
 				log.Fatalf("  安装向导出错: %v", err)
 			}
-			return
+			fmt.Println("  安装完成，正在启动监控服务...")
 		}
 	}
 
@@ -201,7 +208,17 @@ func main() {
 	existingPort, alive := checkExistingInstance()
 	if alive {
 		fmt.Printf("  已有 ai-monitor 实例运行于端口 %d，当前进程退出。\n", existingPort)
-		fmt.Println("  如需重启，请先终止已有进程。")
+		// 第二次双击 exe 时把配置窗口拉起来，对准已运行实例的端口。
+		// 内嵌窗口不可用时会自动回退到系统浏览器。
+		if defaultRunMode {
+			wizardURL := fmt.Sprintf("http://127.0.0.1:%d/wizard", existingPort)
+			done, _ := openWizardOrBrowser(wizardURL, "AI Token 监控")
+			if done != nil {
+				<-done // 等用户关闭窗口再退出，体感上像 "打开了配置面板"
+			}
+		} else {
+			fmt.Println("  如需重启，请先终止已有进程。")
+		}
 		os.Exit(0)
 	}
 	removeInstanceInfo() // clean up any stale PID file
@@ -288,7 +305,7 @@ func main() {
 	fmt.Printf("  配置页面: http://127.0.0.1:%d/wizard\n", runtime.listenPort)
 	fmt.Println()
 	if defaultRunMode {
-		openBrowser(fmt.Sprintf("http://127.0.0.1:%d/wizard", runtime.listenPort))
+		openWizardOrBrowser(fmt.Sprintf("http://127.0.0.1:%d/wizard", runtime.listenPort), "AI Token 监控")
 	}
 	fmt.Println("  等待 AI 请求中... (Ctrl+C 退出)")
 	fmt.Println("  " + strings.Repeat("─", 55))

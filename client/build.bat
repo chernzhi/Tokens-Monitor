@@ -10,7 +10,9 @@ if exist "%~dp0VERSION" (
     set VERSION=dev
 )
 echo  Version: %VERSION%
-set LDFLAGS=-s -w -X main.Version=%VERSION%
+:: -H=windowsgui 隐藏 conhost 控制台窗口：日志通过内嵌 WebView2 里的"运行日志"
+:: 面板显示，整个程序看起来是单一窗口应用。
+set LDFLAGS=-s -w -H=windowsgui -X main.Version=%VERSION%
 
 :: Build for Windows amd64
 set GOOS=windows

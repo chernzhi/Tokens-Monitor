@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -34,7 +33,7 @@ func installAutoStart(configPath string) error {
 	args := fmt.Sprintf(`--config "%s"`, absConfig)
 
 	// Try schtasks first
-	cmd := exec.Command("schtasks", "/Create",
+	cmd := newHiddenCmd("schtasks", "/Create",
 		"/TN", taskName,
 		"/TR", fmt.Sprintf(`"%s" %s`, exePath, args),
 		"/SC", "ONLOGON",
@@ -67,7 +66,7 @@ func installAutoStart(configPath string) error {
 // 该任务是主进程之外的安全网：如果 ai-monitor 被强杀/崩溃后未重启，下一次
 // 登录会主动清理指向 dead 端口的代理设置，避免污染 VS Code/Cursor 等应用。
 func installHealTask(exePath, configPath string) error {
-	cmd := exec.Command("schtasks", "/Create",
+	cmd := newHiddenCmd("schtasks", "/Create",
 		"/TN", healTaskName,
 		"/TR", fmt.Sprintf(`"%s" --heal --config "%s"`, exePath, configPath),
 		"/SC", "ONLOGON",
@@ -84,7 +83,7 @@ func installHealTask(exePath, configPath string) error {
 
 // uninstallHealTask 移除自愈计划任务。任务不存在不报错。
 func uninstallHealTask() error {
-	cmd := exec.Command("schtasks", "/Delete", "/TN", healTaskName, "/F")
+	cmd := newHiddenCmd("schtasks", "/Delete", "/TN", healTaskName, "/F")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.TrimSpace(string(output))
@@ -116,7 +115,7 @@ func createStartupShortcut(exePath, configPath string) error {
 		lnkPath, exePath, configPath, workDir,
 	)
 
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
+	cmd := newHiddenCmd("powershell", "-NoProfile", "-Command", script)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("创建启动快捷方式失败: %w\n%s", err, string(output))
@@ -137,7 +136,7 @@ func removeStartupShortcut() {
 // uninstallWatchdogTask removes the watchdog scheduled task left by pre-PAC installs.
 func uninstallWatchdogTask() error {
 	const watchdogTaskName = "AIMonitorWatchdog"
-	cmd := exec.Command("schtasks", "/Delete", "/TN", watchdogTaskName, "/F")
+	cmd := newHiddenCmd("schtasks", "/Delete", "/TN", watchdogTaskName, "/F")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.TrimSpace(string(output))
@@ -154,7 +153,7 @@ func uninstallWatchdogTask() error {
 // uninstallAutoStart removes both the scheduled task and Startup shortcut.
 func uninstallAutoStart() error {
 	// Remove scheduled task
-	cmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+	cmd := newHiddenCmd("schtasks", "/Delete", "/TN", taskName, "/F")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.TrimSpace(string(output))
@@ -179,7 +178,7 @@ func uninstallAutoStart() error {
 
 // isAutoStartInstalled checks if auto-start is configured (either schtasks or shortcut).
 func isAutoStartInstalled() bool {
-	cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
+	cmd := newHiddenCmd("schtasks", "/Query", "/TN", taskName)
 	if cmd.Run() == nil {
 		return true
 	}
@@ -198,7 +197,7 @@ func startBackgroundInstance(configPath string) error {
 	exePath, _ = filepath.Abs(exePath)
 	absConfig, _ := filepath.Abs(configPath)
 
-	cmd := exec.Command("cmd", "/C", "start", "/b", "",
+	cmd := newHiddenCmd("cmd", "/C", "start", "/b", "",
 		exePath, "--config", absConfig)
 	cmd.Stdout = nil
 	cmd.Stderr = nil

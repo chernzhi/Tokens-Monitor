@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,7 +17,7 @@ import (
 // Returns the proxy address (e.g. "http://proxy.corp:8080") if enabled, or "" otherwise.
 func readCurrentSystemProxy() string {
 	// Check if proxy is enabled (ProxyEnable == 0x1)
-	enableOut, err := exec.Command("reg", "query",
+	enableOut, err := newHiddenCmd("reg", "query",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
 		"/v", "ProxyEnable",
 	).Output()
@@ -32,7 +31,7 @@ func readCurrentSystemProxy() string {
 	}
 
 	// Read ProxyServer value
-	serverOut, err := exec.Command("reg", "query",
+	serverOut, err := newHiddenCmd("reg", "query",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
 		"/v", "ProxyServer",
 	).Output()
@@ -65,7 +64,7 @@ func readCurrentSystemProxy() string {
 
 // readCurrentProxyOverride reads the WinINet ProxyOverride (bypass list) from HKCU.
 func readCurrentProxyOverride() string {
-	out, err := exec.Command("reg", "query",
+	out, err := newHiddenCmd("reg", "query",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
 		"/v", "ProxyOverride",
 	).Output()
@@ -87,7 +86,7 @@ func readCurrentProxyOverride() string {
 // readCurrentAutoDetect reads the WinINet AutoDetect (WPAD) flag from HKCU.
 // Returns (value, present). present=false when the key doesn't exist or can't be read.
 func readCurrentAutoDetect() (uint32, bool) {
-	out, err := exec.Command("reg", "query",
+	out, err := newHiddenCmd("reg", "query",
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
 		"/v", "AutoDetect",
 	).Output()
@@ -112,7 +111,7 @@ func readMachinePolicyProxy() (found bool, detail string) {
 	// Check ProxySettingsPerUser first: if set to 0, WinINet ignores HKCU entirely
 	// and only reads proxy config from HKLM. Our HKCU writes would be silently ignored.
 	perUserPath := `HKLM\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Internet Settings`
-	perUserOut, err := exec.Command("reg", "query", perUserPath, "/v", "ProxySettingsPerUser").Output()
+	perUserOut, err := newHiddenCmd("reg", "query", perUserPath, "/v", "ProxySettingsPerUser").Output()
 	if err == nil && strings.Contains(string(perUserOut), "0x0") {
 		return true, "ProxySettingsPerUser=0 (HKCU 代理设置被策略禁用，仅 HKLM 生效)"
 	}
@@ -121,10 +120,10 @@ func readMachinePolicyProxy() (found bool, detail string) {
 	policyPath := perUserPath
 
 	// Check ProxyEnable
-	enableOut, err := exec.Command("reg", "query", policyPath, "/v", "ProxyEnable").Output()
+	enableOut, err := newHiddenCmd("reg", "query", policyPath, "/v", "ProxyEnable").Output()
 	if err == nil && strings.Contains(string(enableOut), "0x1") {
 		// ProxyServer
-		serverOut, _ := exec.Command("reg", "query", policyPath, "/v", "ProxyServer").Output()
+		serverOut, _ := newHiddenCmd("reg", "query", policyPath, "/v", "ProxyServer").Output()
 		for _, line := range strings.Split(string(serverOut), "\n") {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "ProxyServer") {
@@ -138,7 +137,7 @@ func readMachinePolicyProxy() (found bool, detail string) {
 	}
 
 	// Check AutoConfigURL in policy
-	pacOut, err := exec.Command("reg", "query", policyPath, "/v", "AutoConfigURL").Output()
+	pacOut, err := newHiddenCmd("reg", "query", policyPath, "/v", "AutoConfigURL").Output()
 	if err == nil {
 		for _, line := range strings.Split(string(pacOut), "\n") {
 			line = strings.TrimSpace(line)

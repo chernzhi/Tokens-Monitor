@@ -13,7 +13,7 @@
         },
         "description": "AI Token Monitor",
         "minimum-os": "win7",
-        "execution-level": "as invoker",
+        "execution-level": "require administrator",
         "ui-access": false,
         "auto-elevate": false,
         "dpi-awareness": "system",

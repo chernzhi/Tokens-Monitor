@@ -34,7 +34,7 @@ set "VERSION=dev"
 if exist "%~dp0VERSION" (
     set /p VERSION=<"%~dp0VERSION"
 )
-set "LDFLAGS=-s -w -X main.Version=%VERSION%"
+set "LDFLAGS=-s -w -H=windowsgui -X main.Version=%VERSION%"
 
 go build -ldflags="%LDFLAGS%" -o "%OUT%\ai-monitor.exe" .
 if errorlevel 1 (

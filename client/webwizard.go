@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,11 +27,18 @@ const webWizardHTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Token 监控 - 安装向导</title>
+<title>AI Token 监控</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-  .card { background: #1e293b; border-radius: 16px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); padding: 40px; width: 860px; max-width: 96vw; }
+  /* ── 自定义滚动条：与暗色玻璃 UI 一致的细圆角槽 ───────────────────── */
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track { background: rgba(15,23,42,0.4); border-radius: 8px; }
+  *::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #475569 0%, #334155 100%); border-radius: 8px; border: 2px solid rgba(30,41,59,0); background-clip: padding-box; }
+  *::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, #64748b 0%, #475569 100%); background-clip: padding-box; border: 2px solid rgba(30,41,59,0); }
+  *::-webkit-scrollbar-corner { background: transparent; }
+  * { scrollbar-width: thin; scrollbar-color: #475569 rgba(15,23,42,0.4); }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 16px; display: flex; align-items: stretch; justify-content: center; gap: 16px; }
+  .card { background: #1e293b; border-radius: 16px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); padding: 40px; width: 860px; max-width: 96vw; flex: 0 0 auto; overflow-y: auto; max-height: calc(100vh - 32px); }
   h1 { font-size: 24px; text-align: center; margin-bottom: 8px; color: #38bdf8; }
   .subtitle { text-align: center; color: #94a3b8; margin-bottom: 28px; font-size: 14px; }
   .field { margin-bottom: 18px; }
@@ -46,10 +55,12 @@ const webWizardHTML = `<!DOCTYPE html>
   .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
   .btn-secondary { background: transparent; border: 1px solid #475569; color: #94a3b8; margin-top: 8px; }
   .btn-secondary:hover { border-color: #38bdf8; color: #e2e8f0; }
-  #status { margin-top: 20px; padding: 12px; border-radius: 8px; font-size: 13px; display: none; line-height: 1.6; }
-  #status.success { display: block; background: #064e3b; color: #6ee7b7; border: 1px solid #065f46; }
-  #status.error { display: block; background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
-  #status.info { display: block; background: #1e3a5f; color: #93c5fd; border: 1px solid #1e40af; }
+  /* ── Toast 通知：右上角悬浮，自动隐藏，不再被底部内容遮挡 ────────── */
+  #status { position: fixed; top: 18px; right: 18px; z-index: 9999; max-width: 460px; min-width: 240px; padding: 12px 16px; border-radius: 10px; font-size: 13px; display: none; line-height: 1.6; box-shadow: 0 12px 32px rgba(0,0,0,0.55); backdrop-filter: blur(6px); opacity: 0; transform: translateY(-8px); transition: opacity 0.22s, transform 0.22s; pointer-events: auto; }
+  #status.show { opacity: 1; transform: translateY(0); }
+  #status.success { display: block; background: rgba(6,78,59,0.95); color: #6ee7b7; border: 1px solid #10b981; }
+  #status.error { display: block; background: rgba(69,10,10,0.95); color: #fca5a5; border: 1px solid #ef4444; }
+  #status.info { display: block; background: rgba(30,58,95,0.95); color: #93c5fd; border: 1px solid #3b82f6; }
   .logo { text-align: center; margin-bottom: 16px; font-size: 40px; }
   .advanced-toggle { text-align: center; margin: 12px 0; }
   .advanced-toggle a { color: #64748b; font-size: 12px; cursor: pointer; text-decoration: none; }
@@ -81,6 +92,76 @@ const webWizardHTML = `<!DOCTYPE html>
   .btn-small.active { border: 1px solid #38bdf8; box-shadow: 0 0 0 1px #38bdf8 inset; }
   .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; color: #cbd5e1; }
   .status-bar { background: #0b1220; border: 1px solid #243244; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; line-height: 1.7; }
+  .log-panel { border: 1px solid #334155; border-radius: 16px; background: #1e293b; box-shadow: 0 25px 50px rgba(0,0,0,0.5); flex: 1 1 auto; min-width: 360px; max-width: 100%; display: flex; flex-direction: column; max-height: calc(100vh - 32px); overflow: hidden; }
+  .log-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid #334155; flex: 0 0 auto; }
+  .log-head .lbl { font-size: 14px; color: #e2e8f0; font-weight: 600; }
+  .log-head .lbl .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #475569; margin-right: 6px; vertical-align: middle; transition: background 0.2s; }
+  .log-head .lbl.live .dot { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  .log-head .actions { display: flex; gap: 6px; align-items: center; }
+  .log-head .actions button { width: auto; margin: 0; padding: 4px 10px; font-size: 12px; font-weight: 500; background: transparent; border: 1px solid #334155; color: #94a3b8; border-radius: 6px; }
+  .log-head .actions button:hover { color: #e2e8f0; border-color: #475569; }
+  .log-head .actions label { font-size: 12px; color: #94a3b8; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .log-body { font-family: Consolas, "Courier New", monospace; font-size: 12px; color: #cbd5e1; line-height: 1.6; padding: 10px 14px; flex: 1 1 auto; overflow-y: auto; white-space: pre-wrap; word-break: break-all; background: #0b1220; border-radius: 0 0 16px 16px; }
+  .log-body > div { padding: 1px 0; }
+  .log-body > div:hover { background: rgba(56,189,248,0.05); }
+  .log-body .ts { color: #475569; margin-right: 8px; }
+  .log-body .tag { display: inline-block; padding: 0 6px; margin-right: 6px; border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.3px; line-height: 1.55; }
+  .log-body .tag[data-tag="usage"]      { background: #0c4a6e; color: #7dd3fc; }
+  .log-body .tag[data-tag="记录"]       { background: #14532d; color: #86efac; }
+  .log-body .tag[data-tag="MITM"],
+  .log-body .tag[data-tag="MITM/h2"]    { background: #3b0764; color: #c4b5fd; }
+  .log-body .tag[data-tag="CONNECT"]    { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+  .log-body .tag[data-tag="上报"]       { background: #7c2d12; color: #fdba74; }
+  .log-body .tag[data-tag="wizard"],
+  .log-body .tag[data-tag="认证"]       { background: #831843; color: #f9a8d4; }
+  .log-body .tag[data-tag="提示"],
+  .log-body .tag[data-tag="启动"]       { background: #365314; color: #bef264; }
+  .log-body .tag.tag-default            { background: #1e293b; color: #94a3b8; }
+  .log-body .k     { color: #94a3b8; }
+  .log-body .num   { color: #fbbf24; font-weight: 600; }
+  .log-body .model { color: #38bdf8; }
+  .log-body .app   { color: #c4b5fd; }
+  .log-body .url   { color: #67e8f9; }
+  .log-body .st-2  { color: #4ade80; font-weight: 600; }
+  .log-body .st-3  { color: #fbbf24; font-weight: 600; }
+  .log-body .st-4  { color: #fb923c; font-weight: 600; }
+  .log-body .st-5  { color: #f87171; font-weight: 600; }
+  .log-body .ln-err{ color: #fca5a5; }
+  .range-tabs { display: flex; gap: 6px; background: #0b1220; border: 1px solid #243244; border-radius: 10px; padding: 4px; margin-bottom: 12px; }
+  .range-tabs button { flex: 1; padding: 8px 6px; background: transparent; border: none; color: #94a3b8; font-size: 13px; font-weight: 500; border-radius: 6px; cursor: pointer; transition: all 0.2s; margin: 0; }
+  .range-tabs button:hover { color: #e2e8f0; }
+  .range-tabs button.active { background: linear-gradient(135deg, rgba(220,38,38,0.5), rgba(124,45,18,0.5)); color: #fecaca; }
+  .stats-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .stat-card { background: #0b1220; border: 1px solid #243244; border-radius: 12px; padding: 14px 16px; position: relative; overflow: hidden; }
+  .stat-card::before { content: ''; position: absolute; top: 0; left: 0; width: 3px; height: 100%; }
+  .stat-card.red::before    { background: linear-gradient(180deg, #f97316, #ef4444); }
+  .stat-card.green::before  { background: linear-gradient(180deg, #10b981, #14b8a6); }
+  .stat-card.amber::before  { background: linear-gradient(180deg, #f59e0b, #f97316); }
+  .stat-card.blue::before   { background: linear-gradient(180deg, #3b82f6, #06b6d4); }
+  .stat-card .stat-label { font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+  .stat-card .stat-num   { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; font-family: Consolas, "Courier New", monospace; }
+  .stat-card.red   .stat-num { color: #fb923c; }
+  .stat-card.green .stat-num { color: #4ade80; }
+  .stat-card.amber .stat-num { color: #fbbf24; }
+  .stat-card.blue  .stat-num { color: #60a5fa; }
+  /* ── 一键启动按钮：图标 + 名称 + 悬浮位移 ───────────────────────── */
+  .launch-section { margin-bottom: 14px; }
+  .launch-section:last-of-type { margin-bottom: 0; }
+  .launch-section-title { font-size: 12px; color: #64748b; margin-bottom: 8px; padding-left: 2px; letter-spacing: 0.5px; }
+  .launch-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .launch-btn { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #0b1220; border: 1px solid #243244; border-radius: 10px; color: #e2e8f0; cursor: pointer; transition: all 0.18s; font-size: 13px; font-weight: 500; text-align: left; width: 100%; margin: 0; min-height: 48px; }
+  .launch-btn:hover { border-color: #38bdf8; background: #0e1830; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(56,189,248,0.18); }
+  .launch-btn:active { transform: translateY(0); }
+  .launch-ico { width: 30px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); overflow: hidden; }
+  .launch-ico svg { width: 18px; height: 18px; display: block; }
+  .launch-name { flex: 1; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 760px) {
+    .launch-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 1100px) {
+    body { flex-direction: column; align-items: center; }
+    .log-panel { width: 860px; max-width: 96vw; max-height: 320px; flex: 0 0 auto; }
+  }
   @media (max-width: 1100px) {
     .btn-grid, .btn-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
@@ -195,38 +276,125 @@ const webWizardHTML = `<!DOCTYPE html>
       <div class="user-name" id="displayName"></div>
       <div class="user-detail" id="displayDetail"></div>
     </div>
-    <div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct) | 已上报: 0</div>
+    <div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct)</div>
+
+    <div class="panel">
+      <div class="panel-title">使用统计</div>
+      <div class="range-tabs">
+        <button id="rangeBtn1" class="active" onclick="setRange(1)">今日</button>
+        <button id="rangeBtn7" onclick="setRange(7)">近7天</button>
+        <button id="rangeBtn15" onclick="setRange(15)">近15天</button>
+        <button id="rangeBtn30" onclick="setRange(30)">近30天</button>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card red">
+          <div class="stat-label" id="statTokensLabel">今日 Tokens</div>
+          <div class="stat-num" id="statTokens">—</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-label" id="statRequestsLabel">今日请求</div>
+          <div class="stat-num" id="statRequests">—</div>
+        </div>
+        <div class="stat-card amber">
+          <div class="stat-label" id="statCostLabel">今日成本</div>
+          <div class="stat-num" id="statCost">—</div>
+        </div>
+        <div class="stat-card blue">
+          <div class="stat-label" id="statUsersLabel">今日活跃用户</div>
+          <div class="stat-num" id="statUsers">—</div>
+        </div>
+      </div>
+    </div>
 
     <div class="panel">
       <div class="panel-title">一键模式切换</div>
       <div class="btn-grid">
-        <button class="btn-secondary btn-small" id="modeObserveBtn" onclick="switchMode('observe')">观察模式</button>
-        <button class="btn-secondary btn-small" id="modeSessionBtn" onclick="switchMode('session_pac')">会话PAC模式</button>
-        <button class="btn-secondary btn-small" id="modeGlobalBtn" onclick="switchMode('global_install')">全局接管模式</button>
-        <button class="btn-secondary btn-small" id="modeCleanupBtn" onclick="switchMode('cleanup')">一键恢复网络</button>
+        <button class="btn-secondary btn-small" id="modeObserveBtn" onclick="switchMode('observe')" title="不改系统代理 / PAC / 环境变量。仅本程序运行时监听端口；只有 --launch 子进程或手动把应用代理指到本程序端口的流量才会被监控。本机保持「干净」。">观察模式</button>
+        <button class="btn-secondary btn-small" id="modeSessionBtn" onclick="switchMode('session_pac')" title="写一份 AI 域名白名单 PAC（仅 AI 相关域名走本程序，其它网站照常）。本程序退出时自动还原。Electron 类 IDE（VS Code / Cursor）改 PAC 后通常要重启，可用下方「一键启动」帮你拉。【日常推荐】">会话PAC模式</button>
+        <button class="btn-secondary btn-small" id="modeGlobalBtn" onclick="switchMode('global_install')" title="写 PAC + 用户级代理环境变量等（类似全局安装），关掉本程序后仍然接管。适合希望新开终端 / 多数软件默认就走监控路径的场景。停用要点「一键恢复网络」或运行 --global-uninstall / 卸载脚本。">全局接管模式</button>
+        <button class="btn-secondary btn-small" id="modeCleanupBtn" onclick="switchMode('cleanup')" title="一次性清理 PAC / 代理 / 用户级环境变量等接管残留，回到「未接管」状态。网络异常或想彻底回退时点。">一键恢复网络</button>
       </div>
       <div class="hint" id="modeHint" style="margin-top:8px;">当前模式: 未获取</div>
     </div>
 
     <div class="panel">
       <div class="panel-title">一键启动编辑器 / 终端（已启用自动重启同名运行实例）</div>
-      <div class="btn-grid">
-        <button class="btn-secondary btn-small" onclick="launchPreset('cursor')">启动 Cursor</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('vscode')">启动 VS Code</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('powershell')">启动 PowerShell</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('cmd')">启动 CMD</button>
+
+      <div class="launch-section">
+        <div class="launch-section-title">AI 编辑器 / CLI</div>
+        <div class="launch-grid">
+          <button class="launch-btn" onclick="launchPreset('cursor')" title="启动 Cursor">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#000 0%,#1f1f1f 100%);color:#fff;font-weight:700;font-size:14px;">C</span>
+            <span class="launch-name">Cursor</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('vscode')" title="启动 VS Code">
+            <span class="launch-ico" style="background:#0a66c2;">
+              <svg viewBox="0 0 24 24" fill="#fff"><path d="M17.5 2.5l-11 9.5 5 4.5L17.5 2.5zM3 8l3.5 3.5L3 15l1.5 1.5L8.5 13l9 8.5L21 19V5l-3.5-2.5L8.5 11 4.5 7 3 8z"/></svg>
+            </span>
+            <span class="launch-name">VS Code</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('codex')" title="在 PowerShell 中启动 Codex CLI，自动注入本地 MITM 环境变量。">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#10a37f 0%,#0e8a6b 100%);">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 9 5 12 8 15"/><polyline points="16 9 19 12 16 15"/></svg>
+            </span>
+            <span class="launch-name">Codex</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('windsurf')" title="启动 Windsurf">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#0ea5a4 0%,#0891b2 100%);color:#fff;font-weight:700;font-size:14px;">W</span>
+            <span class="launch-name">Windsurf</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('kiro')" title="启动 Kiro">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#7c3aed 0%,#a855f7 100%);color:#fff;font-weight:700;font-size:14px;">K</span>
+            <span class="launch-name">Kiro</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('trae')" title="启动 Trae">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#f43f5e 0%,#e11d48 100%);color:#fff;font-weight:700;font-size:14px;">T</span>
+            <span class="launch-name">Trae</span>
+          </button>
+        </div>
       </div>
-      <div class="hint" style="margin-top:8px;">更多 IDE（含 JetBrains）</div>
-      <div class="btn-grid-3">
-        <button class="btn-secondary btn-small" onclick="launchPreset('windsurf')">Windsurf</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('kiro')">Kiro</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('trae')">Trae</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('idea')">IntelliJ IDEA</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('webstorm')">WebStorm</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('pycharm')">PyCharm</button>
-        <button class="btn-secondary btn-small" onclick="launchPreset('goland')">GoLand</button>
+
+      <div class="launch-section">
+        <div class="launch-section-title">终端</div>
+        <div class="launch-grid">
+          <button class="launch-btn" onclick="launchPreset('powershell')" title="启动 PowerShell">
+            <span class="launch-ico" style="background:#012456;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 7 10 12 5 17"/><line x1="13" y1="17" x2="19" y2="17"/></svg>
+            </span>
+            <span class="launch-name">PowerShell</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('cmd')" title="启动 CMD">
+            <span class="launch-ico" style="background:#1e293b;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 8 10 12 6 16"/><line x1="12" y1="16" x2="18" y2="16"/></svg>
+            </span>
+            <span class="launch-name">CMD</span>
+          </button>
+        </div>
       </div>
-      <div class="field" style="margin-top:10px;">
+
+      <div class="launch-section">
+        <div class="launch-section-title">JetBrains 系列</div>
+        <div class="launch-grid">
+          <button class="launch-btn" onclick="launchPreset('idea')" title="启动 IntelliJ IDEA">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#087cfa 0%,#fe315d 50%,#f97a12 100%);color:#fff;font-weight:700;font-size:13px;">IJ</span>
+            <span class="launch-name">IntelliJ IDEA</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('webstorm')" title="启动 WebStorm">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#00cdd7 0%,#087cfa 50%,#fff200 100%);color:#000;font-weight:700;font-size:13px;">WS</span>
+            <span class="launch-name">WebStorm</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('pycharm')" title="启动 PyCharm">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#21d789 0%,#fcf84a 50%,#07c3f2 100%);color:#000;font-weight:700;font-size:13px;">PC</span>
+            <span class="launch-name">PyCharm</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('goland')" title="启动 GoLand">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#0eb9c3 0%,#bf3bb4 50%,#3bea62 100%);color:#fff;font-weight:700;font-size:13px;">GL</span>
+            <span class="launch-name">GoLand</span>
+          </button>
+        </div>
+      </div>
+      <div class="launch-section-title" style="margin-top:14px;border-top:1px solid #1f2a3a;padding-top:12px;">自定义程序</div>
+      <div class="field" style="margin-top:6px;">
         <label>自定义程序路径</label>
         <input id="customBinary" type="text" placeholder="例如：C:\Program Files\Git\bin\bash.exe" />
       </div>
@@ -257,17 +425,49 @@ const webWizardHTML = `<!DOCTYPE html>
   </div>
 </div>
 
+<div class="log-panel" id="logPanel">
+  <div class="log-head">
+    <div class="lbl" id="logLbl"><span class="dot"></span>运行日志</div>
+  </div>
+  <div class="log-body" id="logBody"></div>
+</div>
+
 <script>
 var authUser = null;
 var basePath = '{{.BasePath}}';
 var consoleStatus = null;
 
+var statusHideTimer = null;
 function setStatus(level, text) {
   var status = document.getElementById('status');
   status.className = level;
   status.style.display = 'block';
   status.textContent = text;
+  // 触发 reflow 以确保 transition 生效
+  void status.offsetWidth;
+  status.classList.add('show');
+  if (statusHideTimer) { clearTimeout(statusHideTimer); statusHideTimer = null; }
+  // info 短一点（操作进行中会被后续 success/error 覆盖），success 4s，error 7s 留出阅读时间
+  var hold = level === 'error' ? 7000 : (level === 'info' ? 6000 : 4000);
+  statusHideTimer = setTimeout(function() {
+    status.classList.remove('show');
+    setTimeout(function() {
+      if (!status.classList.contains('show')) {
+        status.style.display = 'none';
+        status.className = '';
+      }
+    }, 260);
+  }, hold);
 }
+// 点击 toast 立即关闭
+document.addEventListener('DOMContentLoaded', function() {
+  var s = document.getElementById('status');
+  if (s) s.addEventListener('click', function() {
+    s.classList.remove('show');
+    setTimeout(function() { s.style.display = 'none'; s.className = ''; }, 260);
+    if (statusHideTimer) { clearTimeout(statusHideTimer); statusHideTimer = null; }
+  });
+});
 
 function activateModeButton(mode) {
   ['modeObserveBtn', 'modeSessionBtn', 'modeGlobalBtn', 'modeCleanupBtn'].forEach(function(id) {
@@ -316,7 +516,7 @@ async function refreshConsoleStatus() {
     document.getElementById('displayDetail').textContent = detail;
     document.getElementById('modeHint').textContent = '当前模式: ' + modeText(data.mode) + ' | 已上报: ' + (data.total_reported || 0);
     var upstream = data.upstream_proxy || '(direct)';
-    document.getElementById('quickStatus').textContent = '模式: ' + shortMode(data.mode) + ' | 上游: ' + upstream + ' | 已上报: ' + (data.total_reported || 0);
+    document.getElementById('quickStatus').textContent = '模式: ' + shortMode(data.mode) + ' | 上游: ' + upstream;
     return true;
   } catch (err) {
     return false;
@@ -609,9 +809,126 @@ window.addEventListener('load', function() {
     if (supported) {
       // 运行态默认进入控制台页；已登录后不再展示注册/登录入口。
       goToStep2();
+      loadOverview();
+      setInterval(loadOverview, 30000);
     }
   });
+  initLogPanel();
 });
+
+// ── 使用统计 ─────────────────────────────────────────────────
+var overviewState = { days: 1, loading: false };
+
+function setRange(days) {
+  overviewState.days = days;
+  ['1','7','15','30'].forEach(function(d) {
+    var btn = document.getElementById('rangeBtn' + d);
+    if (btn) btn.classList.toggle('active', String(days) === d);
+  });
+  var label = days === 1 ? '今日' : ('近' + days + '天');
+  ['Tokens', 'Requests', 'Cost', 'Users'].forEach(function(k, i) {
+    var el = document.getElementById('stat' + k + 'Label');
+    var names = ['Tokens', '请求', '成本', '活跃用户'];
+    if (el) el.textContent = label + ' ' + names[i];
+  });
+  loadOverview();
+}
+
+async function loadOverview() {
+  if (overviewState.loading) return;
+  overviewState.loading = true;
+  try {
+    var resp = await fetch(basePath + '/api/overview?days=' + overviewState.days);
+    if (!resp.ok) return;
+    var data = await resp.json();
+    if (!data || typeof data !== 'object') return;
+    var tokens = Number(data.total_tokens || 0);
+    var requests = Number(data.total_requests || 0);
+    var cost = Number(data.total_cost_cny || 0);
+    var users = Number(data.active_users || 0);
+    document.getElementById('statTokens').textContent = tokens.toLocaleString();
+    document.getElementById('statRequests').textContent = requests.toLocaleString();
+    document.getElementById('statCost').textContent = '¥' + cost.toFixed(2);
+    document.getElementById('statUsers').textContent = String(users);
+  } catch (err) {
+    // 网络/服务器不可达时静默；下一次轮询自然重试
+  } finally {
+    overviewState.loading = false;
+  }
+}
+
+// ── 运行日志面板 ──────────────────────────────────────────────
+// 从 /wizard/api/logs/history 拉历史，再走 EventSource 订阅实时流。
+// 控制台里看到的内容（[MITM]/[记录]/[上报]/banner 等）和这里完全一致。
+var logState = { lastSeq: 0, evt: null, paused: false };
+
+function escHtml(s) { return s.replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+
+// renderLogLine returns innerHTML for a single log line:
+//   * 剥掉 Go log 包前缀的 "YYYY/MM/DD HH:MM:SS.uuuuuu " 时间戳，避免和我们的短时间重复
+//   * 识别 [tag] 染成胶囊
+//   * 数字 / model / sourceApp / HTTP 状态码 高亮
+function renderLogLine(text) {
+  text = text.replace(/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+/, '');
+  var head = '';
+  var m = text.match(/^\[([^\]]+)\]\s*/);
+  if (m) {
+    var tag = m[1];
+    head = '<span class="tag" data-tag="' + escHtml(tag) + '">' + escHtml(tag) + '</span>';
+    text = text.slice(m[0].length);
+  }
+  var body = escHtml(text);
+  body = body.replace(/\bmodel=&quot;([^&]+?)&quot;/g, 'model=<span class="model">"$1"</span>');
+  body = body.replace(/\bsourceApp=&quot;([^&]+?)&quot;/g, 'sourceApp=<span class="app">"$1"</span>');
+  body = body.replace(/\b(prompt|completion|total|tokens)=(\d+)/g, '<span class="k">$1</span>=<span class="num">$2</span>');
+  body = body.replace(/(输入|输出|总计|累计)\s*[:：]\s*(\d+)/g, '<span class="k">$1</span>:<span class="num">$2</span>');
+  body = body.replace(/(→\s*)(\d{3})\b/g, function(_, arrow, code) {
+    var c = code.charAt(0);
+    var cls = c==='2'?'st-2':c==='4'?'st-4':c==='5'?'st-5':'st-3';
+    return arrow + '<span class="' + cls + '">' + code + '</span>';
+  });
+  body = body.replace(/(https?:\/\/[^\s]+)/g, '<span class="url">$1</span>');
+  return head + body;
+}
+
+function appendLogLine(ln) {
+  var body = document.getElementById('logBody');
+  if (!body) return;
+  if (ln.seq <= logState.lastSeq) return;
+  logState.lastSeq = ln.seq;
+  var div = document.createElement('div');
+  if (/\b(error|失败|ERROR|FAIL)\b/.test(ln.text)) div.className = 'ln-err';
+  div.innerHTML = '<span class="ts">' + escHtml(ln.time) + '</span>' + renderLogLine(ln.text);
+  body.appendChild(div);
+  while (body.childNodes.length > 2000) body.removeChild(body.firstChild);
+  body.scrollTop = body.scrollHeight;
+}
+
+function setLogLive(live) {
+  var lbl = document.getElementById('logLbl');
+  if (!lbl) return;
+  if (live) lbl.classList.add('live'); else lbl.classList.remove('live');
+}
+
+function initLogPanel() {
+  if (!window.EventSource) {
+    var b = document.getElementById('logBody');
+    if (b) b.textContent = '当前 WebView 不支持 EventSource，无法显示日志。';
+    return;
+  }
+  fetch(basePath + '/api/logs/history').then(function(r) { return r.json(); }).then(function(arr) {
+    (arr || []).forEach(appendLogLine);
+  }).catch(function() {}).finally(function() {
+    try {
+      logState.evt = new EventSource(basePath + '/api/logs/stream');
+      logState.evt.onopen = function() { setLogLive(true); };
+      logState.evt.onerror = function() { setLogLive(false); }; // 浏览器会自动重连
+      logState.evt.onmessage = function(e) {
+        try { appendLogLine(JSON.parse(e.data)); } catch (err) {}
+      };
+    } catch (err) {}
+  });
+}
 </script>
 </body>
 </html>`
@@ -864,21 +1181,52 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 	}()
 
 	log.Printf("[wizard] 安装向导已启动: %s", wizardURL)
-	openBrowser(wizardURL)
+	windowDone, closeWindow := openWizardOrBrowser(wizardURL, "AI Token 监控")
 
 	fmt.Println()
 	fmt.Println("  ╔══════════════════════════════════════════╗")
-	fmt.Println("  ║   安装向导已在浏览器中打开                ║")
+	if windowDone != nil {
+		fmt.Println("  ║   安装向导已在内嵌窗口中打开              ║")
+	} else {
+		fmt.Println("  ║   安装向导已在浏览器中打开                ║")
+	}
 	fmt.Printf("  ║   %s            ║\n", wizardURL)
-	fmt.Println("  ║   请在浏览器中完成配置                    ║")
+	fmt.Println("  ║   请完成配置                              ║")
 	fmt.Println("  ╚══════════════════════════════════════════╝")
 	fmt.Println()
 
-	// Wait for setup completion or timeout (10 minutes)
+	// Wait for: setup completion, user-closed window, or 10-minute timeout.
+	if windowDone == nil {
+		windowDone = make(chan struct{}) // never closes; only done/timeout matters
+	}
 	select {
 	case <-done:
+		// Setup completed (or HTTP server errored). Dismiss the embedded window so
+		// the user doesn't have to close it manually. 等窗口真正销毁后再返回——
+		// 否则 main goroutine 会马上打开「运行态」配置窗口，老窗口还没关掉，
+		// 用户看到两个窗口，老窗口卡死无响应。
+		if closeWindow != nil {
+			closeWindow()
+		}
+		select {
+		case <-windowDone:
+		case <-time.After(3 * time.Second):
+			log.Println("[wizard] 安装向导窗口未在 3s 内关闭，继续后续流程")
+		}
+	case <-windowDone:
+		// User closed the wizard window before completing setup. Treat as abort.
+		if setupErr == nil {
+			setupErr = errors.New("用户关闭了安装向导窗口")
+		}
 	case <-time.After(10 * time.Minute):
 		log.Println("[wizard] 超时，关闭向导")
+		if closeWindow != nil {
+			closeWindow()
+		}
+		select {
+		case <-windowDone:
+		case <-time.After(3 * time.Second):
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -902,10 +1250,12 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 		}
 		data := struct {
 			UserName  string
+			UserID    string
 			ServerURL string
 			BasePath  string
 		}{
 			UserName:  s.cfg.UserName,
+			UserID:    s.cfg.UserID,
 			ServerURL: s.cfg.ServerURL,
 			BasePath:  "/wizard",
 		}
@@ -924,6 +1274,18 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 	}
 	if subPath == "/api/console/launch" && r.Method == http.MethodPost {
 		s.handleConsoleLaunch(w, r)
+		return
+	}
+	if subPath == "/api/logs/history" && r.Method == http.MethodGet {
+		handleLogsHistory(w, r)
+		return
+	}
+	if subPath == "/api/logs/stream" && r.Method == http.MethodGet {
+		handleLogsStream(w, r)
+		return
+	}
+	if subPath == "/api/overview" && r.Method == http.MethodGet {
+		s.handleOverviewProxy(w, r)
 		return
 	}
 
@@ -1021,6 +1383,35 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.NotFound(w, r)
+}
+
+func (s *ProxyServer) handleOverviewProxy(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	serverURL := strings.TrimRight(strings.TrimSpace(s.cfg.ServerURL), "/")
+	if serverURL == "" {
+		w.WriteHeader(400)
+		w.Write([]byte(`{"detail":"server_url 未配置"}`))
+		return
+	}
+	days := strings.TrimSpace(r.URL.Query().Get("days"))
+	if days == "" {
+		days = "1"
+	}
+	target := serverURL + "/api/dashboard/overview?days=" + url.QueryEscape(days)
+	if eid := strings.TrimSpace(s.cfg.UserID); eid != "" {
+		target += "&employee_id=" + url.QueryEscape(eid)
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Get(target)
+	if err != nil {
+		w.WriteHeader(502)
+		w.Write([]byte(`{"detail":"上游不可达: ` + err.Error() + `"}`))
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
 }
 
 func (s *ProxyServer) handleConsoleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -1135,7 +1526,7 @@ func (s *ProxyServer) handleConsoleLaunch(w http.ResponseWriter, r *http.Request
 		}
 		if req.RestartRunning {
 			if image, _ := managedPresetProcessImage(preset); image != "" {
-				_ = exec.Command("taskkill", "/F", "/IM", image).Run()
+				_ = newHiddenCmd("taskkill", "/F", "/IM", image).Run()
 				time.Sleep(1200 * time.Millisecond)
 			}
 		}
@@ -1177,11 +1568,27 @@ func openBrowser(url string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/C", "start", url)
+		cmd = newHiddenCmd("cmd", "/C", "start", url)
 	case "darwin":
-		cmd = exec.Command("open", url)
+		cmd = newHiddenCmd("open", url)
 	default:
-		cmd = exec.Command("xdg-open", url)
+		cmd = newHiddenCmd("xdg-open", url)
 	}
 	cmd.Start()
+}
+
+// openWizardOrBrowser tries to open the wizard in an embedded WebView2
+// window first; on failure (WebView2 runtime missing, non-Windows, etc.)
+// it falls back to the system browser. Returns the window's close channel
+// (nil when fallback was used) and the captured close callback (nil when
+// fallback was used). Fire-and-forget callers can ignore both returns.
+func openWizardOrBrowser(url, title string) (<-chan struct{}, func()) {
+	var closer func()
+	done, err := openWizardWindow(url, title, &closer)
+	if err != nil {
+		log.Printf("[wizard] 内嵌窗口不可用 (%v)，回退到系统浏览器", err)
+		openBrowser(url)
+		return nil, nil
+	}
+	return done, closer
 }

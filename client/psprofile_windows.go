@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -70,7 +69,7 @@ function codex  { _Invoke-AIMonitorProxy "codex"  $args }
 // powershellProfilePath 返回当前用户的 PowerShell 5 和 PowerShell 7 Profile 路径。
 func powershellProfilePaths() []string {
 	docs := ""
-	if out, err := exec.Command("powershell", "-NoProfile", "-Command",
+	if out, err := newHiddenCmd("powershell", "-NoProfile", "-Command",
 		"[Environment]::GetFolderPath('MyDocuments')").Output(); err == nil {
 		docs = strings.TrimSpace(string(out))
 	}

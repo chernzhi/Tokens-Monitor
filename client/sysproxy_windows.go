@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
@@ -106,7 +105,7 @@ func captureProxySnapshot() proxySnapshot {
 // readRegSnapshot queries a single registry value and returns a three-state result.
 // Present=true means the key was found; Present=false means not found or reg.exe failed.
 func readRegSnapshot(regPath, valueName string) regSnapshotValue {
-	out, err := exec.Command("reg", "query", regPath, "/v", valueName).CombinedOutput()
+	out, err := newHiddenCmd("reg", "query", regPath, "/v", valueName).CombinedOutput()
 	if err != nil {
 		return regSnapshotValue{Present: false}
 	}
@@ -131,30 +130,30 @@ func readRegSnapshot(regPath, valueName string) regSnapshotValue {
 func restoreProxySnapshot(snap proxySnapshot) {
 	if snap.ProxyEnable.Present {
 		if strings.Contains(snap.ProxyEnable.Value, "0x1") || snap.ProxyEnable.Value == "1" {
-			exec.Command("reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f").Run()
+			newHiddenCmd("reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f").Run()
 		} else {
-			exec.Command("reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
+			newHiddenCmd("reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
 		}
 	}
 	if snap.ProxyServer.Present {
 		if snap.ProxyServer.Value != "" {
-			exec.Command("reg", "add", inetRegPath, "/v", "ProxyServer", "/t", "REG_SZ", "/d", snap.ProxyServer.Value, "/f").Run()
+			newHiddenCmd("reg", "add", inetRegPath, "/v", "ProxyServer", "/t", "REG_SZ", "/d", snap.ProxyServer.Value, "/f").Run()
 		} else {
-			exec.Command("reg", "delete", inetRegPath, "/v", "ProxyServer", "/f").Run()
+			newHiddenCmd("reg", "delete", inetRegPath, "/v", "ProxyServer", "/f").Run()
 		}
 	}
 	if snap.ProxyOverride.Present {
 		if snap.ProxyOverride.Value != "" {
-			exec.Command("reg", "add", inetRegPath, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", snap.ProxyOverride.Value, "/f").Run()
+			newHiddenCmd("reg", "add", inetRegPath, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", snap.ProxyOverride.Value, "/f").Run()
 		} else {
-			exec.Command("reg", "delete", inetRegPath, "/v", "ProxyOverride", "/f").Run()
+			newHiddenCmd("reg", "delete", inetRegPath, "/v", "ProxyOverride", "/f").Run()
 		}
 	}
 	if snap.AutoConfigURL.Present {
 		if snap.AutoConfigURL.Value != "" {
-			exec.Command("reg", "add", inetRegPath, "/v", "AutoConfigURL", "/t", "REG_SZ", "/d", snap.AutoConfigURL.Value, "/f").Run()
+			newHiddenCmd("reg", "add", inetRegPath, "/v", "AutoConfigURL", "/t", "REG_SZ", "/d", snap.AutoConfigURL.Value, "/f").Run()
 		} else {
-			exec.Command("reg", "delete", inetRegPath, "/v", "AutoConfigURL", "/f").Run()
+			newHiddenCmd("reg", "delete", inetRegPath, "/v", "AutoConfigURL", "/f").Run()
 		}
 	}
 	notifyWinInetSettingsChanged()
@@ -176,7 +175,7 @@ func EnableSystemProxy(proxyAddr, bypass string) error {
 		{[]string{"reg", "add", inetRegPath, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", bypass, "/f"}, "set bypass list"},
 	}
 	for _, c := range cmds {
-		if err := exec.Command(c.args[0], c.args[1:]...).Run(); err != nil {
+		if err := newHiddenCmd(c.args[0], c.args[1:]...).Run(); err != nil {
 			log.Printf("[proxy] %s failed: %v — rolling back", c.desc, err)
 			restoreProxySnapshot(snapshot)
 			return fmt.Errorf("%s: %w", c.desc, err)
@@ -185,7 +184,7 @@ func EnableSystemProxy(proxyAddr, bypass string) error {
 	// 清除残留的 PAC 配置——WinINet 优先使用 AutoConfigURL，残留的 PAC 会覆盖
 	// 刚写入的手工代理，导致代理"设了没生效"。与 EnableSystemProxyPAC 清除
 	// ProxyServer/ProxyOverride 对称。
-	if err := exec.Command("reg", "delete", inetRegPath, "/v", "AutoConfigURL", "/f").Run(); err != nil {
+	if err := newHiddenCmd("reg", "delete", inetRegPath, "/v", "AutoConfigURL", "/f").Run(); err != nil {
 		// AutoConfigURL 本就不存在时 reg delete 会报错，属正常情况，不告警。
 		// 只在键存在但删除失败时才值得关注——此时检查 snapshot 判断原来是否有值。
 		if snapshot.AutoConfigURL.Present {
@@ -201,7 +200,7 @@ func EnableSystemProxy(proxyAddr, bypass string) error {
 // 注意：本函数仅置 ProxyEnable=0，不还原 AutoConfigURL / ProxyServer 等其他注册表项。
 // 完整恢复请使用 restoreWinInetProxyFromState（依赖 install_state 快照）。
 func DisableSystemProxy() {
-	exec.Command("reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
+	newHiddenCmd("reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
 	notifyWinInetSettingsChanged()
 	log.Println("[proxy] system proxy disabled")
 }
@@ -209,7 +208,7 @@ func DisableSystemProxy() {
 // SetEnvProxy sets HTTP_PROXY, HTTPS_PROXY, and AI SDK base URL env vars persistently.
 func SetEnvProxy(vars map[string]string) error {
 	for k, v := range vars {
-		if err := exec.Command("setx", k, v).Run(); err != nil {
+		if err := newHiddenCmd("setx", k, v).Run(); err != nil {
 			return fmt.Errorf("setx %s: %w", k, err)
 		}
 	}
@@ -221,7 +220,7 @@ func SetEnvProxy(vars map[string]string) error {
 // ClearEnvProxy removes all proxy-related environment variables.
 func ClearEnvProxy(keys []string) {
 	for _, k := range keys {
-		exec.Command("reg", "delete", envRegPath, "/v", k, "/f").Run()
+		newHiddenCmd("reg", "delete", envRegPath, "/v", k, "/f").Run()
 	}
 	notifyWinInetSettingsChanged()
 	log.Println("[proxy] environment variables cleared")
@@ -241,7 +240,7 @@ func ReadUserLevelEnv(name string) string {
 	if strings.TrimSpace(name) == "" {
 		return ""
 	}
-	out, err := exec.Command("reg", "query", envRegPath, "/v", name).Output()
+	out, err := newHiddenCmd("reg", "query", envRegPath, "/v", name).Output()
 	if err != nil {
 		return ""
 	}
@@ -262,7 +261,7 @@ func ReadUserLevelEnv(name string) string {
 // ReadCurrentAutoConfigURL reads the current AutoConfigURL from the WinINet registry.
 // Returns "" if not set or on error.
 func ReadCurrentAutoConfigURL() string {
-	out, err := exec.Command("reg", "query", inetRegPath, "/v", "AutoConfigURL").CombinedOutput()
+	out, err := newHiddenCmd("reg", "query", inetRegPath, "/v", "AutoConfigURL").CombinedOutput()
 	if err != nil {
 		return ""
 	}
@@ -292,15 +291,15 @@ func EnableSystemProxyPAC(pacURL string) error {
 		{[]string{"reg", "add", inetRegPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"}, "disable manual proxy"},
 	}
 	for _, c := range cmds {
-		if err := exec.Command(c.args[0], c.args[1:]...).Run(); err != nil {
+		if err := newHiddenCmd(c.args[0], c.args[1:]...).Run(); err != nil {
 			log.Printf("[proxy] %s failed: %v — rolling back", c.desc, err)
 			restoreProxySnapshot(snapshot)
 			return fmt.Errorf("%s: %w", c.desc, err)
 		}
 	}
 	// Clean up stale manual proxy keys (ignore errors if they don't exist)
-	exec.Command("reg", "delete", inetRegPath, "/v", "ProxyServer", "/f").Run()
-	exec.Command("reg", "delete", inetRegPath, "/v", "ProxyOverride", "/f").Run()
+	newHiddenCmd("reg", "delete", inetRegPath, "/v", "ProxyServer", "/f").Run()
+	newHiddenCmd("reg", "delete", inetRegPath, "/v", "ProxyOverride", "/f").Run()
 	notifyWinInetSettingsChanged()
 	log.Printf("[proxy] PAC proxy set: %s", pacURL)
 	return nil
@@ -308,7 +307,7 @@ func EnableSystemProxyPAC(pacURL string) error {
 
 // DisableSystemProxyPAC removes the AutoConfigURL registry value.
 func DisableSystemProxyPAC() {
-	exec.Command("reg", "delete", inetRegPath, "/v", "AutoConfigURL", "/f").Run()
+	newHiddenCmd("reg", "delete", inetRegPath, "/v", "AutoConfigURL", "/f").Run()
 	notifyWinInetSettingsChanged()
 	log.Println("[proxy] PAC proxy cleared")
 }
@@ -320,7 +319,7 @@ func RestoreAutoDetect(value uint32, present bool) {
 	if !present {
 		return
 	}
-	exec.Command("reg", "add", inetRegPath, "/v", "AutoDetect", "/t", "REG_DWORD",
+	newHiddenCmd("reg", "add", inetRegPath, "/v", "AutoDetect", "/t", "REG_DWORD",
 		"/d", fmt.Sprintf("%d", value), "/f").Run()
 	notifyWinInetSettingsChanged()
 	log.Printf("[proxy] AutoDetect restored to %d", value)

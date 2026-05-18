@@ -228,7 +228,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 		// 稍等 MITM 端口监听起来，避免抢跑
 		time.Sleep(500 * time.Millisecond)
 		log.Printf("[认证] 已打开登录向导 %s", wizardURL)
-		openBrowser(wizardURL)
+		openWizardOrBrowser(wizardURL, "AI Token 监控")
 	}
 
 	rt := &monitorRuntime{
@@ -670,7 +670,7 @@ func stdinIsInteractive() bool {
 func killAndRelaunchEditors(editors []runningElectronEditor, out io.Writer) {
 	for _, e := range editors {
 		fmt.Fprintf(out, "  [%s] 终止进程 %s ...\n", e.Display, e.ImageName)
-		if err := exec.Command("taskkill", "/F", "/IM", e.ImageName).Run(); err != nil {
+		if err := newHiddenCmd("taskkill", "/F", "/IM", e.ImageName).Run(); err != nil {
 			fmt.Fprintf(out, "    ⚠ taskkill /F /IM %s 失败: %v\n", e.ImageName, err)
 			continue
 		}
@@ -770,7 +770,7 @@ func isProcessImageRunning(imageName string) (bool, error) {
 	if runtime.GOOS != "windows" {
 		return false, nil
 	}
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", imageName), "/FO", "CSV", "/NH").Output()
+	out, err := newHiddenCmd("tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", imageName), "/FO", "CSV", "/NH").Output()
 	if err != nil {
 		return false, err
 	}
