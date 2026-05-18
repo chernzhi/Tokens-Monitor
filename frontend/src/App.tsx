@@ -141,10 +141,13 @@ function App() {
   ];
 
   // ── Trend Chart ──
+  const hasCacheSeries = trend.points.some((p) => (p.cache_read_tokens ?? 0) + (p.cache_creation_tokens ?? 0) > 0);
+  const legendData = ["Input Tokens", "Output Tokens"];
+  if (hasCacheSeries) legendData.push("Cache Read", "Cache Create");
   const trendOption = {
     backgroundColor: "transparent",
     tooltip: { trigger: "axis" as const },
-    legend: { data: ["Input Tokens", "Output Tokens"], textStyle: { color: "#8b949e" }, top: 0 },
+    legend: { data: legendData, textStyle: { color: "#8b949e" }, top: 0 },
     grid: { left: 60, right: 20, bottom: 30, top: 40 },
     xAxis: {
       type: "category" as const,
@@ -163,15 +166,31 @@ function App() {
         type: trendType,
         data: trend.points.map((p) => p.input_tokens),
         itemStyle: { color: COLORS.green },
-        ...(trendType === "bar" ? { barMaxWidth: 30 } : { smooth: true }),
+        ...(trendType === "bar" ? { barMaxWidth: 30, stack: "tokens" } : { smooth: true }),
       },
       {
         name: "Output Tokens",
         type: trendType,
         data: trend.points.map((p) => p.output_tokens),
         itemStyle: { color: COLORS.purple },
-        ...(trendType === "bar" ? { barMaxWidth: 30 } : { smooth: true }),
+        ...(trendType === "bar" ? { barMaxWidth: 30, stack: "tokens" } : { smooth: true }),
       },
+      ...(hasCacheSeries ? [
+        {
+          name: "Cache Read",
+          type: trendType,
+          data: trend.points.map((p) => p.cache_read_tokens ?? 0),
+          itemStyle: { color: COLORS.cyan },
+          ...(trendType === "bar" ? { barMaxWidth: 30, stack: "cache" } : { smooth: true, lineStyle: { type: "dashed" as const } }),
+        },
+        {
+          name: "Cache Create",
+          type: trendType,
+          data: trend.points.map((p) => p.cache_creation_tokens ?? 0),
+          itemStyle: { color: COLORS.orange },
+          ...(trendType === "bar" ? { barMaxWidth: 30, stack: "cache" } : { smooth: true, lineStyle: { type: "dashed" as const } }),
+        },
+      ] : []),
     ],
   };
 
@@ -268,7 +287,7 @@ function App() {
             <Radio.Button value="bar">柱状图</Radio.Button>
             <Radio.Button value="line">折线图</Radio.Button>
           </Radio.Group>
-          <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" icon={<DownloadOutlined />} href="/api/extension/client" target="_blank">
+          <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" icon={<DownloadOutlined />} href="/api/extension/installer" target="_blank">
             安装包
           </Button>
           <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" type="primary" ghost onClick={() => void fetchAll(false)} loading={isRefreshing && !isLoading}>

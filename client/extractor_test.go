@@ -197,3 +197,65 @@ func TestAnthropicSSENoUsageNoTextReturnsNil(t *testing.T) {
 		t.Fatalf("expected nil or zero tokens for empty response, got %+v", u)
 	}
 }
+
+// 缓存 token 必须以原始计数透传到 UsageInfo（用于观测），同时 PromptTokens 仍是折算后的等效值（用于成本）。
+func TestAnthropicCacheTokensExposed(t *testing.T) {
+	const body = `{"usage":{"input_tokens":1500,"cache_read_input_tokens":1000,"cache_creation_input_tokens":200,"output_tokens":50}}`
+	u := ExtractUsage("anthropic", []byte(body))
+	if u == nil {
+		t.Fatal("nil usage")
+	}
+	if u.CacheReadTokens != 1000 {
+		t.Fatalf("CacheReadTokens=%d want 1000", u.CacheReadTokens)
+	}
+	if u.CacheCreationTokens != 200 {
+		t.Fatalf("CacheCreationTokens=%d want 200", u.CacheCreationTokens)
+	}
+	// 等效 PromptTokens：regular=300, +cacheCreate*1.25=250, +cacheRead*0.1=100 → 650
+	if u.PromptTokens != 650 {
+		t.Fatalf("PromptTokens=%d want 650 (cost-weighted)", u.PromptTokens)
+	}
+}
+
+// Haiku 不支持 reasoning，MITM 需剥离 output_config.effort / thinking，避免上游 400。
+func TestStripReasoningForHaiku(t *testing.T) {
+	req := map[string]interface{}{
+		"model":         "claude-haiku-4.5",
+		"output_config": map[string]interface{}{"effort": "high"},
+		"thinking":      map[string]interface{}{"type": "adaptive"},
+	}
+	stripped := stripReasoningForNonReasoningModel(req, "claude-haiku-4.5")
+	if stripped == "" {
+		t.Fatal("expected fields to be stripped for haiku")
+	}
+	if _, has := req["output_config"]; has {
+		t.Fatalf("output_config should be removed entirely, got %+v", req["output_config"])
+	}
+	if _, has := req["thinking"]; has {
+		t.Fatal("thinking should be removed")
+	}
+	// Opus 应原样保留
+	req2 := map[string]interface{}{
+		"model":         "claude-opus-4-7",
+		"output_config": map[string]interface{}{"effort": "high"},
+	}
+	if stripReasoningForNonReasoningModel(req2, "claude-opus-4-7") != "" {
+		t.Fatal("opus should not be stripped")
+	}
+}
+
+// OpenAI cached_tokens 同样以原始计数暴露。
+func TestOpenAICachedTokensExposed(t *testing.T) {
+	const body = `{"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100,"prompt_tokens_details":{"cached_tokens":400}}}`
+	u := ExtractUsage("openai", []byte(body))
+	if u == nil {
+		t.Fatal("nil usage")
+	}
+	if u.CacheReadTokens != 400 {
+		t.Fatalf("CacheReadTokens=%d want 400", u.CacheReadTokens)
+	}
+	// 等效 PromptTokens：regular=600 + cached*0.5=200 → 800
+	if u.PromptTokens != 800 {
+		t.Fatalf("PromptTokens=%d want 800 (cost-weighted)", u.PromptTokens)
+	}
+}

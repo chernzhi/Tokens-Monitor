@@ -300,8 +300,9 @@ const webWizardHTML = `<!DOCTYPE html>
           <div class="stat-num" id="statCost">—</div>
         </div>
         <div class="stat-card blue">
-          <div class="stat-label" id="statUsersLabel">今日活跃用户</div>
+          <div class="stat-label" id="statUsersLabel">缓存命中率</div>
           <div class="stat-num" id="statUsers">—</div>
+          <div class="stat-sub" id="statUsersSub" style="font-size:12px;color:#94a3b8;margin-top:4px;">读 0 / 写 0</div>
         </div>
       </div>
     </div>
@@ -826,11 +827,13 @@ function setRange(days) {
     if (btn) btn.classList.toggle('active', String(days) === d);
   });
   var label = days === 1 ? '今日' : ('近' + days + '天');
-  ['Tokens', 'Requests', 'Cost', 'Users'].forEach(function(k, i) {
+  ['Tokens', 'Requests', 'Cost'].forEach(function(k, i) {
     var el = document.getElementById('stat' + k + 'Label');
-    var names = ['Tokens', '请求', '成本', '活跃用户'];
+    var names = ['Tokens', '请求', '成本'];
     if (el) el.textContent = label + ' ' + names[i];
   });
+  var usersLabel = document.getElementById('statUsersLabel');
+  if (usersLabel) usersLabel.textContent = label + ' 缓存命中率';
   loadOverview();
 }
 
@@ -845,11 +848,24 @@ async function loadOverview() {
     var tokens = Number(data.total_tokens || 0);
     var requests = Number(data.total_requests || 0);
     var cost = Number(data.total_cost_cny || 0);
-    var users = Number(data.active_users || 0);
     document.getElementById('statTokens').textContent = tokens.toLocaleString();
     document.getElementById('statRequests').textContent = requests.toLocaleString();
     document.getElementById('statCost').textContent = '¥' + cost.toFixed(2);
-    document.getElementById('statUsers').textContent = String(users);
+    var cacheRead = Number(data.cache_read_tokens || 0);
+    var cacheCreate = Number(data.cache_creation_tokens || 0);
+    var inputTokens = Number(data.input_tokens || 0);
+    // 命中率 = cache_read / (cache_read + 已计费 input)。input_tokens 已含折算后的 cache 量，作为近似分母。
+    var denom = cacheRead + inputTokens;
+    var rateEl = document.getElementById('statUsers');
+    var subEl = document.getElementById('statUsersSub');
+    if (cacheRead + cacheCreate > 0 && denom > 0) {
+      var rate = cacheRead / denom * 100;
+      rateEl.textContent = rate.toFixed(1) + '%';
+      subEl.textContent = '读 ' + cacheRead.toLocaleString() + ' / 写 ' + cacheCreate.toLocaleString();
+    } else {
+      rateEl.textContent = '—';
+      subEl.textContent = '暂无命中';
+    }
   } catch (err) {
     // 网络/服务器不可达时静默；下一次轮询自然重试
   } finally {

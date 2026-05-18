@@ -41,6 +41,8 @@ export interface TrendPoint {
   output_tokens: number;
   cost_cny: number;
   requests: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
 }
 
 export interface TrendData {

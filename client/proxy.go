@@ -1553,6 +1553,15 @@ func (s *ProxyServer) processRequestBody(r *http.Request) (model string, promptT
 		}
 	}
 
+	// Haiku 等非 reasoning 模型不接受 output_config.effort / thinking 字段，
+	// 上游会返回 400 invalid_reasoning_effort。剥离这些字段，避免调用方一刀切配置导致请求失败。
+	if stripped := stripReasoningForNonReasoningModel(reqData, model); stripped != "" {
+		if modified, err := json.Marshal(reqData); err == nil {
+			bodyBytes = modified
+			log.Printf("[proxy] rewrite: 模型 %s 不支持 reasoning，已剥离 %s (host=%s)", model, stripped, r.URL.Hostname())
+		}
+	}
+
 	// 仅对 OpenAI Chat Completions 类 API 注入 stream_options（含 include_usage）。
 	// Anthropic、GitHub Copilot（含 Claude 后端）等会拒绝未知字段，报 invalid_request_error。
 	if stream, ok := reqData["stream"].(bool); ok && stream {
@@ -1697,15 +1706,17 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		log.Printf("[usage] %s %s: reported model=%q prompt=%d completion=%d total=%d sourceApp=%q",
 			vendor, endpoint, model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, sourceApp)
 		s.reporter.Add(UsageRecord{
-			Vendor:           vendor,
-			Model:            model,
-			Endpoint:         endpoint,
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			TotalTokens:      usage.TotalTokens,
-			CostMultiplier:   s.githubCopilotDiscountMultiplier(model),
-			Source:           "client",
-			SourceApp:        sourceApp,
+			Vendor:              vendor,
+			Model:               model,
+			Endpoint:            endpoint,
+			PromptTokens:        usage.PromptTokens,
+			CompletionTokens:    usage.CompletionTokens,
+			TotalTokens:         usage.TotalTokens,
+			CacheReadTokens:     usage.CacheReadTokens,
+			CacheCreationTokens: usage.CacheCreationTokens,
+			CostMultiplier:      s.githubCopilotDiscountMultiplier(model),
+			Source:              "client",
+			SourceApp:           sourceApp,
 		})
 		return
 	}
@@ -2092,6 +2103,54 @@ func rewriteThinkingEnabled(reqData map[string]interface{}) bool {
 		reqData["output_config"] = map[string]interface{}{"effort": effort}
 	}
 	return true
+}
+
+// modelSupportsReasoning 粗判模型是否支持 reasoning（即 output_config.effort / thinking 字段）。
+// Anthropic 系：opus 4.x / sonnet 4.x 支持；haiku 全系列 + sonnet 3.x 及以前不支持。
+// 命中"不支持"返回 false；未知模型按"支持"放行，避免误伤。
+func modelSupportsReasoning(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return true
+	}
+	if strings.Contains(m, "haiku") {
+		return false
+	}
+	// claude-3*-sonnet / claude-sonnet-3* 等 3.x 不支持 reasoning
+	if strings.Contains(m, "claude-3") || strings.Contains(m, "sonnet-3") {
+		return false
+	}
+	return true
+}
+
+// stripReasoningForNonReasoningModel 对不支持 reasoning 的模型剥离 output_config.effort 与 thinking 字段。
+// 返回被剥离字段的描述（空字符串表示未改写）。
+func stripReasoningForNonReasoningModel(reqData map[string]interface{}, model string) string {
+	if modelSupportsReasoning(model) {
+		return ""
+	}
+	var stripped []string
+	if outCfg, ok := reqData["output_config"].(map[string]interface{}); ok {
+		if _, has := outCfg["effort"]; has {
+			delete(outCfg, "effort")
+			stripped = append(stripped, "output_config.effort")
+			if len(outCfg) == 0 {
+				delete(reqData, "output_config")
+			}
+		}
+	}
+	if _, ok := reqData["thinking"]; ok {
+		delete(reqData, "thinking")
+		stripped = append(stripped, "thinking")
+	}
+	if _, ok := reqData["reasoning_effort"]; ok {
+		delete(reqData, "reasoning_effort")
+		stripped = append(stripped, "reasoning_effort")
+	}
+	if len(stripped) == 0 {
+		return ""
+	}
+	return strings.Join(stripped, ", ")
 }
 
 // rewriteOutputConfigEffort 规范化 output_config.effort 字段。

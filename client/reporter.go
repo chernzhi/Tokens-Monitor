@@ -35,10 +35,12 @@ type UsageRecord struct {
 	Vendor           string  `json:"vendor"`
 	Model            string  `json:"model"`
 	Endpoint         string  `json:"endpoint"`
-	PromptTokens     int     `json:"prompt_tokens"`
-	CompletionTokens int     `json:"completion_tokens"`
-	TotalTokens      int     `json:"total_tokens"`
-	CostMultiplier   float64 `json:"cost_multiplier,omitempty"`
+	PromptTokens        int     `json:"prompt_tokens"`
+	CompletionTokens    int     `json:"completion_tokens"`
+	TotalTokens         int     `json:"total_tokens"`
+	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
+	CostMultiplier      float64 `json:"cost_multiplier,omitempty"`
 	RequestTime      string  `json:"request_time"`
 	// Source 上报来源：client 为 JSON 解析；client-mitm-estimate 为 gRPC/二进制体积估算。
 	Source string `json:"source,omitempty"`

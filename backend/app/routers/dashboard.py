@@ -103,6 +103,7 @@ async def get_overview(
                 active_users=0, avg_tokens_per_user=0, avg_cost_per_user=0.0,
                 exact_tokens=0, estimated_tokens=0, exact_requests=0,
                 estimated_requests=0, tokens_change_pct=None, cost_change_pct=None,
+                cache_read_tokens=0, cache_creation_tokens=0,
             )
         user_filter_ids = resolved
 
@@ -124,12 +125,16 @@ async def get_overview(
         func.coalesce(func.sum(case((TokenUsageLog.source == ESTIMATE_SOURCE, _request_count_expr()), else_=0)), 0),
         # 定价覆盖：排除估算流量后，cost_cny > 0 的 token 认为"已定价"
         func.coalesce(func.sum(case((((TokenUsageLog.source != ESTIMATE_SOURCE) & (TokenUsageLog.cost_cny > 0)), TokenUsageLog.total_tokens), else_=0)), 0),
+        func.coalesce(func.sum(TokenUsageLog.cache_read_tokens), 0),
+        func.coalesce(func.sum(TokenUsageLog.cache_creation_tokens), 0),
+        func.coalesce(func.sum(TokenUsageLog.input_tokens), 0),
+        func.coalesce(func.sum(TokenUsageLog.output_tokens), 0),
     ).where(TokenUsageLog.request_at.between(start_ts, end_ts))
     if user_filter_ids is not None:
         current_base = current_base.where(TokenUsageLog.user_id.in_(user_filter_ids))
     current_stmt = _apply_source_app_filter(current_base, source_app)
     cur = await db.execute(current_stmt)
-    tokens, cost, requests, users, estimated_tokens, estimated_requests, priced_tokens = cur.one()
+    tokens, cost, requests, users, estimated_tokens, estimated_requests, priced_tokens, cache_read, cache_create, in_tok, out_tok = cur.one()
     users_count = int(users or 0)
     exact_tokens = int(tokens) - int(estimated_tokens)
     exact_requests = int(requests) - int(estimated_requests)
@@ -167,6 +172,10 @@ async def get_overview(
         cost_change_pct=pct(cost, prev_cost),
         priced_tokens=max(priced_tokens_val, 0),
         unpriced_tokens=max(unpriced_tokens_val, 0),
+        cache_read_tokens=int(cache_read or 0),
+        cache_creation_tokens=int(cache_create or 0),
+        input_tokens=int(in_tok or 0),
+        output_tokens=int(out_tok or 0),
     )
 
 
@@ -189,6 +198,8 @@ async def get_trend(
             func.sum(TokenUsageLog.output_tokens),
             func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)),
             func.coalesce(func.sum(_request_count_expr()), 0),
+            func.coalesce(func.sum(TokenUsageLog.cache_read_tokens), 0),
+            func.coalesce(func.sum(TokenUsageLog.cache_creation_tokens), 0),
         )
         .where(TokenUsageLog.request_at.between(start_ts, end_ts))
         .group_by(dt)
@@ -200,10 +211,11 @@ async def get_trend(
     total_t = 0
     total_c = 0.0
     for row in result.all():
-        d, tt, it, ot, c, r = row
+        d, tt, it, ot, c, r, cr, cc = row
         points.append(TrendPoint(
             date=d.isoformat(), total_tokens=int(tt), input_tokens=int(it),
             output_tokens=int(ot), cost_cny=round(float(c), 2), requests=int(r),
+            cache_read_tokens=int(cr or 0), cache_creation_tokens=int(cc or 0),
         ))
         total_t += int(tt)
         total_c += float(c)

@@ -354,6 +354,14 @@ SYNC_INTERVAL_MINUTES=10
         else:
             print("  ⚠ 未找到 client/dist/ai-monitor.exe，跳过（请先运行 client\\build.ps1）")
 
+        # 分发包 zip（含 sing-box / 启动脚本 / ai-monitor.exe），由「打包-分发.bat」生成
+        installer = project_root / "dist" / "ai-monitor-分发版.zip"
+        if installer.is_file():
+            self.sftp.put(str(installer), f"{ext_remote}/ai-monitor-分发版.zip")
+            print("    ↑ extensions/ai-monitor-分发版.zip")
+        else:
+            print("  ⚠ 未找到 dist/ai-monitor-分发版.zip，跳过（请先运行 client\\打包-分发.bat）")
+
         print("  ✓ 分发物上传完成")
 
     def close(self):

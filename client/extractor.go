@@ -68,11 +68,16 @@ var modelHintValuePatterns = []*regexp.Regexp{
 }
 
 // UsageInfo holds extracted token usage from an AI API response.
+//
+// PromptTokens 已折算缓存权重，用于计费；CacheReadTokens / CacheCreationTokens
+// 是**原始**缓存命中量，仅用于观测/展示，不参与 total/成本计算。
 type UsageInfo struct {
-	Model            string
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
+	Model               string
+	PromptTokens        int
+	CompletionTokens    int
+	TotalTokens         int
+	CacheReadTokens     int // raw cache_read_input_tokens / cached_tokens
+	CacheCreationTokens int // raw cache_creation_input_tokens (Anthropic-only)
 }
 
 // ExtractUsage extracts token usage information from an AI API response body.
@@ -299,6 +304,7 @@ func extractOpenAI(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
 	}
 	// OpenAI 缓存折扣：cached_tokens 按 50% 计费，折算为等效 token 数
 	info.PromptTokens = openAIEffectiveInput(usage, info.PromptTokens)
+	info.CacheReadTokens += openAICachedTokens(usage)
 	return info
 }
 
@@ -308,9 +314,17 @@ func extractAnthropic(resp map[string]interface{}, info *UsageInfo) *UsageInfo {
 		return nil
 	}
 	info.PromptTokens = anthropicEffectiveInput(usage)
+	cr, cc := anthropicCacheBreakdown(usage)
+	info.CacheReadTokens += cr
+	info.CacheCreationTokens += cc
 	info.CompletionTokens = toInt(usage["output_tokens"])
 	info.TotalTokens = info.PromptTokens + info.CompletionTokens
 	return info
+}
+
+// anthropicCacheBreakdown 返回原始的缓存命中量（read, create），用于观测。
+func anthropicCacheBreakdown(usage map[string]interface{}) (read, create int) {
+	return toInt(usage["cache_read_input_tokens"]), toInt(usage["cache_creation_input_tokens"])
 }
 
 // anthropicEffectiveInput 把 Anthropic 的 input_tokens（含缓存命中）折算为等效正常输入 token 数，
@@ -476,6 +490,10 @@ func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 						info.PromptTokens = v
 						saw = true
 					}
+					if cr, cc := anthropicCacheBreakdown(u); cr > 0 || cc > 0 {
+						info.CacheReadTokens += cr
+						info.CacheCreationTokens += cc
+					}
 					if v := toInt(u["output_tokens"]); v > 0 && info.CompletionTokens == 0 {
 						info.CompletionTokens = v
 						saw = true
@@ -495,6 +513,11 @@ func mergeAnthropicSSE(events []sseEvent, modelHint string) *UsageInfo {
 				if v := anthropicEffectiveInput(u); v > 0 && info.PromptTokens == 0 {
 					info.PromptTokens = v
 					saw = true
+				}
+				if info.CacheReadTokens == 0 && info.CacheCreationTokens == 0 {
+					cr, cc := anthropicCacheBreakdown(u)
+					info.CacheReadTokens = cr
+					info.CacheCreationTokens = cc
 				}
 			}
 		case "content_block_delta":
@@ -548,6 +571,19 @@ func openAIEffectiveInput(usage map[string]interface{}, promptTokens int) int {
 		result = 1
 	}
 	return result
+}
+
+// openAICachedTokens 返回 OpenAI usage 中 cached_tokens 的原始计数（观测用）。
+func openAICachedTokens(usage map[string]interface{}) int {
+	if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+		if v := toInt(details["cached_tokens"]); v > 0 {
+			return v
+		}
+	}
+	if details, ok := usage["input_tokens_details"].(map[string]interface{}); ok {
+		return toInt(details["cached_tokens"])
+	}
+	return 0
 }
 
 func toInt(v interface{}) int {

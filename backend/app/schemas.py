@@ -21,6 +21,12 @@ class OverviewResponse(BaseModel):
     # 定价覆盖
     priced_tokens: int = 0
     unpriced_tokens: int = 0
+    # 缓存命中（仅观测，不参与 total_tokens 与成本）
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    # 输入/输出拆分（用于前端计算缓存命中率等指标）
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # === Trend ===
@@ -31,6 +37,8 @@ class TrendPoint(BaseModel):
     output_tokens: int
     cost_cny: float
     requests: int
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 class TrendResponse(BaseModel):

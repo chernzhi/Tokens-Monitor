@@ -75,6 +75,8 @@ class TokenUsageLog(Base):
     input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     total_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_creation_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     request_count: Mapped[int] = mapped_column(Integer, default=1)
     cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), default=0)
     cost_cny: Mapped[float] = mapped_column(Numeric(12, 4), default=0)

@@ -41,6 +41,8 @@ class UsageRecordIn(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
     request_time: str
     request_id: str | None = None
     source_app: str | None = None
@@ -470,6 +472,8 @@ async def collect_usage(
             input_tokens=effective_prompt_tokens,
             output_tokens=rec.completion_tokens,
             total_tokens=rec.total_tokens,
+            cache_read_tokens=max(0, int(rec.cache_read_tokens or 0)),
+            cache_creation_tokens=max(0, int(rec.cache_creation_tokens or 0)),
             request_count=1,
             cost_usd=cost_usd,
             cost_cny=cost_cny,

@@ -89,3 +89,19 @@ async def download_client():
         media_type="application/octet-stream",
         filename="ai-monitor.exe",
     )
+
+
+@router.get("/installer")
+async def download_installer():
+    """下载完整分发包（含 sing-box / 启动脚本 / ai-monitor.exe）。
+
+    文件位于 EXTENSION_DIR/ai-monitor-分发版.zip，由部署脚本上传。
+    """
+    filepath = EXTENSION_DIR / "ai-monitor-分发版.zip"
+    if not filepath.is_file():
+        raise HTTPException(404, "分发包未上传，请联系管理员")
+    return FileResponse(
+        filepath,
+        media_type="application/zip",
+        filename="ai-monitor-分发版.zip",
+    )
