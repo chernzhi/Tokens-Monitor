@@ -46,15 +46,9 @@ func runHealMode(configPath string) int {
 
 	fmt.Println("  [heal] 检测到 ai-monitor 已停止，但系统代理仍指向其端口，正在恢复…")
 	if runtime.GOOS == "windows" {
-		if st.PACFileSet {
-			// PAC 模式下不动 AutoConfigURL（PAC 自带 DIRECT 回退），只清环境变量。
-			restoreOrClearEnvVars(st)
-			fmt.Println("  [heal] 已清理用户级 HTTP_PROXY / HTTPS_PROXY；PAC 文件保留（自带 DIRECT 回退）。")
-		} else {
-			restoreWinInetProxyFromState(st)
-			restoreOrClearEnvVars(st)
-			fmt.Println("  [heal] 已恢复系统代理与用户级环境变量。")
-		}
+		restoreProxyFromState(st)
+		restoreOrClearEnvVars(st)
+		fmt.Println("  [heal] 已恢复系统代理/PAC 与用户级环境变量。")
 	}
 
 	// 残留 instance.json 一并清掉，避免下次启动时被当作活实例。
@@ -64,8 +58,11 @@ func runHealMode(configPath string) int {
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		clearInstallState()
 		fmt.Println("  [heal] 未找到 config.json，已清空 install_state（不会再次自动重建代理）。")
+	} else if st.SessionOnly {
+		clearInstallState()
+		fmt.Println("  [heal] 临时会话状态已清空。")
 	} else {
-		fmt.Println("  [heal] 提示：下次启动 ai-monitor 将自动重新接管代理。")
+		fmt.Println("  [heal] 提示：下次启动 ai-monitor 时才会临时接管代理，关闭后会恢复。")
 	}
 	return 0
 }

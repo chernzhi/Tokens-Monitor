@@ -57,6 +57,24 @@ func removeIDEProxy() {
 	}
 }
 
+func removeAIMonitorIDEProxy() int {
+	count := 0
+	for _, ide := range nonWindowsIDESettingsPaths() {
+		changed, err := unpatchAIMonitorIDESettings(ide.path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("    ⚠ %s: %v", ide.name, err)
+			}
+			continue
+		}
+		if changed {
+			fmt.Printf("    ✓ %s: %s\n", ide.name, ide.path)
+			count++
+		}
+	}
+	return count
+}
+
 func nonWindowsIDESettingsPaths() []idePath {
 	home, err := os.UserHomeDir()
 	if err != nil || strings.TrimSpace(home) == "" {

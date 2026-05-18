@@ -193,7 +193,6 @@ func TestSaveConfigWritesAnnotatedSingleConfig(t *testing.T) {
 		`// monitor_hosts: 完整精确监控域名表`,
 		`"api.openai.com": "openai"`,
 		`"suffix": ".openai.azure.com"`,
-		`"bypass_domains": [`,
 		`"report_opaque_traffic": true`,
 		`"install_system_proxy": false`,
 	} {
@@ -203,6 +202,9 @@ func TestSaveConfigWritesAnnotatedSingleConfig(t *testing.T) {
 	}
 	if strings.Contains(text, `"_说明_`) {
 		t.Fatalf("saved config should use // comments, got legacy _说明 fields:\n%s", text)
+	}
+	if strings.Contains(text, `"bypass_domains"`) {
+		t.Fatalf("saved config should not expose bypass_domains:\n%s", text)
 	}
 	loaded, err := LoadConfig(path)
 	if err != nil {
@@ -265,8 +267,8 @@ func TestConfigExampleListsBuiltinDomains(t *testing.T) {
 	if len(cfg.MonitorSuffixes) < len(aiWildcardDomains) {
 		t.Fatalf("config.example monitor_suffixes = %d, want at least %d", len(cfg.MonitorSuffixes), len(aiWildcardDomains))
 	}
-	if len(cfg.BypassDomains) < len(bypassDomains) {
-		t.Fatalf("config.example bypass_domains = %d, want at least %d", len(cfg.BypassDomains), len(bypassDomains))
+	if cfg.BypassDomains != nil {
+		t.Fatalf("config.example should not expose bypass_domains: %+v", cfg.BypassDomains)
 	}
 }
 

@@ -4,7 +4,7 @@
   "user_id": "chenzhi@otw.cn",
   "department": "公共技术部",
   "port": 18090,
-  "upstream_proxy": "http://127.0.0.1:8089",
+  "upstream_proxy": "",
   "install_system_proxy": true,
   "install_ide_proxy": false,
   "auth_token": "f6c80902de69d16b93b00c537bb83c6bf19850231ef069b9f19995ebc755c975"

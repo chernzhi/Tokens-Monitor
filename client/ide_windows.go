@@ -79,6 +79,29 @@ func removeIDEProxy() {
 	}
 }
 
+func removeAIMonitorIDEProxy() int {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return 0
+	}
+	count := 0
+	for _, ide := range ideSettingsPaths {
+		p := filepath.Join(appData, ide.relPath)
+		changed, err := unpatchAIMonitorIDESettings(p)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("    ⚠ %s: %v", ide.name, err)
+			}
+			continue
+		}
+		if changed {
+			fmt.Printf("    ✓ %s: %s\n", ide.name, p)
+			count++
+		}
+	}
+	return count
+}
+
 // patchIDESettings uses regex to update or insert proxy settings in a JSONC file.
 // This preserves comments, formatting, and all other settings.
 func patchIDESettings(path string, kvs []proxyKV) error {

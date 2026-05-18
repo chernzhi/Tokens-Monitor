@@ -121,10 +121,10 @@ func userFacingIDEProxyReinstallHint() string {
 // printMonitorModeHints 在监控运行时打印模式说明（避免 main 内变量名 runtime 遮蔽标准库）。
 func printMonitorModeHints() {
 	if runtime.GOOS == "windows" {
-		fmt.Println("  说明: 默认不修改系统代理；推荐双击「开始使用.bat」内的受管启动项。")
-		fmt.Println("        若必须接管整机代理，请使用「快速安装-系统代理.bat」或配置后双击「安装.bat」。")
+		fmt.Println("  说明: 本窗口打开期间仅临时启用 AI 域名白名单 PAC；关闭后恢复本机网络。")
+		fmt.Println("        不写用户级 HTTP_PROXY/HTTPS_PROXY；CLI 请用「开始使用.bat」内的受管启动项。")
 		return
 	}
-	fmt.Println("  说明: 默认不修改系统代理；推荐用 `--launch <程序>` 仅对子进程注入代理环境变量。")
+	fmt.Println("  说明: 推荐用 `--launch <程序>` 仅对子进程注入代理环境变量。")
 	fmt.Println("        若必须接管整机代理，请显式启用 install_system_proxy=true 或使用 --install-full（legacy 模式）。")
 }

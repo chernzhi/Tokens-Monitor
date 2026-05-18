@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_api_key_or_user_token, require_user_token
+from app.auth import lookup_active_user_by_identity, require_api_key_or_user_token, require_user_token
 from app.canonical import dashboard_tz, canonical_provider_key, source_app_display_name
 from app.config import settings
 from app.database import get_db
@@ -372,11 +372,13 @@ MAX_BATCH_SIZE = 500
 async def collect_usage(
     records: list[UsageRecordIn],
     db: AsyncSession = Depends(get_db),
-    auth_user: User = Depends(require_user_token),
+    auth_user: User | None = Depends(require_api_key_or_user_token),
 ):
     """Receive batched token usage records from client applications.
 
-    必须携带 `Authorization: Bearer <auth_token>`。匿名 / 仅 X-API-Key 已禁用，避免多用户与僵尸行问题。
+    - 首选 `Authorization: Bearer <auth_token>`：用量记入该登录用户。
+    - 或服务端配置了 COLLECT_API_KEY 且客户端携带有效 `X-API-Key`：用量按每条记录中的
+      `user_id`（必须与批次内一致）映射到已有用户（邮箱或工号）；无法映射则拒绝，不新建僵尸账号。
     """
     if len(records) > MAX_BATCH_SIZE:
         raise HTTPException(status_code=400, detail=f"batch too large (max {MAX_BATCH_SIZE})")
@@ -384,7 +386,28 @@ async def collect_usage(
         return {"status": "ok", "inserted": 0}
 
     pricing = await _get_pricing(db)
-    internal_user_id = auth_user.id
+    if auth_user is not None:
+        internal_user_id = auth_user.id
+    else:
+        owner_key = _normalize_identity_value(records[0].user_id)
+        if not owner_key:
+            raise HTTPException(
+                status_code=400,
+                detail="user_id required when authenticating with API key only",
+            )
+        resolved = await lookup_active_user_by_identity(db, owner_key)
+        if not resolved:
+            raise HTTPException(
+                status_code=403,
+                detail="unknown user for API key collect; user_id must match a registered email or employee_id",
+            )
+        internal_user_id = resolved.id
+        for rec in records:
+            if _normalize_identity_value(rec.user_id) != owner_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="all records must share the same user_id under API key authentication",
+                )
     inserted = 0
     skipped_duplicates = 0
     request_ids = [rec.request_id for rec in records if rec.request_id]
@@ -566,13 +589,22 @@ async def client_heartbeat(
     data: ClientHeartbeatIn,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    auth_user: User = Depends(require_user_token),
+    auth_user: User | None = Depends(require_api_key_or_user_token),
 ):
-    """Register or update a client's online status. 必须已登录；展示身份以 token 为准。"""
-    dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
-    display_department = _normalize_department_value(dept.name if dept else None)
-    display_user_id = _normalize_identity_value(auth_user.employee_id)
-    display_name = _normalize_identity_value(auth_user.name)
+    """Register or update a client's online status.
+
+    Bearer 登录：展示字段以服务端用户档案为准。
+    仅 API Key（或迁移宽限期）：展示字段取自请求 body。
+    """
+    if auth_user is not None:
+        dept = await db.get(Department, auth_user.department_id) if auth_user.department_id else None
+        display_department = _normalize_department_value(dept.name if dept else None)
+        display_user_id = _normalize_identity_value(auth_user.employee_id)
+        display_name = _normalize_identity_value(auth_user.name)
+    else:
+        display_department = _normalize_department_value(data.department)
+        display_user_id = _normalize_identity_value(data.user_id)
+        display_name = _normalize_identity_value(data.user_name)
 
     ip = request.client.host if request.client else None
 

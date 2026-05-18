@@ -35,7 +35,7 @@ type Config struct {
 	MonitorHosts map[string]string `json:"monitor_hosts,omitempty"`
 	// MonitorSuffixes 是完整的后缀/前缀+后缀监控规则。字段不存在时使用内置默认规则；字段存在时以配置为准。
 	MonitorSuffixes []MonitoredSuffix `json:"monitor_suffixes,omitempty"`
-	// BypassDomains 是完整的直连域名/通配列表。字段不存在时使用内置默认直连列表；字段存在时以配置为准，但本机回环保护会始终保留。
+	// BypassDomains 仅为兼容旧配置保留。新配置不再暴露该字段：系统 PAC 已采用 AI 域名白名单，未配置的域名默认不走 ai-monitor。
 	BypassDomains []string `json:"bypass_domains,omitempty"`
 	// ExtraMonitorHosts 精确主机名 → 供应商（与内置 aiDomains 合并，适合内网网关、新 API 域名）。
 	// Deprecated: 新配置请直接修改 monitor_hosts。
@@ -63,9 +63,8 @@ type Config struct {
 	APIKey string `json:"api_key,omitempty"`
 	// AuthToken 用户登录/注册后获取的个人认证令牌，上报时优先使用 Bearer 认证。
 	AuthToken string `json:"auth_token,omitempty"`
-	// ExtraBypassDomains 企业管理员可添加的额外直连域名/通配，与内置 bypassDomains 合并。
-	// 适合公司内网域名（如 "*.corp.company.com"）、VPN 地址等。
-	// Deprecated: 新配置请直接修改 bypass_domains。
+	// ExtraBypassDomains 仅为兼容旧配置保留。新配置不需要维护直连列表；系统 PAC 会让非监控域名走默认网络。
+	// Deprecated: 新配置请不要使用。
 	ExtraBypassDomains []string `json:"extra_bypass_domains,omitempty"`
 	// ReportProxy 上报服务器流量使用的代理。"auto" 或空值 = 智能判断（内网直连，外网走上游代理）；
 	// "direct" = 强制直连；"upstream" = 强制走 upstream_proxy；也可填具体代理地址。
@@ -362,7 +361,7 @@ func annotatedConfigEntries(cfg *Config) []configJSONEntry {
 		{"department", cfg.Department, "department: 部门名称，用于统计分组；可留空。"},
 		{"port", port, "port: 本机 MITM HTTP 代理监听端口，默认 18090；端口被占用时程序可能自动顺延。"},
 		{"gateway_port", cfg.GatewayPort, "gateway_port: 可选 API Gateway 端口。大于 0 时该端口只提供 /v1/* 与 /vendor/* 反向代理，不做 HTTPS MITM。"},
-		{"upstream_proxy", strings.TrimSpace(cfg.UpstreamProxy), "upstream_proxy: ai-monitor 访问外网 AI 服务时使用的上游代理。支持 http://、https://、socks5://；没有本地代理可留空。"},
+		{"upstream_proxy", strings.TrimSpace(cfg.UpstreamProxy), "upstream_proxy: 高级可选项。通常留空，让 ai-monitor 按本机默认网络直连；只有必须串接公司/本地代理时才填写。"},
 		{"report_proxy", strings.TrimSpace(cfg.ReportProxy), "report_proxy: 上报到 server_url 时使用的代理策略：auto 或空=自动判断，direct=直连，upstream=走 upstream_proxy，也可填写具体代理 URL。"},
 		{"install_system_proxy", boolConfigValue(cfg.InstallSystemProxy, false), "install_system_proxy: 为 true 时安装会写入 Windows 系统 PAC/代理，让浏览器、Visual Studio 等自动经过监控；默认 false 更保守。"},
 		{"install_ide_proxy", boolConfigValue(cfg.InstallIDEProxy, false), "install_ide_proxy: 为 true 时安装会写入 VS Code/Cursor 等 IDE 的 http.proxy 设置；通常保持 false，避免与系统代理重复。"},
@@ -372,7 +371,6 @@ func annotatedConfigEntries(cfg *Config) []configJSONEntry {
 		{"strict_policy_check", boolConfigValue(cfg.StrictPolicyCheck, true), "strict_policy_check: 为 true 时检测到公司策略级代理会拒绝全局安装，避免覆盖管理员策略；建议保持 true。"},
 		{"monitor_hosts", effectiveMonitorHosts(cfg), "monitor_hosts: 完整精确监控域名表。键是主机名，值是供应商标签；可直接增删改，删除后该精确域名不再 MITM。"},
 		{"monitor_suffixes", effectiveMonitorSuffixes(cfg), "monitor_suffixes: 完整后缀/前缀监控规则。suffix 必填，prefix 可选；用于 Azure/OpenAI、Bedrock、Cursor、Copilot 等通配域名。"},
-		{"bypass_domains", effectiveBypassDomains(cfg), "bypass_domains: 完整直连域名/通配列表，不经过 ai-monitor；本机回环 localhost/127.* 和链路本地 169.254.169.254 会强制保留，适合 GitHub、VS Code 更新、公司内网、VPN、文件服务器等。"},
 		{"api_key", strings.TrimSpace(cfg.APIKey), "api_key: 服务端如果配置了 COLLECT_API_KEY，可在这里填写；多数登录态场景留空即可。"},
 		{"auth_token", strings.TrimSpace(cfg.AuthToken), "auth_token: 用户登录/注册后得到的个人令牌，上报优先使用它。属于敏感信息，不要公开分享。"},
 		{"watchdog_interval_sec", cfg.EffectiveWatchdogInterval(), "watchdog_interval_sec: ai-monitor 进程内自检间隔秒数；默认 10。不是 Windows 计划任务，不会弹黑框。"},
@@ -408,31 +406,13 @@ func stringSliceConfigValue(v []string) []string {
 	return v
 }
 
-// ValidateAndHealConfig 检测关键配置字段是否缺失，并尝试从 install_state 恢复。
+// ValidateAndHealConfig 检测关键配置字段是否缺失。
 // 返回值是需要提示用户的警告信息列表。不会修改用户已手动配置的值。
 func ValidateAndHealConfig(cfg *Config, configPath string) []string {
 	if cfg == nil {
 		return nil
 	}
 	var warnings []string
-
-	// upstream_proxy 是国际 AI API 出口的关键字段，缺失会直接导致 Copilot/OpenAI 等不可用
-	if strings.TrimSpace(cfg.UpstreamProxy) == "" {
-		if st := loadInstallState(); st != nil && st.PreviousUpstreamProxy != "" {
-			cfg.UpstreamProxy = st.PreviousUpstreamProxy
-			if err := SaveConfig(cfg, configPath); err != nil {
-				warnings = append(warnings,
-					fmt.Sprintf("upstream_proxy 已从安装记录恢复到内存，但写入配置文件失败: %v", err))
-			} else {
-				warnings = append(warnings,
-					fmt.Sprintf("upstream_proxy 已从安装记录恢复 (%s)，并同步到配置文件", st.PreviousUpstreamProxy))
-			}
-		} else {
-			warnings = append(warnings,
-				"⚠ upstream_proxy 未设置：国际 AI API（Copilot / OpenAI / Anthropic 等）可能无法访问。"+
-					"请执行 ai-monitor.exe --setup 或在 config.json 中配置 upstream_proxy 字段。")
-		}
-	}
-
+	_ = configPath
 	return warnings
 }

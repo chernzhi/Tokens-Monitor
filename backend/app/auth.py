@@ -57,6 +57,23 @@ async def _lookup_user_by_token(token: str, db: AsyncSession) -> User | None:
     return result.scalar_one_or_none()
 
 
+async def lookup_active_user_by_identity(db: AsyncSession, identity: str) -> User | None:
+    """按邮箱或工号（employee_id）查找活跃用户，供仅 X-API-Key 的上报路径归并到既有账号。"""
+    normalized = (identity or "").strip()
+    if not normalized:
+        return None
+    result = await db.execute(
+        select(User).where(User.email == normalized, User.is_active == True)  # noqa: E712
+    )
+    user = result.scalar_one_or_none()
+    if user:
+        return user
+    result = await db.execute(
+        select(User).where(User.employee_id == normalized, User.is_active == True)  # noqa: E712
+    )
+    return result.scalar_one_or_none()
+
+
 async def require_user_token(request: Request, db: AsyncSession = Depends(get_db)) -> User:
     """用户 token 认证依赖。返回已认证的 User 对象。
 
@@ -80,11 +97,9 @@ async def require_api_key_or_user_token(
 ) -> User | None:
     """双重认证：接受 API Key 或用户 token。
 
-    - 有 Authorization: Bearer <token> 头 → 尝试用户 token 认证，成功返回 User
-    - 有 X-API-Key 头 → 走 API Key 认证，返回 None
-    - 都没有 → 若 API Key 处于宽限期则放行返回 None，否则 401
+    - Authorization: Bearer 非空时仅按用户 auth_token 校验；无效则立刻 401，不回落到 X-API-Key
+    - 未带 Bearer（或 Bearer 后 token 为空）时，再走 X-API-Key / 迁移宽限期
     """
-    # 优先尝试用户 token
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
@@ -94,7 +109,6 @@ async def require_api_key_or_user_token(
                 return user
             raise HTTPException(status_code=401, detail="invalid_token")
 
-    # fallback 到 API Key
     global _api_key_warned
     if not settings.COLLECT_API_KEY:
         if not _api_key_warned:

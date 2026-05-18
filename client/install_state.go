@@ -16,9 +16,8 @@ type InstallState struct {
 	PreviousProxyEnabled bool   `json:"previous_proxy_enabled"`
 	IDESettingsPatched   bool   `json:"ide_settings_patched"`
 	Timestamp            string `json:"timestamp"`
-	// PreviousUpstreamProxy is the upstream proxy detected BEFORE install overwrote
-	// system proxy / env vars. Used at runtime as a fallback in detectUpstreamProxy
-	// so that the proxy chain is not broken after installation.
+	// PreviousUpstreamProxy stores an explicitly configured upstream proxy, if any.
+	// Empty means ai-monitor should use the machine's normal network path directly.
 	PreviousUpstreamProxy string            `json:"previous_upstream_proxy,omitempty"`
 	PreviousEnvVars       map[string]string `json:"previous_env_vars,omitempty"`
 	// PAC-based proxy (v2.2+). When PACFileSet is true, system proxy is
@@ -43,6 +42,9 @@ type InstallState struct {
 	PortAtInstall int `json:"port_at_install,omitempty"`
 	// Version tracks the install_state schema version for upgrade migration.
 	Version int `json:"version,omitempty"`
+	// SessionOnly marks temporary state created by a normal foreground run.
+	// It is kept only so --heal can recover after a crash; graceful shutdown clears it.
+	SessionOnly bool `json:"session_only,omitempty"`
 }
 
 func installStatePath() string {

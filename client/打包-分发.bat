@@ -50,11 +50,17 @@ if not exist "%OUT%\ai-monitor.exe" (
 
 copy /Y "%~dp0卸载.bat" "%OUT%\" >nul
 copy /Y "%~dp0修复网络.bat" "%OUT%\" >nul
+copy /Y "%~dp0开始使用.bat" "%OUT%\" >nul
+copy /Y "%~dp0低侵入监控.bat" "%OUT%\" >nul
+copy /Y "%~dp0启动-VSCode监控.bat" "%OUT%\" >nul
+copy /Y "%~dp0启动-Cursor监控.bat" "%OUT%\" >nul
+copy /Y "%~dp0启动-PowerShell监控.bat" "%OUT%\" >nul
+copy /Y "%~dp0启动-CMD监控.bat" "%OUT%\" >nul
 copy /Y "%~dp0config.example.json" "%OUT%\" >nul
 copy /Y "%~dp0使用说明.md" "%OUT%\" >nul
 
 echo   ✓ 完成
-echo   分发包只包含: ai-monitor.exe、卸载.bat、修复网络.bat、config.example.json、使用说明.md
+echo   分发包包含 ai-monitor.exe、低侵入启动器、受管启动器、卸载/修复脚本、配置模板和说明文档
 echo   请将文件夹「ai-monitor-分发版」打成 zip 发给同事。
 echo   提醒：不要附带仓库里的 config.json（真实配置）。
 echo.

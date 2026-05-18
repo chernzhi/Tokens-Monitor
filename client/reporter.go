@@ -344,10 +344,12 @@ func (r *Reporter) postJSONRetry(path string, body []byte) (*http.Response, erro
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-		if r.cfg.AuthToken != "" {
-			req.Header.Set("Authorization", "Bearer "+r.cfg.AuthToken)
-		} else if r.cfg.APIKey != "" {
-			req.Header.Set("X-API-Key", r.cfg.APIKey)
+		at := strings.TrimSpace(r.cfg.AuthToken)
+		ak := strings.TrimSpace(r.cfg.APIKey)
+		if at != "" {
+			req.Header.Set("Authorization", "Bearer "+at)
+		} else if ak != "" {
+			req.Header.Set("X-API-Key", ak)
 		}
 		client := r.pickClient()
 		resp, err := client.Do(req)

@@ -14,8 +14,8 @@
   "port": 18090,
   // gateway_port: 可选 API Gateway 端口。大于 0 时该端口只提供 /v1/* 与 /vendor/* 反向代理，不做 HTTPS MITM。
   "gateway_port": 0,
-  // upstream_proxy: ai-monitor 访问外网 AI 服务时使用的上游代理。支持 http://、https://、socks5://；没有本地代理可留空。
-  "upstream_proxy": "http://127.0.0.1:8089",
+  // upstream_proxy: 高级可选项。通常留空，让 ai-monitor 按本机默认网络直连；只有必须串接公司/本地代理时才填写。
+  "upstream_proxy": "",
   // report_proxy: 上报到 server_url 时使用的代理策略：auto 或空=自动判断，direct=直连，upstream=走 upstream_proxy，也可填写具体代理 URL。
   "report_proxy": "",
   // install_system_proxy: 为 true 时安装会写入 Windows 系统 PAC/代理，让浏览器、Visual Studio 等自动经过监控；默认 false 更保守。
@@ -125,50 +125,6 @@
     { "suffix": ".qwen.ai", "vendor": "qwen" },
     { "suffix": ".qoder.sh", "vendor": "qoder" },
     { "suffix": ".qoder.com", "vendor": "qoder" }
-  ],
-  // bypass_domains: 完整直连域名/通配列表，不经过 ai-monitor；本机回环 localhost/127.* 和链路本地 169.254.169.254 会强制保留，适合 GitHub、VS Code 更新、公司内网、VPN、文件服务器等。
-  "bypass_domains": [
-    "localhost",
-    "localhost.localdomain",
-    "127.0.0.1",
-    "127.*",
-    "::1",
-    "[::1]",
-    "169.254.169.254",
-    "10.*",
-    "192.168.*",
-    "172.16.*",
-    "172.17.*",
-    "172.18.*",
-    "172.19.*",
-    "172.20.*",
-    "172.21.*",
-    "172.22.*",
-    "172.23.*",
-    "172.24.*",
-    "172.25.*",
-    "172.26.*",
-    "172.27.*",
-    "172.28.*",
-    "172.29.*",
-    "172.30.*",
-    "172.31.*",
-    "169.254.*",
-    "*.local",
-    "*.vscode-cdn.net",
-    "*.gallery.vsassets.io",
-    "marketplace.visualstudio.com",
-    "*.vsassets.io",
-    "vscodeexperiments.azureedge.net",
-    "az764295.vo.msecnd.net",
-    "*.vo.msecnd.net",
-    "*.vscode-unpkg.net",
-    "vscode.blob.core.windows.net",
-    "default.exp-tas.com",
-    "login.microsoftonline.com",
-    "*.microsoftonline.com",
-    "github.com",
-    "*.github.com"
   ],
   // api_key: 服务端如果配置了 COLLECT_API_KEY，可在这里填写；多数登录态场景留空即可。
   "api_key": "",

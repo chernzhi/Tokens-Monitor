@@ -236,9 +236,9 @@ const webWizardHTML = `<!DOCTYPE html>
     <div class="advanced-toggle"><a onclick="toggleAdvanced()">▶ 高级选项</a></div>
     <div class="advanced" id="advancedSection">
       <div class="field">
-        <label>上游代理（可选）</label>
-        <input id="upstreamProxy" type="text" placeholder="如 socks5://127.0.0.1:7890（访问外网用的代理）" />
-        <div class="hint">如果你的电脑需要代理才能上外网，在此填写代理地址</div>
+        <label>上游代理（高级，可选）</label>
+        <input id="upstreamProxy" type="text" placeholder="通常留空；必须串接公司/本地代理时才填写" />
+        <div class="hint">默认不依赖上游地址，按本机网络直连</div>
       </div>
       <div class="field">
         <label>监听端口</label>
@@ -704,54 +704,7 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		}
 		_ = os.Remove(filepath.Join(appDataDir(), "identity.json"))
 
-		// Run global install (CA + env vars + auto-start)
 		var messages []string
-
-		// Step 0: Detect existing upstream proxy BEFORE overwriting.
-		// Re-install guard: if install_state already exists with SystemProxySet,
-		// reuse its Previous* fields to avoid polluting them with our own values.
-		existingSt := loadInstallState()
-		var detectedUpstream, previousSysProxy string
-		var previousEnvVars map[string]string
-		var previousAutoConfigURL, previousProxyOverride string
-		var previousAutoDetect uint32
-		var previousAutoDetectPresent bool
-		var previousPACBody string
-
-		if existingSt != nil && existingSt.SystemProxySet {
-			previousSysProxy = existingSt.PreviousProxyAddr
-			previousEnvVars = existingSt.PreviousEnvVars
-			previousAutoConfigURL = existingSt.PreviousAutoConfigURL
-			previousProxyOverride = existingSt.PreviousProxyOverride
-			previousAutoDetect = existingSt.PreviousAutoDetect
-			previousAutoDetectPresent = existingSt.PreviousAutoDetectPresent
-			previousPACBody = existingSt.PreviousAutoConfigURLBody
-			detectedUpstream = existingSt.PreviousUpstreamProxy
-			if detectedUpstream == "" {
-				detectedUpstream = detectUpstreamProxy(cfg)
-			}
-		} else {
-			detectedUpstream = detectUpstreamProxy(cfg)
-			previousSysProxy = readCurrentSystemProxy()
-			previousEnvVars = snapshotProxyEnvVars()
-			previousAutoConfigURL = ReadCurrentAutoConfigURL()
-			previousProxyOverride = readCurrentProxyOverride()
-			previousAutoDetect, previousAutoDetectPresent = readCurrentAutoDetect()
-			if previousAutoConfigURL != "" && cfg.EffectiveChainExistingPAC() {
-				if body, err := fetchPACBody(previousAutoConfigURL); err == nil {
-					previousPACBody = body
-				}
-			}
-		}
-
-		if detectedUpstream != "" {
-			messages = append(messages, fmt.Sprintf("ℹ 检测到已有代理: %s（将作为上游保留）", detectedUpstream))
-			if strings.TrimSpace(cfg.UpstreamProxy) == "" {
-				cfg.UpstreamProxy = detectedUpstream
-				// Re-save config with upstream_proxy
-				_ = SaveConfig(cfg, absConfigPath)
-			}
-		}
 
 		// 1. Install CA
 		if err := certMgr.InstallCA(); err != nil {
@@ -760,85 +713,11 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 			messages = append(messages, "✓ CA 证书已安装")
 		}
 
-		// 2. Set user-level env vars + system proxy
-		actualPort := resolveActualPort(cfg)
-		proxyAddr := fmt.Sprintf("127.0.0.1:%d", actualPort)
-		httpProxy := "http://" + proxyAddr
-		noProxy := buildNoProxyEnvWithConfig(cfg)
-		envVars := map[string]string{
-			"HTTP_PROXY":           httpProxy,
-			"HTTPS_PROXY":          httpProxy,
-			"NO_PROXY":             noProxy,
-			"http_proxy":           httpProxy,
-			"https_proxy":          httpProxy,
-			"no_proxy":             noProxy,
-			"NODE_EXTRA_CA_CERTS":  certMgr.CACertPath(),
-			"SSL_CERT_FILE":        certMgr.CACertPath(),
-			"CODEX_CA_CERTIFICATE": certMgr.CACertPath(),
-		}
-		if err := SetEnvProxy(envVars); err != nil {
-			messages = append(messages, "⚠ 环境变量设置失败: "+err.Error())
-		} else {
-			messages = append(messages, "✓ 环境变量已设置 (HTTP_PROXY 等)")
-		}
-
-		// 2b. System proxy via PAC (Windows only)
-		if runtime.GOOS == "windows" {
-			pacURL, pacErr := writePACFile(actualPort, cfg, previousPACBody)
-			saveInstallState(&InstallState{
-				SystemProxySet:            true,
-				PreviousProxyAddr:         previousSysProxy,
-				PreviousProxyEnabled:      previousSysProxy != "" && !isSelfProxy(previousSysProxy),
-				PreviousUpstreamProxy:     detectedUpstream,
-				PreviousEnvVars:           previousEnvVars,
-				PACFileSet:                true,
-				PACFilePath:               pacFilePath(),
-				PreviousAutoConfigURL:     previousAutoConfigURL,
-				PreviousAutoConfigURLBody: previousPACBody,
-				PreviousProxyOverride:     previousProxyOverride,
-				PreviousAutoDetect:        previousAutoDetect,
-				PreviousAutoDetectPresent: previousAutoDetectPresent,
-				PortAtInstall:             actualPort,
-				Version:                   3,
-			})
-			if pacErr != nil {
-				messages = append(messages, "⚠ PAC 文件生成失败: "+pacErr.Error())
-			} else if err := EnableSystemProxyPAC(pacURL); err != nil {
-				messages = append(messages, "⚠ 系统代理 (PAC) 设置失败: "+err.Error())
-			} else {
-				messages = append(messages, "✓ 系统代理已设置 (PAC + DIRECT 回退，异常时不断网)")
-			}
-		} else {
-			messages = append(messages, "ℹ 系统代理 (PAC) 仅 Windows 支持，已跳过")
-			messages = append(messages, "  → 请使用 --launch 模式或手动配置应用代理指向 "+proxyAddr)
-		}
-
-		// 3. Register auto-start (Windows only)
-		if runtime.GOOS == "windows" {
-			if err := installAutoStart(absConfigPath); err != nil {
-				messages = append(messages, "⚠ 开机自启注册失败: "+err.Error())
-			} else {
-				messages = append(messages, "✓ 已注册开机自启")
-			}
-		} else {
-			messages = append(messages, "ℹ 开机自启仅 Windows 支持，已跳过")
-		}
-
-		// 4. Start background instance (Windows only)
-		if runtime.GOOS == "windows" {
-			if _, alive := checkExistingInstance(); !alive {
-				if err := startBackgroundInstance(absConfigPath); err != nil {
-					messages = append(messages, "⚠ 后台启动失败: "+err.Error())
-				} else {
-					messages = append(messages, "✓ ai-monitor 已在后台启动")
-				}
-			} else {
-				messages = append(messages, "✓ ai-monitor 已在运行中")
-			}
-		}
+		messages = append(messages, "✓ 已保存低侵入配置")
+		messages = append(messages, "✓ 未写入系统代理 / 用户环境变量 / IDE settings / 开机自启")
 
 		messages = append(messages, "")
-		messages = append(messages, "重新打开 IDE 和终端即可生效。")
+		messages = append(messages, "后续通过 低侵入监控.bat 或 启动-VSCode监控.bat / 启动-Cursor监控.bat 打开监控。")
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(setupResponse{

@@ -10,7 +10,7 @@ import (
 )
 
 // detectUpstreamProxy discovers the user's existing proxy before ai-monitor sets itself up.
-// Priority: explicit config > Windows system proxy registry > environment variables > install_state saved proxy.
+// Priority: explicit config > Windows system proxy registry > environment variables.
 // Returns "" if no upstream proxy is found or all candidates are self-referential.
 func detectUpstreamProxy(cfg *Config) string {
 	// 1. Explicit config takes highest priority (already validated by LoadConfig)
@@ -50,16 +50,6 @@ func detectUpstreamProxy(cfg *Config) string {
 		}
 		log.Printf("[upstream] auto-detected env %s: %s", key, v)
 		return v
-	}
-
-	// 4. Fallback: install_state.json saved the upstream before install overwrote everything.
-	// This handles the case where system proxy + env vars now all point to ai-monitor.
-	// 同样做 TCP 可达性探测，避免上次安装时保存的本地代理已停止运行而影响上报。
-	if state := loadInstallState(); state != nil && state.PreviousUpstreamProxy != "" {
-		if !isSelfProxy(state.PreviousUpstreamProxy) && isUsableDetectedProxy(state.PreviousUpstreamProxy) {
-			log.Printf("[upstream] recovered from install_state: %s", state.PreviousUpstreamProxy)
-			return state.PreviousUpstreamProxy
-		}
 	}
 
 	return ""
