@@ -61,10 +61,21 @@ func main() {
 	setup := flag.Bool("setup", false, "傻瓜式配置向导：生成 config.json 并安装证书/代理")
 	heal := flag.Bool("heal", false, "自愈：如果上次 ai-monitor 崩溃/被杀导致系统代理指向 dead 端口，还原原始网络配置")
 	cleanupNetwork := flag.Bool("cleanup-network", false, "低侵入清理：停止后台实例，恢复系统代理/环境变量，移除 ai-monitor 写入的 IDE 代理，并清空 upstream_proxy")
+	withSessionPAC := flag.Bool("with-session-pac", false, "本次会话临时写一次 AI 域名 PAC（关闭程序时自动还原）；不显式指定则按 config.auto_install_session_pac 决定，默认观察模式不动系统代理")
 	defaultConfigPath := filepath.Join(appDataDir(), "config.json")
 	configPath := flag.String("config", defaultConfigPath, "配置文件路径")
 	showVersion := flag.Bool("version", false, "显示版本号并退出")
 	flag.Parse()
+	defaultRunMode := !*install &&
+		!*globalInstall &&
+		!*globalUninstall &&
+		!*launch &&
+		!*listLaunchPresets &&
+		strings.TrimSpace(*launchPreset) == "" &&
+		!*uninstall &&
+		!*setup &&
+		!*heal &&
+		!*cleanupNetwork
 
 	if *showVersion {
 		fmt.Println(Version)
@@ -129,7 +140,7 @@ func main() {
 
 	// When no config exists and no explicit flags are given, launch the web wizard automatically.
 	// This handles the "double-click ai-monitor.exe" scenario for first-time users.
-	if !*install && !*launch && strings.TrimSpace(*launchPreset) == "" && !*listLaunchPresets {
+	if defaultRunMode {
 		if _, err := os.Stat(*configPath); os.IsNotExist(err) {
 			fmt.Println("  未找到 config.json，正在打开安装向导...")
 			if err := runWebWizard(*configPath, certMgr); err != nil {
@@ -180,6 +191,12 @@ func main() {
 	}
 
 	// ── Normal run ──
+	// 启动前先做一次「幽灵 session_only 状态」体检：如果上次异常退出留下
+	// install_state.session_only=true，但当前注册表里实际已没有对应的
+	// AutoConfigURL / ProxyServer，就清掉它——避免下次启动时把"幽灵"快照
+	// 当成"用户原 PAC"还原回去（A3 修的污染源头的入口侧防护）。
+	pruneGhostInstallState()
+
 	// Singleton check: if a healthy instance already exists, don't start a second one.
 	existingPort, alive := checkExistingInstance()
 	if alive {
@@ -196,25 +213,60 @@ func main() {
 	if err := writeInstanceInfo(runtime.listenPort); err != nil {
 		log.Printf("[singleton] 写入 instance.json 失败: %v", err)
 	}
-	if !applySessionManagedProxy(cfg, certMgr, runtime.listenPort) {
+
+	// 三段式接管模式（优先级从高到低）：
+	//   1) 已有持久化安装（install_state.SystemProxySet 且非 SessionOnly）
+	//      → applySessionManagedProxy 重应用 PAC + 用户级环境变量
+	//   2) 用户显式要求本次写一次 PAC：--with-session-pac 或 config.auto_install_session_pac=true
+	//      → applyTemporarySessionProxy 仅本会话写 PAC，关闭时还原
+	//   3) 默认观察模式：完全不动系统设置；只有显式指向本机端口的流量被监控
+	takeoverMode := "observe"
+	if applySessionManagedProxy(cfg, certMgr, runtime.listenPort) {
+		takeoverMode = "persistent"
+	} else if *withSessionPAC || cfg.EffectiveAutoInstallSessionPAC() {
 		applyTemporarySessionProxy(cfg, certMgr, runtime.listenPort)
+		takeoverMode = "session"
 	}
+	runtime.SetTakeoverMode(takeoverMode)
+
+	// 接管模式真的写了系统 PAC / 环境变量时（session 或 persistent），Electron 编辑器
+	// 已运行的实例不会动态拾取代理变更——必须重启进程才行。这里友好询问是否帮用户
+	// 处理。observe 模式不接管系统，重启反而徒劳，跳过。
+	if takeoverMode == "session" || takeoverMode == "persistent" {
+		runningEditors := detectRunningElectronEditors(func(image string) bool {
+			ok, _ := isProcessImageRunning(image)
+			return ok
+		})
+		if len(runningEditors) > 0 {
+			interactive := stdinIsInteractive()
+			if promptRestartElectronEditors(runningEditors, os.Stdin, os.Stdout, interactive) {
+				killAndRelaunchEditors(runningEditors, os.Stdout)
+			}
+		}
+	}
+
 	startSelfWatchdog(runtime.listenPort, cfg)
 	if runtime.listenPort != cfg.Port {
 		log.Printf("[提示] 配置端口 %d 已被占用，已自动改用 %d（定向启动应用时请指向新端口）", cfg.Port, runtime.listenPort)
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown.
+	// 超时从 5s 调整到 8s：实测在 install_state 较复杂（持久 PAC + 用户级 env）
+	// 时，server.Shutdown + restoreSessionManagedProxyOnShutdown 串行下还原
+	// 注册表 + setx 写两套 key 偶尔会在 6s 左右才完成。给一点 buffer 避免
+	// 极端情况下用户网络残留我们的写入。
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		fmt.Println("\n  正在关闭...")
 		removeInstanceInfo()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		runtime.Shutdown(ctx)
 	}()
+
+	printTakeoverBanner(takeoverMode)
 
 	fmt.Printf("  用户: %s (%s) | 部门: %s\n", cfg.UserName, cfg.UserID, cfg.Department)
 	fmt.Printf("  本地 MITM (拦截 AI 流量): %s\n", runtime.proxyAddr)
@@ -226,8 +278,8 @@ func main() {
 		len(effectiveMonitorHosts(cfg)), len(effectiveMonitorSuffixes(cfg)))
 	fmt.Printf("  CA 证书: %s\n", certMgr.CACertPath())
 	fmt.Println()
-	fmt.Println("  说明: 本窗口打开期间仅临时启用 AI 域名白名单 PAC；关闭后恢复本机网络。")
-	fmt.Println("        不再写用户级 HTTP_PROXY/HTTPS_PROXY；CLI 工具请用 `--launch <程序>` 受管启动。")
+	printTakeoverHint(takeoverMode, cfg)
+	printTakeoverModeQuickRef()
 	fmt.Println("        经 MITM 的请求会尽量记录用量（免费额度与付费调用均尝试统计，不按计费类型过滤）；JSON 有 usage 为 [记录]，gRPC 多为 [记录·估算]。")
 	fmt.Println("  扩展: config.json 可设 extra_monitor_*；report_opaque_traffic=false 可关闭体积估算。")
 	if runtime.gatewayPort > 0 {
@@ -235,6 +287,9 @@ func main() {
 	}
 	fmt.Printf("  配置页面: http://127.0.0.1:%d/wizard\n", runtime.listenPort)
 	fmt.Println()
+	if defaultRunMode {
+		openBrowser(fmt.Sprintf("http://127.0.0.1:%d/wizard", runtime.listenPort))
+	}
 	fmt.Println("  等待 AI 请求中... (Ctrl+C 退出)")
 	fmt.Println("  " + strings.Repeat("─", 55))
 
@@ -851,7 +906,8 @@ func restoreOrClearEnvVars(state *InstallState) {
 			ClearEnvProxy(toClear)
 		}
 	} else {
-		ClearEnvProxy(keysToManage)
+		// 无安装快照时仅清理指向 ai-monitor 的残留，避免误删用户自己的代理环境变量。
+		clearSelfProxyEnvVars()
 	}
 }
 
@@ -948,12 +1004,24 @@ func applyTemporarySessionProxy(cfg *Config, certMgr *CertManager, listenPort in
 	}
 	previousSysProxy := readCurrentSystemProxy()
 	previousAutoConfigURL := ReadCurrentAutoConfigURL()
+	// 自污染防护：如果当前注册表里残留的 AutoConfigURL 本来就是 ai-monitor 自己
+	// 上次写入的 PAC URL（例如上次 taskkill /F 后 install_state 没清干净），就不能
+	// 把它当作「用户原本的 PAC」快照下来——否则关闭 ai-monitor 时还原回这个
+	// 已删除/即将删除的 PAC URL，用户网络会永远绑在我们的孤儿配置上。
+	if isAIMonitorPACURL(previousAutoConfigURL) {
+		log.Printf("[session] 检测到上次残留的 ai-monitor PAC URL: %s，视为无原 PAC。", previousAutoConfigURL)
+		previousAutoConfigURL = ""
+	}
+	if isSelfProxy(previousSysProxy) {
+		log.Printf("[session] 检测到系统手动代理仍指向 ai-monitor 自身: %s，视为无原代理。", previousSysProxy)
+		previousSysProxy = ""
+	}
 	previousEnvVars := snapshotProxyEnvVars()
 	previousProxyOverride := readCurrentProxyOverride()
 	previousAutoDetect, previousAutoDetectPresent := readCurrentAutoDetect()
 	previousPACBody := ""
 	if previousAutoConfigURL != "" && cfg.EffectiveChainExistingPAC() {
-		if body, err := fetchPACBody(previousAutoConfigURL); err == nil {
+		if body, err := fetchPACBody(previousAutoConfigURL); err == nil && !isAIMonitorPACBody(body) {
 			previousPACBody = body
 		}
 	}
@@ -990,17 +1058,135 @@ func applyTemporarySessionProxy(cfg *Config, certMgr *CertManager, listenPort in
 	fmt.Println("  [会话] 已确保用户级 HTTP(S)_PROXY 不指向 ai-monitor，减少全局网络影响。")
 }
 
+// clearSelfProxyEnvVars 扫描当前进程环境 *和* 用户级注册表（HKCU\Environment），
+// 把指向 ai-monitor 自己的旧值清除：
+//   - http://127.0.0.1:<MITM 端口范围> 等 isSelfProxy 命中的代理
+//   - 已知由 ai-monitor 写入的 NODE_EXTRA_CA_CERTS / CODEX_CA_CERTIFICATE 路径
+//
+// 历史 Bug：之前 v 与 userV 都调用 os.Getenv，注册表残留永远清不掉，导致
+// 旧 --global-install 留下的 HTTP_PROXY 在卸载后仍指向已 dead 的 18090 端口，
+// npm / pip / curl 全线超时。
 func clearSelfProxyEnvVars() {
+	seen := make(map[string]struct{}, len(proxyEnvKeys))
 	var toClear []string
+	add := func(key string) {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		toClear = append(toClear, key)
+	}
+
 	for _, key := range proxyEnvKeys {
-		v := strings.TrimSpace(os.Getenv(key))
-		userV := strings.TrimSpace(os.Getenv(key))
-		if isSelfProxy(v) || isSelfProxy(userV) || strings.Contains(strings.ToLower(v), "127.0.0.1:18090/") || strings.Contains(strings.ToLower(userV), "127.0.0.1:18090/") {
-			toClear = append(toClear, key)
+		procV := strings.TrimSpace(os.Getenv(key))
+		userV := strings.TrimSpace(ReadUserLevelEnv(key))
+		if isAIMonitorManagedEnvValue(procV) || isAIMonitorManagedEnvValue(userV) {
+			add(key)
 		}
 	}
 	if len(toClear) > 0 {
 		ClearEnvProxy(toClear)
+	}
+}
+
+// pruneGhostInstallState 在主流程开始前清理「会话残留」的 install_state。
+//
+// 触发场景：上一次 ai-monitor 以「会话 PAC 模式」启动并写了 install_state.json，
+// 但进程被 taskkill /F、断电、Windows 直接关机等方式强制结束，没有跑到优雅
+// 退出的 restoreSessionManagedProxyOnShutdown。此时下次启动会读到一份
+//
+//	{ "system_proxy_set": true, "session_only": true, ... }
+//
+// 而注册表里实际上要么已经被「修复网络.bat」清干净，要么从未真正写入。
+// 如果不剪掉，applyTemporarySessionProxy 仍会把当前注册表内容（甚至 ai-monitor
+// 自己的旧 PAC URL）当作"用户原 PAC"再次快照下来，形成自污染。
+//
+// 安全准则：仅在 install_state 标记为 SessionOnly 且当前注册表里没有任何
+// AutoConfigURL / 自指 ProxyServer 时才清空；不会动持久化安装的 install_state。
+func pruneGhostInstallState() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	st := loadInstallState()
+	if st == nil || !st.SessionOnly {
+		return
+	}
+	currentPAC := ReadCurrentAutoConfigURL()
+	currentSys := readCurrentSystemProxy()
+	hasOwnTakeover := isAIMonitorPACURL(currentPAC) || isSelfProxy(currentSys)
+	hasUserPAC := currentPAC != "" && !isAIMonitorPACURL(currentPAC)
+	hasUserSys := currentSys != "" && !isSelfProxy(currentSys)
+	if !hasOwnTakeover && !hasUserPAC && !hasUserSys {
+		// 既没我们的接管痕迹，也没用户原配置——这份 SessionOnly 状态完全失效。
+		log.Println("[session] 检测到上一次会话异常退出残留的 install_state，已清理（注册表已无对应接管）。")
+		clearInstallState()
+	}
+}
+
+// printTakeoverBanner 在启动信息上方打印一段「当前接管模式」横幅，
+// 让用户一眼能区分 ai-monitor 现在是否真的动了系统设置。
+func printTakeoverBanner(mode string) {
+	switch mode {
+	case "persistent":
+		fmt.Println("  ┌────────────────────────────────────────────────────────────┐")
+		fmt.Println("  │ 接管模式: [持久安装] 系统 PAC + 用户级环境变量已重应用     │")
+		fmt.Println("  │ 关闭程序后仅 dead 端口风险由 watchdog/--heal 兜底          │")
+		fmt.Println("  │ 使用: 新开终端/多数软件易自动走监控；停用请 --global-uninstall  │")
+		fmt.Println("  └────────────────────────────────────────────────────────────┘")
+	case "session":
+		fmt.Println("  ┌────────────────────────────────────────────────────────────┐")
+		fmt.Println("  │ 接管模式: [本会话 PAC] AI 域名走 MITM，其他流量保持原状    │")
+		fmt.Println("  │ 关闭本程序时自动还原系统代理/环境变量                      │")
+		fmt.Println("  │ 使用: 推荐日常；Electron IDE 改 PAC 后建议重启或用向导启动   │")
+		fmt.Println("  └────────────────────────────────────────────────────────────┘")
+	default:
+		fmt.Println("  ┌────────────────────────────────────────────────────────────┐")
+		fmt.Println("  │ 接管模式: [观察]  未修改系统代理 / 环境变量 / IDE 配置     │")
+		fmt.Println("  │ 仅监听本地端口；只有 --launch 子进程或显式指向本端口的     │")
+		fmt.Println("  │ 流量会被监控。Cursor/VS Code/浏览器 等不受影响。           │")
+		fmt.Println("  │ 使用: 不改系统；浏览器/IDE 默认路径一般不经过监控          │")
+		fmt.Println("  └────────────────────────────────────────────────────────────┘")
+	}
+}
+
+// printTakeoverModeQuickRef 在本进程控制台打印四种运行/清理操作的简要对照，
+// 与向导网页「一键模式切换」同名按钮语义一致（说明集中在 exe 窗口，便于边看边操作）。
+func printTakeoverModeQuickRef() {
+	fmt.Println("  ┌────────────────────────────────────────────────────────────┐")
+	fmt.Println("  │ 模式速览（向导网页「一键模式切换」同名）　　　　　　　　　 │")
+	fmt.Println("  │ 观察　　　不改系统代理/PAC；指向本机 MITM 端口的流量才监控 │")
+	fmt.Println("  │ 会话PAC　 仅 AI 域名经 PAC；关闭本程序自动还原　　　　　 │")
+	fmt.Println("  │ 全局　　　PAC+用户环境变量持久；向导一键恢复或卸载参数停用 │")
+	fmt.Println("  │ 一键恢复　清理 PAC/代理残留与 config 上游等　　　　　　　 │")
+	fmt.Println("  └────────────────────────────────────────────────────────────┘")
+	fmt.Println()
+}
+
+// printTakeoverHint 在「监控域名 / CA 路径」之后打印一段补充说明，
+// 内容随接管模式而变，避免「日志说一套，实际做一套」的认知错位。
+//
+// observe 模式下额外读取 cfg：若用户在 config.json 里显式 auto_install_session_pac=false，
+// 给出一行 PowerShell 命令一键升级（针对 v3.1.0/v3.1.1 的老 config 文件，新默认 true 不会
+// 自动覆盖已写入的 false）。
+func printTakeoverHint(mode string, cfg *Config) {
+	switch mode {
+	case "persistent":
+		fmt.Println("  说明: 已重应用持久安装：系统 PAC + 用户级 HTTP_PROXY 指向本程序。")
+		fmt.Println("        如需停掉持久接管，请使用 --global-uninstall（或运行『卸载.bat』）。")
+	case "session":
+		fmt.Println("  说明: 本窗口打开期间临时启用 AI 域名白名单 PAC；关闭后自动恢复本机网络。")
+		fmt.Println("        若希望本机不接管：在 config.json 设 \"auto_install_session_pac\": false。")
+	default:
+		fmt.Println("  说明: 当前 *未* 修改系统代理/环境变量/IDE 配置（观察模式 = 不监控）。")
+		if cfg != nil && cfg.AutoInstallSessionPAC != nil && !*cfg.AutoInstallSessionPAC {
+			fmt.Println("        原因: config.json 里显式设置了 \"auto_install_session_pac\": false。")
+			fmt.Println("        一行恢复（先关闭本进程再跑）：")
+			fmt.Println(`          powershell -NoProfile -Command "(Get-Content $env:APPDATA\ai-monitor\config.json) -replace '\"auto_install_session_pac\"\s*:\s*false','\"auto_install_session_pac\": true' | Set-Content $env:APPDATA\ai-monitor\config.json -Encoding UTF8"`)
+		}
+		fmt.Println("        其它接管方式：")
+		fmt.Println("          · 本次会话临时接管：重新运行并加 --with-session-pac；")
+		fmt.Println("          · 永久接管（开机自启 + 写 PAC/环境变量）：--global-install；")
+		fmt.Println("          · 仅当前进程：ai-monitor --launch <程序> 启动目标。")
 	}
 }
 
@@ -1028,6 +1214,19 @@ func restoreSessionManagedProxyOnShutdown() {
 // restoreProxyFromState undoes what doGlobalInstall set up: removes PAC file,
 // clears AutoConfigURL, and restores the user's previous proxy configuration.
 func restoreProxyFromState(state *InstallState) {
+	if state == nil {
+		// 无快照时只清理 ai-monitor 自己留下的接管痕迹；不碰用户原有代理。
+		currentPAC := ReadCurrentAutoConfigURL()
+		if isAIMonitorPACURL(currentPAC) {
+			removePACFile()
+			DisableSystemProxyPAC()
+		}
+		currentProxy := readCurrentSystemProxy()
+		if isSelfProxy(currentProxy) {
+			DisableSystemProxy()
+		}
+		return
+	}
 	if state != nil && state.PACFileSet {
 		// PAC-based install: clean up PAC file and registry
 		removePACFile()

@@ -41,12 +41,21 @@ func pacFileURL() string {
 //
 // chainedPACBody: the JavaScript body of the user's original PAC file. If non-empty,
 // it will be embedded and used as fallback for non-AI traffic. Pass "" to skip chaining.
+//
+// 防自引用：若 chainedPACBody 实际上是 ai-monitor 自己生成过的 PAC（例如上次
+// 异常退出后没清干净，又被当作「用户原 PAC」读了回来），强制丢弃。否则会出现
+// 每启动一次就把整段旧 PAC 嵌一遍 → PAC 体积无限增长，最终 WinINet 拒绝加载。
 func writePACFile(listenPort int, cfg *Config, chainedPACBody string) (string, error) {
 	monitorHosts := monitorHostsForPAC(cfg)
 
 	var upstream string
 	if cfg != nil {
 		upstream = cfg.UpstreamProxy
+	}
+
+	if isAIMonitorPACBody(chainedPACBody) {
+		log.Println("[pac] 检测到链接的 PAC 内容来自 ai-monitor 自身，已丢弃以避免自引用 / PAC 膨胀。")
+		chainedPACBody = ""
 	}
 
 	content := generatePACContent(listenPort, monitorHosts, upstream, chainedPACBody)
@@ -144,6 +153,28 @@ func generatePACContent(listenPort int, monitorHosts []monitorHostEntry, upstrea
 	b.WriteString("}\n")
 
 	return b.String()
+}
+
+// isAIMonitorPACBody 判断一段 PAC 文本是不是 ai-monitor 自己写出来的。
+// 用于「链接已有 PAC」时识别自引用，避免越累越大。
+//
+// 识别依据：
+//   - 注释行 "// === AI domain whitelist:" 是我们生成函数 generatePACContent 中
+//     固定写入的标记，普通企业 PAC 不会带；
+//   - 重命名标记 "__OriginalFindProxyForURL" 说明它已经把别人的 PAC 链了进来，
+//     再链一次就是套娃。
+func isAIMonitorPACBody(body string) bool {
+	if strings.TrimSpace(body) == "" {
+		return false
+	}
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "// === ai domain whitelist:") {
+		return true
+	}
+	if strings.Contains(body, "__OriginalFindProxyForURL") {
+		return true
+	}
+	return false
 }
 
 // renamePACFunction takes the body of an existing PAC file and renames its

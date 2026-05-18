@@ -24,8 +24,8 @@
   "install_ide_proxy": false,
   // report_opaque_traffic: 为 true 时，对 gRPC/Protobuf 等无法解析 usage 的响应按可见内容估算 token 并上报；非官方计费口径。
   "report_opaque_traffic": true,
-  // mitm_cursor: 为 true 时尝试解密 Cursor 流量；如 Cursor 因证书钉扎断连，可改为 false 透传。
-  "mitm_cursor": true,
+  // mitm_cursor: 默认 false 安全；Cursor 桌面端钉证书，置 true 会让 Cursor 网络断连。仅在确认本机 Cursor 不再 pin 时才打开。
+  "mitm_cursor": false,
   // chain_existing_pac: 为 true 时保留并串联用户原有企业 PAC；建议保持 true，避免丢失公司内网代理策略。
   "chain_existing_pac": true,
   // strict_policy_check: 为 true 时检测到公司策略级代理会拒绝全局安装，避免覆盖管理员策略；建议保持 true。
@@ -133,5 +133,7 @@
   // watchdog_interval_sec: ai-monitor 进程内自检间隔秒数；默认 10。不是 Windows 计划任务，不会弹黑框。
   "watchdog_interval_sec": 10,
   // watchdog_failures: 连续自检失败多少次后触发网络恢复；默认 2。
-  "watchdog_failures": 2
+  "watchdog_failures": 2,
+  // auto_install_session_pac: 默认 true（双击 ai-monitor.exe 自动写 AI 白名单 PAC，关闭程序时自动还原）；置 false 进入观察模式，只监听本地端口、完全不动系统代理。
+  "auto_install_session_pac": true
 }

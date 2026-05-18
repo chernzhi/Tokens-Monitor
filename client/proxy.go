@@ -313,6 +313,38 @@ type ProxyServer struct {
 	startedAt        time.Time // when process started
 	copilotMu        sync.RWMutex
 	copilotDiscounts map[string]float64
+	// takeoverMode 是本次进程的网络接管模式，由 main.go 在 startMonitorRuntime 之后
+	// 通过 SetTakeoverMode 注入；仅用于 /status 诊断展示。允许值："observe" / "session" / "persistent"。
+	takeoverMu   sync.RWMutex
+	takeoverMode string
+}
+
+// SetTakeoverMode 在 main.go 决定本次接管模式后调用，让 /status 能如实展示。
+// 取值："observe" / "session" / "persistent"；其它字符串会被强制改为 "observe"。
+func (s *ProxyServer) SetTakeoverMode(mode string) {
+	if s == nil {
+		return
+	}
+	switch mode {
+	case "observe", "session", "persistent":
+	default:
+		mode = "observe"
+	}
+	s.takeoverMu.Lock()
+	s.takeoverMode = mode
+	s.takeoverMu.Unlock()
+}
+
+func (s *ProxyServer) currentTakeoverMode() string {
+	if s == nil {
+		return "observe"
+	}
+	s.takeoverMu.RLock()
+	defer s.takeoverMu.RUnlock()
+	if s.takeoverMode == "" {
+		return "observe"
+	}
+	return s.takeoverMode
 }
 
 var (
@@ -439,14 +471,14 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		go safeGo("mitm "+hostname, func() { s.mitmConnection(clientConn, host, hostname, vendor) })
 	} else if isAI {
 		log.Printf("[CONNECT] tunnel → %s (%s, no cert manager)", hostname, vendor)
-		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host) })
+		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host, vendor, hostname) })
 	} else {
 		if vendor != "" {
 			log.Printf("[CONNECT] tunnel → %s (钉证书主机，跳过 MITM)", hostname)
 		} else {
 			log.Printf("[CONNECT] tunnel → %s", hostname)
 		}
-		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host) })
+		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host, vendor, hostname) })
 	}
 }
 
@@ -463,7 +495,7 @@ func safeGo(label string, fn func()) {
 	fn()
 }
 
-func (s *ProxyServer) tunnelConnection(clientConn net.Conn, host string) {
+func (s *ProxyServer) tunnelConnection(clientConn net.Conn, host, vendor, hostname string) {
 	defer clientConn.Close()
 
 	var serverConn net.Conn
@@ -505,9 +537,68 @@ func (s *ProxyServer) tunnelConnection(clientConn net.Conn, host string) {
 		done <- wsCopyResult{direction: "server->client", bytes: n, err: copyErr}
 	}()
 	first := <-done
+	second := <-done
 	if first.err != nil && !isClosedNetworkError(first.err) && !isTimeoutNetworkError(first.err) {
 		log.Printf("[tunnel] copy ended %s %s: bytes=%d err=%v", first.direction, host, first.bytes, first.err)
 	}
+	if second.err != nil && !isClosedNetworkError(second.err) && !isTimeoutNetworkError(second.err) {
+		log.Printf("[tunnel] copy ended %s %s: bytes=%d err=%v", second.direction, host, second.bytes, second.err)
+	}
+	s.maybeReportTunnelOpaqueUsage(vendor, hostname, first, second)
+}
+
+// maybeReportTunnelOpaqueUsage 对无法 MITM 的 AI CONNECT 透传流量做保守体积估算上报。
+// 典型场景：Cursor 钉证书，HTTPS 只能隧道透传；若完全不记，这部分永远是 0。
+// 注意：这是粗算（非官方计费口径），仅在 report_opaque_traffic=true 时启用。
+func (s *ProxyServer) maybeReportTunnelOpaqueUsage(vendor, hostname string, a, b wsCopyResult) {
+	if s == nil || s.reporter == nil || s.cfg == nil || !s.cfg.EffectiveReportOpaqueTraffic() {
+		return
+	}
+	vendor = strings.TrimSpace(vendor)
+	if vendor == "" {
+		return
+	}
+	var downBytes int64
+	if a.direction == "server->client" {
+		downBytes += a.bytes
+	}
+	if b.direction == "server->client" {
+		downBytes += b.bytes
+	}
+	if downBytes < 64 {
+		return
+	}
+	total := int(downBytes / 4)
+	if total <= 0 {
+		return
+	}
+	if total > 500000 {
+		total = 500000
+	}
+	// CONNECT 隧道里拿不到请求体，按 30/70 粗分 prompt/completion。
+	prompt := total * 30 / 100
+	if prompt < 1 {
+		prompt = 1
+	}
+	completion := total - prompt
+	if completion < 1 {
+		completion = 1
+	}
+	sourceApp := ""
+	if vendor == "cursor" {
+		sourceApp = "cursor"
+	}
+	s.reporter.Add(UsageRecord{
+		Vendor:           vendor,
+		Model:            opaqueModelLabel(vendor),
+		Endpoint:         "connect://" + hostname,
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      total,
+		Source:           opaqueSourceEstimate,
+		SourceApp:        sourceApp,
+	})
+	log.Printf("[opaque-tunnel] %s %s: estimated total=%d (down_bytes=%d)", vendor, hostname, total, downBytes)
 }
 
 // dialViaUpstreamProxy establishes a TCP tunnel through the upstream HTTP proxy
@@ -1663,25 +1754,59 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":           "running",
-		"version":          Version,
-		"mode":             "transparent-mitm",
-		"pid":              os.Getpid(),
-		"port":             s.listenPort,
-		"wizard_url":       fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
-		"uptime_seconds":   int(time.Since(s.startedAt).Seconds()),
-		"upstream_proxy":   upstreamLabel,
-		"user":             s.cfg.UserName,
-		"department":       s.cfg.Department,
-		"source_app":       s.reporter.sourceApp,
-		"server":           s.cfg.ServerURL,
-		"monitor_hosts":    len(effectiveMonitorHosts(s.cfg)),
-		"monitor_suffixes": len(effectiveMonitorSuffixes(s.cfg)),
+		"status":            "running",
+		"version":           Version,
+		"mode":              "transparent-mitm",
+		"network_takeover":  s.networkTakeoverDiagnostics(),
+		"pid":               os.Getpid(),
+		"port":              s.listenPort,
+		"wizard_url":        fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
+		"uptime_seconds":    int(time.Since(s.startedAt).Seconds()),
+		"upstream_proxy":    upstreamLabel,
+		"user":              s.cfg.UserName,
+		"department":        s.cfg.Department,
+		"source_app":        s.reporter.sourceApp,
+		"server":            s.cfg.ServerURL,
+		"monitor_hosts":     len(effectiveMonitorHosts(s.cfg)),
+		"monitor_suffixes":  len(effectiveMonitorSuffixes(s.cfg)),
+		"mitm_cursor":       s.cfg.EffectiveMitmCursor(),
 		"stats": map[string]interface{}{
 			"total_reported": s.reporter.Stats.TotalReported.Load(),
 			"total_tokens":   s.reporter.Stats.TotalTokens.Load(),
 		},
 	})
+}
+
+// networkTakeoverDiagnostics 汇总「ai-monitor 究竟改了哪些系统设置」，
+// 用户/排障同事可以直接 GET /status 看清楚而不必去翻注册表。
+// 字段：
+//
+//	mode               -> observe / session / persistent
+//	auto_config_url    -> 当前注册表里的 AutoConfigURL（空串表示未设）
+//	pac_is_self        -> 当前 PAC 是否指向本程序
+//	system_proxy       -> 当前 WinINet 手动代理（空串表示未启用）
+//	user_http_proxy    -> HKCU\Environment 中的 HTTP_PROXY（不同于进程级，能反映「持久」设置）
+//	user_https_proxy   -> 同上
+//	ca_path            -> 本程序生成的 CA 证书路径，便于检查 NODE_EXTRA_CA_CERTS 等
+func (s *ProxyServer) networkTakeoverDiagnostics() map[string]interface{} {
+	mode := s.currentTakeoverMode()
+	autoConfigURL := ReadCurrentAutoConfigURL()
+	sysProxy := readCurrentSystemProxy()
+	caPath := ""
+	if s.certMgr != nil {
+		caPath = s.certMgr.CACertPath()
+	}
+	return map[string]interface{}{
+		"mode":             mode,
+		"auto_config_url":  autoConfigURL,
+		"pac_is_self":      isAIMonitorPACURL(autoConfigURL),
+		"system_proxy":     sysProxy,
+		"system_proxy_is_self": isSelfProxy(sysProxy),
+		"user_http_proxy":  ReadUserLevelEnv("HTTP_PROXY"),
+		"user_https_proxy": ReadUserLevelEnv("HTTPS_PROXY"),
+		"user_no_proxy":    ReadUserLevelEnv("NO_PROXY"),
+		"ca_path":          caPath,
+	}
 }
 
 // recordingBody wraps an io.ReadCloser, recording all bytes read.

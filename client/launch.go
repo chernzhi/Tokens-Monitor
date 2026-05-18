@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"errors"
@@ -173,12 +174,22 @@ type monitorRuntime struct {
 	reporterCancel context.CancelFunc
 	server         *http.Server
 	listener       net.Listener
+	proxy          *ProxyServer // 持有引用以便注入接管模式 / 运行期更新
 	proxyAddr      string
 	listenPort     int
 	compatLn       []net.Listener
 	gatewayServer  *http.Server // nil if gateway_port not configured
 	gatewayLn      net.Listener // nil if gateway_port not configured
 	gatewayPort    int
+}
+
+// SetTakeoverMode 透传到内部 ProxyServer，让 /status 能上报真实模式。
+// 在 main.go 决定 takeoverMode 后调用一次即可。
+func (r *monitorRuntime) SetTakeoverMode(mode string) {
+	if r == nil || r.proxy == nil {
+		return
+	}
+	r.proxy.SetTakeoverMode(mode)
 }
 
 func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, configPath string) (*monitorRuntime, error) {
@@ -231,6 +242,7 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 			IdleTimeout:       120 * time.Second,
 		},
 		listener:   ln,
+		proxy:      proxy,
 		proxyAddr:  fmt.Sprintf("127.0.0.1:%d", listenPort),
 		listenPort: listenPort,
 	}
@@ -402,6 +414,19 @@ func runManagedProcess(cfg *Config, certMgr *CertManager, args []string, presetN
 // ai-monitor instance. No new proxy is started.
 func launchChildWithExistingProxy(cfg *Config, certMgr *CertManager, commandArgs []string, preset *launchPreset, port int) error {
 	sourceApp := inferSourceApp(commandArgs, preset)
+	envVars := buildManagedLaunchEnv(cfg, certMgr, sourceApp, port, preset)
+
+	cmd := exec.Command(commandArgs[0], commandArgs[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = mergeEnv(os.Environ(), envVars)
+
+	log.Printf("[launch] 复用已有代理 (127.0.0.1:%d)，启动: %s", port, strings.Join(commandArgs, " "))
+	return cmd.Run()
+}
+
+func buildManagedLaunchEnv(cfg *Config, certMgr *CertManager, sourceApp string, port int, preset *launchPreset) map[string]string {
 	httpProxy := fmt.Sprintf("http://127.0.0.1:%d", port)
 	noProxy := buildNoProxyEnvWithConfig(cfg)
 	envVars := map[string]string{
@@ -423,15 +448,26 @@ func launchChildWithExistingProxy(cfg *Config, certMgr *CertManager, commandArgs
 	if preset != nil {
 		envVars["AI_MONITOR_LAUNCH_PRESET"] = preset.Name
 	}
+	return envVars
+}
 
+// launchChildWithExistingProxyDetached launches a managed child process without waiting for exit.
+// Used by the web console one-click launcher to avoid blocking HTTP requests.
+func launchChildWithExistingProxyDetached(cfg *Config, certMgr *CertManager, commandArgs []string, preset *launchPreset, port int) error {
+	if len(commandArgs) == 0 {
+		return fmt.Errorf("empty launch command")
+	}
+	sourceApp := inferSourceApp(commandArgs, preset)
+	envVars := buildManagedLaunchEnv(cfg, certMgr, sourceApp, port, preset)
+	if runtime.GOOS == "windows" {
+		parts := append([]string{"/c", "start", ""}, commandArgs...)
+		cmd := exec.Command("cmd", parts...)
+		cmd.Env = mergeEnv(os.Environ(), envVars)
+		return cmd.Start()
+	}
 	cmd := exec.Command(commandArgs[0], commandArgs[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Env = mergeEnv(os.Environ(), envVars)
-
-	log.Printf("[launch] 复用已有代理 (127.0.0.1:%d)，启动: %s", port, strings.Join(commandArgs, " "))
-	return cmd.Run()
+	return cmd.Start()
 }
 
 func inferSourceApp(commandArgs []string, preset *launchPreset) string {
@@ -507,10 +543,176 @@ func resolveLaunchCommand(args []string, presetName string, lookPath func(string
 		return nil, nil, fmt.Errorf("launch 预设 %q 未找到可执行文件（尝试过: %s）", preset.Name, strings.Join(candidate, ", "))
 	}
 
+	// 解析到 .cmd / .bat shim 而预设属于 Electron GUI 时（VS Code / Cursor / Kiro 等），
+	// 多数 shim 会把真实 GUI 进程 detach（如 C:\Program Files\cursor\resources\app\bin\cursor.cmd
+	// 启动 Cursor.exe 后立刻退出），导致 ai-monitor 跟着退出，监控失效。
+	// 此处只能告警；真正的修复在 resolvePresetBinary —— 对 GUI 预设优先扫 KnownPaths。
+	if isGUIPreset(preset) && isShimExecutable(resolved) {
+		log.Printf("[launch] ⚠ 预设 %q 命中了脱钩 shim %s。建议把 GUI 主程序加入 KnownPaths 或修复 PATH，使 ai-monitor 能等待 GUI 进程退出。",
+			preset.Name, resolved)
+	}
+
 	command := []string{resolved}
 	command = append(command, preset.Args...)
 	command = append(command, args...)
 	return command, preset, nil
+}
+
+// isGUIPreset 判断预设是否启动 Electron 类 GUI 进程。
+// 复用 managedPresetProcessImage —— 凡能给出 ImageName 的都是会被 ai-monitor
+// 严格 singleton 检查的 Electron GUI（VS Code / Cursor / Windsurf / Kiro / VSCodium / Trae）。
+// 这些应用的 .cmd shim 几乎都会脱钩主 GUI 进程，需要特殊解析顺序。
+func isGUIPreset(preset *launchPreset) bool {
+	img, _ := managedPresetProcessImage(preset)
+	return img != ""
+}
+
+// isShimExecutable 判断解析出的可执行文件是否是 *.cmd / *.bat shim —— 这类入口
+// 通常立即 spawn GUI 并退出，不适合作为 cmd.Run() 同步等待的目标。
+func isShimExecutable(path string) bool {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(path)))
+	return ext == ".cmd" || ext == ".bat" || ext == ".ps1"
+}
+
+// runningElectronEditor 表示一个正在跑且会被 PAC 接管影响的 Electron 编辑器实例。
+// 仅用于「ai-monitor 启动时提示用户重启」的展示与重启决策，不持久化。
+type runningElectronEditor struct {
+	Preset    string // 对应 launchPreset.Name，例如 "cursor" / "vscode"
+	ImageName string // tasklist 的 IMAGENAME，例如 "Cursor.exe"
+	Display   string // 给用户看的展示名，例如 "Cursor"
+}
+
+// detectRunningElectronEditors 扫描当前主机上正在跑的、且依赖系统 PAC / 环境变量
+// 才能被 ai-monitor 接管的 Electron 编辑器。返回顺序与 managedLaunchPresets 一致，
+// 方便测试断言。
+//
+// 之所以单列 Electron 类：这类应用启动后**不会动态拾取 PAC 变更**，必须
+// 重启进程才能让新写的会话 PAC 生效；JetBrains 系不走 system PAC（走自己
+// 的 settings + JVM proxy），不在此列。
+func detectRunningElectronEditors(presetRunning func(string) bool) []runningElectronEditor {
+	var out []runningElectronEditor
+	seen := map[string]struct{}{}
+	for _, p := range managedLaunchPresets {
+		img, display := managedPresetProcessImage(&p)
+		if img == "" {
+			continue
+		}
+		key := strings.ToLower(img)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if presetRunning(img) {
+			out = append(out, runningElectronEditor{
+				Preset:    p.Name,
+				ImageName: img,
+				Display:   display,
+			})
+		}
+	}
+	return out
+}
+
+// promptRestartElectronEditors 在 stdin 是交互式终端时，把 editors 列出来
+// 询问用户「是否帮你重启它们让监控立即生效？[Y/n]」。
+//
+// 非交互式 stdin（例如开机自启的后台进程、被 nohup / start /b 启动）跳过提示，
+// 仅打印一段"提示用户重启"的告警日志，避免阻塞启动。
+//
+// 用户输入：
+//   - Y / 回车   → 调用 killAndRelaunchEditors 一一处理
+//   - N         → 仅打印警告
+//   - 其它      → 视为 N
+func promptRestartElectronEditors(editors []runningElectronEditor, in io.Reader, out io.Writer, isInteractive bool) bool {
+	if len(editors) == 0 {
+		return false
+	}
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "  ┌────────────────────────────────────────────────────────────┐")
+	fmt.Fprintln(out, "  │ 检测到以下 IDE 已在运行，*不会* 自动捕获新写入的会话 PAC： │")
+	for _, e := range editors {
+		fmt.Fprintf(out, "  │    · %-50s  │\n", e.Display+" ("+e.ImageName+")")
+	}
+	fmt.Fprintln(out, "  │ 你需要重启这些 IDE 才能让监控立即生效。                    │")
+	fmt.Fprintln(out, "  └────────────────────────────────────────────────────────────┘")
+	if !isInteractive {
+		fmt.Fprintln(out, "  ⓘ 当前为非交互式启动，跳过 Y/N 询问；请手动关闭并重开这些 IDE。")
+		return false
+	}
+	fmt.Fprint(out, "  是否帮你立刻 *关闭* 它们并重新启动？[Y/n] ")
+	reader := bufio.NewReader(in)
+	line, _ := reader.ReadString('\n')
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer == "n" || answer == "no" {
+		fmt.Fprintln(out, "  → 已跳过。请你方便时手动重启这些 IDE，监控才会生效。")
+		return false
+	}
+	return true
+}
+
+// stdinIsInteractive 判断当前进程的 stdin 是不是一个终端 / 控制台。
+// 用于避免在 start /b 后台启动 / Windows 计划任务下尝试 ReadString 阻塞主流程。
+func stdinIsInteractive() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	mode := info.Mode()
+	// 终端（控制台、tty）会带 ModeCharDevice；管道/重定向不会。
+	return mode&os.ModeCharDevice != 0
+}
+
+// killAndRelaunchEditors 终止指定 Electron IDE 进程，等其端口/锁释放后用对应预设
+// 的 KnownPaths（v3.1.1+ 已避开 .cmd shim）detached 重新启动一次。
+//
+// 失败仅打印 warning，**不阻断 ai-monitor 主流程**——监控本身已经在跑了，
+// 用户手动重开 IDE 也可以让 PAC 生效。
+func killAndRelaunchEditors(editors []runningElectronEditor, out io.Writer) {
+	for _, e := range editors {
+		fmt.Fprintf(out, "  [%s] 终止进程 %s ...\n", e.Display, e.ImageName)
+		if err := exec.Command("taskkill", "/F", "/IM", e.ImageName).Run(); err != nil {
+			fmt.Fprintf(out, "    ⚠ taskkill /F /IM %s 失败: %v\n", e.ImageName, err)
+			continue
+		}
+	}
+	// 给文件锁与端口腾出释放时间，否则 Electron 立刻重启容易报 single-instance lock。
+	time.Sleep(1500 * time.Millisecond)
+
+	for _, e := range editors {
+		preset := findLaunchPreset(e.Preset)
+		if preset == nil {
+			fmt.Fprintf(out, "  [%s] 未找到对应 launchPreset，跳过自动重启。\n", e.Display)
+			continue
+		}
+		resolved, _, err := resolvePresetBinary(*preset, exec.LookPath, fileExists)
+		if err != nil {
+			fmt.Fprintf(out, "  [%s] 未在 KnownPaths/PATH 找到主程序，请手动重开。\n", e.Display)
+			continue
+		}
+		if isShimExecutable(resolved) {
+			fmt.Fprintf(out, "  [%s] 命中 shim %s（KnownPaths 全部未命中），自动重启可能脱钩；请手动重开。\n",
+				e.Display, resolved)
+			continue
+		}
+		fmt.Fprintf(out, "  [%s] 启动 %s ...\n", e.Display, resolved)
+		if err := relaunchDetached(resolved); err != nil {
+			fmt.Fprintf(out, "    ⚠ 启动失败: %v；请手动重开 %s。\n", err, e.Display)
+			continue
+		}
+		fmt.Fprintf(out, "    ✓ 已请求启动 %s（GUI 在后台拉起，可能需要 1-3 秒）\n", e.Display)
+	}
+}
+
+// relaunchDetached 在 Windows 用 `cmd /c start "" path` 完成完全脱钩——
+// ai-monitor 之后退出时不会牵连 GUI；GUI 也不会继承 ai-monitor 的 stdin/stdout。
+// 非 Windows 平台直接 exec.Command(path).Start()，对 GUI Editor 已经够用。
+func relaunchDetached(path string) error {
+	if runtime.GOOS == "windows" {
+		// start "" path  —— 第一个 "" 是 start 命令必需的窗口标题占位
+		return exec.Command("cmd", "/c", "start", "", path).Start()
+	}
+	cmd := exec.Command(path)
+	return cmd.Start()
 }
 
 func findLaunchPreset(name string) *launchPreset {
@@ -592,25 +794,60 @@ func isProcessImageRunning(imageName string) (bool, error) {
 	return false, nil
 }
 
+// resolvePresetBinary 解析预设可执行文件路径。
+//
+// 关键修复（v3.1.0）：
+//   - 对 GUI 类预设（VS Code / Cursor / Windsurf / Kiro / VSCodium / Trae）
+//     先扫 KnownPaths 找真实 .exe，命中即用。这样可避免 PATH 里的 .cmd shim
+//     把 GUI 主进程 detach 后立刻退出 → ai-monitor 跟着退出 → 监控失效。
+//   - 仅当 KnownPaths 全部不存在时才回退到 lookPath（候选名）。CLI 类预设
+//     （cmd / powershell / claude-code / codex 等）保留原优先级，因为它们的
+//     入口通常就是 PATH 中的可执行命令。
+//
+// tried 仍按实际尝试顺序追加，便于错误信息复现失败路径。
 func resolvePresetBinary(preset launchPreset, lookPath func(string) (string, error), exists func(string) bool) (string, []string, error) {
-	tried := make([]string, 0, len(preset.Candidates))
-	for _, candidate := range preset.Candidates {
-		tried = append(tried, candidate)
-		resolved, err := lookPath(candidate)
-		if err == nil {
-			return resolved, tried, nil
+	tried := make([]string, 0, len(preset.Candidates)+len(preset.KnownPaths))
+
+	tryKnownPaths := func() (string, bool) {
+		for _, rawPath := range preset.KnownPaths {
+			resolved := expandEnvPath(rawPath)
+			if strings.TrimSpace(resolved) == "" {
+				continue
+			}
+			tried = append(tried, resolved)
+			if exists(resolved) {
+				return resolved, true
+			}
+		}
+		return "", false
+	}
+	tryLookPath := func() (string, bool) {
+		for _, candidate := range preset.Candidates {
+			tried = append(tried, candidate)
+			resolved, err := lookPath(candidate)
+			if err == nil {
+				return resolved, true
+			}
+		}
+		return "", false
+	}
+
+	if isGUIPreset(&preset) {
+		if got, ok := tryKnownPaths(); ok {
+			return got, tried, nil
+		}
+		if got, ok := tryLookPath(); ok {
+			return got, tried, nil
+		}
+	} else {
+		if got, ok := tryLookPath(); ok {
+			return got, tried, nil
+		}
+		if got, ok := tryKnownPaths(); ok {
+			return got, tried, nil
 		}
 	}
-	for _, rawPath := range preset.KnownPaths {
-		resolved := expandEnvPath(rawPath)
-		if strings.TrimSpace(resolved) == "" {
-			continue
-		}
-		tried = append(tried, resolved)
-		if exists(resolved) {
-			return resolved, tried, nil
-		}
-	}
+
 	return "", tried, errors.New("not found")
 }
 

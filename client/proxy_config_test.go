@@ -71,14 +71,15 @@ func TestMatchAIDomainExtraConfig(t *testing.T) {
 	}
 }
 
-// 默认情况下（MitmCursor 默认 true）cursor 主域应豁免 pinning 进入 MITM 流程；
-// nil cfg（极少数代码路径未传配置）保持保守，仍走 pinning。
-func TestPinnedTLSHostCursorDefaultAllowsMITM(t *testing.T) {
+// 默认情况下（MitmCursor 默认 false）cursor 主域必须保持 pinning 透传，
+// 避免开启 ai-monitor 后 IDE 因证书钉扎而断连。这是保证 Cursor 网络
+// 在默认部署下不被 ai-monitor 破坏的关键回归测试。
+func TestPinnedTLSHostCursorDefaultPins(t *testing.T) {
 	if !isPinnedTLSHost("api2.cursor.sh", nil) {
 		t.Fatal("nil cfg 时 api2.cursor.sh 应仍在 pinned 名单内")
 	}
-	if isPinnedTLSHost("api.cursor.com", &Config{}) {
-		t.Fatal("默认配置下 MitmCursor 应为 true，api.cursor.com 不应被 pinning 拦截")
+	if !isPinnedTLSHost("api.cursor.com", &Config{}) {
+		t.Fatal("默认配置下 MitmCursor 应为 false，api.cursor.com 必须仍走 pinning 透传")
 	}
 }
 

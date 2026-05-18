@@ -51,10 +51,14 @@ type Config struct {
 	// ReportOpaqueTraffic 为 true（默认）时，对无法解析 JSON usage 的响应（如 gRPC/Protobuf）按响应体大小做粗略估算并上报，使 135 大屏可见；非官方计费口径。
 	// 设为 false 则仅上报能解析出 usage 的 JSON（与旧版行为一致）。
 	ReportOpaqueTraffic *bool `json:"report_opaque_traffic,omitempty"`
-	// MitmCursor 为 true（默认）时，尝试 MITM Cursor 桌面端流量（*.cursor.sh / *.cursor.com）。
-	// 设为 false：保持 CONNECT 透传（Cursor 历史上做过 TLS pinning，若新版本恢复 pinning
-	// 导致 IDE 断连可关闭此开关回退）。开启后：能解析的 OpenAI 兼容 JSON 走正常 usage 上报，
-	// 不能解析的二进制（gRPC/Protobuf）若同时开启 report_opaque_traffic 则按体积估算。
+	// MitmCursor 控制是否尝试 MITM Cursor 桌面端流量（*.cursor.sh / *.cursor.com）。
+	//
+	// 默认 false（保守、不影响 IDE 网络）：Cursor 桌面端做 TLS 证书钉扎，会拒绝
+	// 任何中间人证书；MITM 一旦命中就会导致 IDE 登录失败 / 频繁掉线，是用户报
+	// "一打开 ai-monitor 编程工具网络就坏" 的高发原因。同时 Cursor 主要走 gRPC，
+	// 即便 MITM 解开 TLS 也只能体积估算 token，监控收益小。
+	//
+	// 若你确认本机 Cursor 已不再 pin（罕见），可显式置 true 开启。
 	MitmCursor *bool `json:"mitm_cursor,omitempty"`
 	// GatewayPort 为 API Gateway 专用端口（可选）。设置后，该端口仅提供反向代理 /v1/* 与 /vendor/* 路由，
 	// 不做 CONNECT MITM，也不需要 CA 证书信任。设为 0 或省略则 Gateway 路由共享 MITM 主端口。
@@ -80,6 +84,32 @@ type Config struct {
 	WatchdogIntervalSec int `json:"watchdog_interval_sec,omitempty"`
 	// WatchdogFailures 连续失败多少次触发恢复，默认 2。
 	WatchdogFailures int `json:"watchdog_failures,omitempty"`
+	// AutoInstallSessionPAC 控制「双击 ai-monitor.exe 是否自动写一次系统 PAC」。
+	//
+	// 默认 true（会话 PAC 模式）：双击 ai-monitor.exe 会临时写一份只针对
+	// AI 域名（白名单）的 PAC：Cursor / VS Code / 浏览器 / npm 中只有命中
+	// monitor_hosts / monitor_suffixes 的请求才进 MITM，其它全部 DIRECT；
+	// 关闭 ai-monitor 进程时自动还原 AutoConfigURL / ProxyServer / 环境变量，
+	// 不会留下"指向 dead 端口"的残留——这是用户真正想要的「打开即监控、
+	// 关掉即恢复」的体验，也是 v3.1.2 起的新默认。
+	//
+	// 设为 false（观察模式）：双击 ai-monitor.exe 仅监听本地端口，*完全不改*
+	// 注册表 / 环境变量 / IDE 配置；只有通过 --launch 受管启动或 IDE 主动
+	// 指向本程序端口的流量才会被监控。适合「想自己用 --launch / --global-install
+	// 完全掌控接管时机」的高级用户，或临时排障。
+	AutoInstallSessionPAC *bool `json:"auto_install_session_pac,omitempty"`
+}
+
+// EffectiveAutoInstallSessionPAC 默认 true（会话 PAC 模式）。
+//
+// 之所以默认 true：观察模式虽然「不破坏网络」，但代价是「啥也不监控」——
+// 用户双击 ai-monitor.exe 后看 /status 全是 0，与「打开即监控」的直觉冲突。
+// 会话 PAC 模式既能完成监控，又有自动还原兜底，是更合理的默认。
+func (c *Config) EffectiveAutoInstallSessionPAC() bool {
+	if c == nil || c.AutoInstallSessionPAC == nil {
+		return true
+	}
+	return *c.AutoInstallSessionPAC
 }
 
 // EffectiveInstallSystemProxy 是否写入系统代理与环境变量。省略字段时默认 false，优先保持本机网络环境不变。
@@ -109,10 +139,12 @@ func (c *Config) EffectiveReportOpaqueTraffic() bool {
 	return *c.ReportOpaqueTraffic
 }
 
-// EffectiveMitmCursor 是否尝试 MITM Cursor 桌面端流量。默认 true（如新版本 Cursor 恢复 TLS pinning 可显式 false 回退）。
+// EffectiveMitmCursor 是否尝试 MITM Cursor 桌面端流量。
+// 默认 false：Cursor 仍做 TLS pinning，开启会导致 IDE 网络断连，远大于监控收益。
+// 仅当 config.json 中显式 "mitm_cursor": true 时才启用。
 func (c *Config) EffectiveMitmCursor() bool {
 	if c == nil || c.MitmCursor == nil {
-		return true
+		return false
 	}
 	return *c.MitmCursor
 }
@@ -366,7 +398,7 @@ func annotatedConfigEntries(cfg *Config) []configJSONEntry {
 		{"install_system_proxy", boolConfigValue(cfg.InstallSystemProxy, false), "install_system_proxy: 为 true 时安装会写入 Windows 系统 PAC/代理，让浏览器、Visual Studio 等自动经过监控；默认 false 更保守。"},
 		{"install_ide_proxy", boolConfigValue(cfg.InstallIDEProxy, false), "install_ide_proxy: 为 true 时安装会写入 VS Code/Cursor 等 IDE 的 http.proxy 设置；通常保持 false，避免与系统代理重复。"},
 		{"report_opaque_traffic", boolConfigValue(cfg.ReportOpaqueTraffic, true), "report_opaque_traffic: 为 true 时，对 gRPC/Protobuf 等无法解析 usage 的响应按可见内容估算 token 并上报；非官方计费口径。"},
-		{"mitm_cursor", boolConfigValue(cfg.MitmCursor, true), "mitm_cursor: 为 true 时尝试解密 Cursor 流量；如 Cursor 因证书钉扎断连，可改为 false 透传。"},
+		{"mitm_cursor", boolConfigValue(cfg.MitmCursor, false), "mitm_cursor: 默认 false 安全；Cursor 桌面端钉证书，置 true 会让 Cursor 网络断连。仅在确认本机 Cursor 不再 pin 时才打开。"},
 		{"chain_existing_pac", boolConfigValue(cfg.ChainExistingPAC, true), "chain_existing_pac: 为 true 时保留并串联用户原有企业 PAC；建议保持 true，避免丢失公司内网代理策略。"},
 		{"strict_policy_check", boolConfigValue(cfg.StrictPolicyCheck, true), "strict_policy_check: 为 true 时检测到公司策略级代理会拒绝全局安装，避免覆盖管理员策略；建议保持 true。"},
 		{"monitor_hosts", effectiveMonitorHosts(cfg), "monitor_hosts: 完整精确监控域名表。键是主机名，值是供应商标签；可直接增删改，删除后该精确域名不再 MITM。"},
@@ -375,6 +407,7 @@ func annotatedConfigEntries(cfg *Config) []configJSONEntry {
 		{"auth_token", strings.TrimSpace(cfg.AuthToken), "auth_token: 用户登录/注册后得到的个人令牌，上报优先使用它。属于敏感信息，不要公开分享。"},
 		{"watchdog_interval_sec", cfg.EffectiveWatchdogInterval(), "watchdog_interval_sec: ai-monitor 进程内自检间隔秒数；默认 10。不是 Windows 计划任务，不会弹黑框。"},
 		{"watchdog_failures", cfg.EffectiveWatchdogFailures(), "watchdog_failures: 连续自检失败多少次后触发网络恢复；默认 2。"},
+		{"auto_install_session_pac", boolConfigValue(cfg.AutoInstallSessionPAC, true), "auto_install_session_pac: 默认 true（双击 ai-monitor.exe 自动写 AI 白名单 PAC，关闭程序时自动还原）；置 false 进入观察模式，只监听本地端口、完全不动系统代理。"},
 	}
 }
 

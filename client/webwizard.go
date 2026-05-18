@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,7 +29,7 @@ const webWizardHTML = `<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-  .card { background: #1e293b; border-radius: 16px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); padding: 40px; width: 500px; max-width: 95vw; }
+  .card { background: #1e293b; border-radius: 16px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); padding: 40px; width: 860px; max-width: 96vw; }
   h1 { font-size: 24px; text-align: center; margin-bottom: 8px; color: #38bdf8; }
   .subtitle { text-align: center; color: #94a3b8; margin-bottom: 28px; font-size: 14px; }
   .field { margin-bottom: 18px; }
@@ -72,6 +73,20 @@ const webWizardHTML = `<!DOCTYPE html>
   .step-indicator { display: flex; justify-content: center; gap: 8px; margin-bottom: 24px; }
   .step-dot { width: 8px; height: 8px; border-radius: 50%; background: #334155; transition: background 0.3s; }
   .step-dot.active { background: #38bdf8; }
+  .panel { border: 1px solid #334155; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .panel-title { font-size: 13px; color: #94a3b8; margin-bottom: 10px; }
+  .btn-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .btn-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .btn-small { margin-top: 0; padding: 10px; font-size: 13px; }
+  .btn-small.active { border: 1px solid #38bdf8; box-shadow: 0 0 0 1px #38bdf8 inset; }
+  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; color: #cbd5e1; }
+  .status-bar { background: #0b1220; border: 1px solid #243244; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; line-height: 1.7; }
+  @media (max-width: 1100px) {
+    .btn-grid, .btn-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 700px) {
+    .btn-grid, .btn-grid-3 { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -93,15 +108,13 @@ const webWizardHTML = `<!DOCTYPE html>
     </div>
 
     <div class="tabs">
-      <div class="tab active" onclick="switchTab('register')">注册</div>
-      <div class="tab" onclick="switchTab('login')">登录</div>
-      <div class="tab" onclick="switchTab('bind')">绑定已有账号</div>
-      <div class="tab" onclick="switchTab('changepwd')">修改密码</div>
+      <div class="tab active" onclick="switchTab('login')">登录</div>
+      <div class="tab" onclick="switchTab('register')">注册</div>
       <div class="tab" onclick="switchTab('resetpwd')">忘记密码</div>
     </div>
 
     <!-- 注册表单 -->
-    <div class="auth-form active" id="registerForm">
+    <div class="auth-form" id="registerForm">
       <div class="field">
         <label>姓名 *</label>
         <input id="regName" type="text" value="{{.UserName}}" required placeholder="真实姓名" />
@@ -125,11 +138,12 @@ const webWizardHTML = `<!DOCTYPE html>
         </div>
       </div>
       <button class="btn-primary" id="regBtn" onclick="doRegister()">注册</button>
+      <div style="text-align:right;margin-top:8px;"><a style="color:#38bdf8;font-size:12px;cursor:pointer;" onclick="switchTab('login')">已有账号？去登录</a></div>
       <div class="auth-msg" id="regMsg"></div>
     </div>
 
     <!-- 登录表单 -->
-    <div class="auth-form" id="loginForm">
+    <div class="auth-form active" id="loginForm">
       <div class="field">
         <label>邮箱</label>
         <input id="loginId" type="text" placeholder="注册时使用的邮箱" />
@@ -139,63 +153,11 @@ const webWizardHTML = `<!DOCTYPE html>
         <input id="loginPwd" type="password" placeholder="密码" />
       </div>
       <button class="btn-primary" id="loginBtn" onclick="doLogin()">登录</button>
-      <div style="text-align:right;margin-top:8px;"><a style="color:#64748b;font-size:12px;cursor:pointer;" onclick="switchTab('resetpwd')">忘记密码？</a></div>
+      <div style="display:flex;justify-content:space-between;margin-top:8px;">
+        <a style="color:#38bdf8;font-size:12px;cursor:pointer;" onclick="switchTab('register')">没有账号？去注册</a>
+        <a style="color:#64748b;font-size:12px;cursor:pointer;" onclick="switchTab('resetpwd')">忘记密码？</a>
+      </div>
       <div class="auth-msg" id="loginMsg"></div>
-    </div>
-
-    <!-- 绑定已有账号 -->
-    <div class="auth-form" id="bindForm">
-      <div class="hint" style="margin-bottom:16px;color:#94a3b8;">已有工号但还没绑定邮箱？输入原工号和姓名验证身份后，即可绑定邮箱，历史数据全部保留。</div>
-      <div class="row">
-        <div class="field">
-          <label>原工号 *</label>
-          <input id="bindEid" type="text" placeholder="例如：10001" />
-        </div>
-        <div class="field">
-          <label>姓名 *</label>
-          <input id="bindName" type="text" value="{{.UserName}}" placeholder="与工号对应的姓名" />
-        </div>
-      </div>
-      <div class="field">
-        <label>邮箱 *</label>
-        <input id="bindEmail" type="email" placeholder="绑定后用邮箱登录" />
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>设置密码 *</label>
-          <input id="bindPwd" type="password" placeholder="至少6位" />
-        </div>
-        <div class="field">
-          <label>确认密码 *</label>
-          <input id="bindPwd2" type="password" placeholder="再次输入" />
-        </div>
-      </div>
-      <button class="btn-primary" id="bindBtn" onclick="doBind()">绑定邮箱</button>
-      <div class="auth-msg" id="bindMsg"></div>
-    </div>
-
-    <!-- 修改密码表单 -->
-    <div class="auth-form" id="changepwdForm">
-      <div class="field">
-        <label>邮箱 *</label>
-        <input id="cpEmail" type="text" placeholder="注册时使用的邮箱" />
-      </div>
-      <div class="field">
-        <label>旧密码 *</label>
-        <input id="cpOldPwd" type="password" placeholder="当前密码" />
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>新密码 *</label>
-          <input id="cpNewPwd" type="password" placeholder="至少6位" />
-        </div>
-        <div class="field">
-          <label>确认新密码 *</label>
-          <input id="cpNewPwd2" type="password" placeholder="再次输入" />
-        </div>
-      </div>
-      <button class="btn-primary" id="cpBtn" onclick="doChangePassword()">修改密码</button>
-      <div class="auth-msg" id="cpMsg"></div>
     </div>
 
     <!-- 忘记密码表单 -->
@@ -222,6 +184,7 @@ const webWizardHTML = `<!DOCTYPE html>
         </div>
       </div>
       <button class="btn-primary" id="rpBtn" onclick="doResetPassword()">重置密码</button>
+      <div style="text-align:right;margin-top:8px;"><a style="color:#38bdf8;font-size:12px;cursor:pointer;" onclick="switchTab('login')">想起密码？返回登录</a></div>
       <div class="auth-msg" id="rpMsg"></div>
     </div>
   </div>
@@ -232,22 +195,64 @@ const webWizardHTML = `<!DOCTYPE html>
       <div class="user-name" id="displayName"></div>
       <div class="user-detail" id="displayDetail"></div>
     </div>
+    <div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct) | 已上报: 0</div>
 
-    <div class="advanced-toggle"><a onclick="toggleAdvanced()">▶ 高级选项</a></div>
-    <div class="advanced" id="advancedSection">
-      <div class="field">
-        <label>上游代理（高级，可选）</label>
-        <input id="upstreamProxy" type="text" placeholder="通常留空；必须串接公司/本地代理时才填写" />
-        <div class="hint">默认不依赖上游地址，按本机网络直连</div>
+    <div class="panel">
+      <div class="panel-title">一键模式切换</div>
+      <div class="btn-grid">
+        <button class="btn-secondary btn-small" id="modeObserveBtn" onclick="switchMode('observe')">观察模式</button>
+        <button class="btn-secondary btn-small" id="modeSessionBtn" onclick="switchMode('session_pac')">会话PAC模式</button>
+        <button class="btn-secondary btn-small" id="modeGlobalBtn" onclick="switchMode('global_install')">全局接管模式</button>
+        <button class="btn-secondary btn-small" id="modeCleanupBtn" onclick="switchMode('cleanup')">一键恢复网络</button>
       </div>
-      <div class="field">
-        <label>监听端口</label>
-        <input id="port" type="number" value="18090" min="1024" max="65535" />
-      </div>
+      <div class="hint" id="modeHint" style="margin-top:8px;">当前模式: 未获取</div>
     </div>
 
-    <button class="btn-primary" id="installBtn" onclick="doInstall()">一键安装</button>
-    <button class="btn-secondary" onclick="backToStep1()">返回修改账号</button>
+    <div class="panel">
+      <div class="panel-title">一键启动编辑器 / 终端（已启用自动重启同名运行实例）</div>
+      <div class="btn-grid">
+        <button class="btn-secondary btn-small" onclick="launchPreset('cursor')">启动 Cursor</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('vscode')">启动 VS Code</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('powershell')">启动 PowerShell</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('cmd')">启动 CMD</button>
+      </div>
+      <div class="hint" style="margin-top:8px;">更多 IDE（含 JetBrains）</div>
+      <div class="btn-grid-3">
+        <button class="btn-secondary btn-small" onclick="launchPreset('windsurf')">Windsurf</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('kiro')">Kiro</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('trae')">Trae</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('idea')">IntelliJ IDEA</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('webstorm')">WebStorm</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('pycharm')">PyCharm</button>
+        <button class="btn-secondary btn-small" onclick="launchPreset('goland')">GoLand</button>
+      </div>
+      <div class="field" style="margin-top:10px;">
+        <label>自定义程序路径</label>
+        <input id="customBinary" type="text" placeholder="例如：C:\Program Files\Git\bin\bash.exe" />
+      </div>
+      <div class="field">
+        <label>参数（可选）</label>
+        <input id="customArgs" type="text" placeholder='例如：-l -i' />
+      </div>
+      <button class="btn-secondary btn-small" onclick="launchCustom()">启动自定义程序</button>
+    </div>
+
+    <div id="setupActions">
+      <div class="advanced-toggle"><a onclick="toggleAdvanced()">▶ 高级选项</a></div>
+      <div class="advanced" id="advancedSection">
+        <div class="field">
+          <label>上游代理（高级，可选）</label>
+          <input id="upstreamProxy" type="text" placeholder="通常留空；必须串接公司/本地代理时才填写" />
+          <div class="hint">默认不依赖上游地址，按本机网络直连</div>
+        </div>
+        <div class="field">
+          <label>监听端口</label>
+          <input id="port" type="number" value="18090" min="1024" max="65535" />
+        </div>
+      </div>
+
+      <button class="btn-primary" id="installBtn" onclick="doInstall()">一键安装</button>
+    </div>
     <div id="status"></div>
   </div>
 </div>
@@ -255,28 +260,153 @@ const webWizardHTML = `<!DOCTYPE html>
 <script>
 var authUser = null;
 var basePath = '{{.BasePath}}';
+var consoleStatus = null;
+
+function setStatus(level, text) {
+  var status = document.getElementById('status');
+  status.className = level;
+  status.style.display = 'block';
+  status.textContent = text;
+}
+
+function activateModeButton(mode) {
+  ['modeObserveBtn', 'modeSessionBtn', 'modeGlobalBtn', 'modeCleanupBtn'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('active');
+  });
+  var id = '';
+  if (mode === 'observe') id = 'modeObserveBtn';
+  if (mode === 'session') id = 'modeSessionBtn';
+  if (mode === 'persistent') id = 'modeGlobalBtn';
+  if (id) {
+    var btn = document.getElementById(id);
+    if (btn) btn.classList.add('active');
+  }
+}
+
+function modeText(mode) {
+  if (mode === 'observe') return '观察模式（不接管网络）';
+  if (mode === 'session' || mode === 'session_pac') return '会话PAC模式（退出自动还原）';
+  if (mode === 'persistent' || mode === 'global_install') return '全局接管模式（持久）';
+  if (mode === 'cleanup') return '一键恢复网络';
+  return mode || '未知';
+}
+
+function shortMode(mode) {
+  if (mode === 'observe') return '观察';
+  if (mode === 'session') return '会话PAC';
+  if (mode === 'persistent') return '全局';
+  return mode || '未知';
+}
+
+async function refreshConsoleStatus() {
+  try {
+    var resp = await fetch(basePath + '/api/console/status');
+    if (!resp.ok) return false;
+    var data = await resp.json();
+    if (!data || !data.success || !data.supported) return false;
+    consoleStatus = data;
+    activateModeButton(data.mode);
+    var name = data.user_name || '';
+    var uid = data.user_id || '';
+    var dept = data.department || '';
+    var detail = '服务器：' + (data.server_url || '');
+    if (dept) detail = '部门：' + dept + '  ' + detail;
+    document.getElementById('displayName').textContent = name && uid ? (name + '（' + uid + '）') : (name || '当前用户');
+    document.getElementById('displayDetail').textContent = detail;
+    document.getElementById('modeHint').textContent = '当前模式: ' + modeText(data.mode) + ' | 已上报: ' + (data.total_reported || 0);
+    var upstream = data.upstream_proxy || '(direct)';
+    document.getElementById('quickStatus').textContent = '模式: ' + shortMode(data.mode) + ' | 上游: ' + upstream + ' | 已上报: ' + (data.total_reported || 0);
+    return true;
+  } catch (err) {
+    return false;
+  }
+  return false;
+}
+
+async function switchMode(mode) {
+  var label = modeText(mode);
+  if (mode === 'global_install' && !confirm('确认切换到全局接管模式？这会写入持久网络设置。')) return;
+  if (mode === 'cleanup' && !confirm('确认执行一键恢复网络？这会清理当前代理接管设置。')) return;
+  setStatus('info', '正在切换模式：' + label + ' ...');
+  try {
+    var resp = await fetch(basePath + '/api/console/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: mode }),
+    });
+    var data = await resp.json();
+    if (resp.ok && data.success) {
+      setStatus('success', '✓ ' + data.message);
+      await refreshConsoleStatus();
+    } else {
+      setStatus('error', '✗ ' + (data.message || '模式切换失败'));
+    }
+  } catch (err) {
+    setStatus('error', '✗ 网络错误: ' + err.message);
+  }
+}
+
+async function launchPreset(name) {
+  setStatus('info', '正在启动：' + name + ' ...');
+  try {
+    var resp = await fetch(basePath + '/api/console/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset: name, restart_running: true }),
+    });
+    var data = await resp.json();
+    if (resp.ok && data.success) {
+      setStatus('success', '✓ ' + data.message);
+    } else {
+      setStatus('error', '✗ ' + (data.message || '启动失败'));
+    }
+  } catch (err) {
+    setStatus('error', '✗ 网络错误: ' + err.message);
+  }
+}
+
+async function launchCustom() {
+  var binary = document.getElementById('customBinary').value.trim();
+  var argsText = document.getElementById('customArgs').value.trim();
+  if (!binary) {
+    setStatus('error', '✗ 请先输入自定义程序路径');
+    return;
+  }
+  var args = argsText ? argsText.split(/\s+/).filter(Boolean) : [];
+  setStatus('info', '正在启动自定义程序...');
+  try {
+    var resp = await fetch(basePath + '/api/console/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ custom_binary: binary, custom_args: args, restart_running: true }),
+    });
+    var data = await resp.json();
+    if (resp.ok && data.success) {
+      setStatus('success', '✓ ' + data.message);
+    } else {
+      setStatus('error', '✗ ' + (data.message || '启动失败'));
+    }
+  } catch (err) {
+    setStatus('error', '✗ 网络错误: ' + err.message);
+  }
+}
 
 function switchTab(tab) {
   document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
   document.querySelectorAll('.auth-form').forEach(function(f){ f.classList.remove('active'); });
   var tabs = document.querySelectorAll('.tabs .tab');
-  if (tab === 'register') {
+  if (tab === 'login') {
     tabs[0].classList.add('active');
-    document.getElementById('registerForm').classList.add('active');
-  } else if (tab === 'login') {
-    tabs[1].classList.add('active');
     document.getElementById('loginForm').classList.add('active');
-  } else if (tab === 'bind') {
-    tabs[2].classList.add('active');
-    document.getElementById('bindForm').classList.add('active');
-  } else if (tab === 'changepwd') {
-    tabs[3].classList.add('active');
-    document.getElementById('changepwdForm').classList.add('active');
+  } else if (tab === 'register') {
+    tabs[1].classList.add('active');
+    document.getElementById('registerForm').classList.add('active');
   } else {
-    tabs[4].classList.add('active');
+    tabs[2].classList.add('active');
     document.getElementById('resetpwdForm').classList.add('active');
   }
-  hideMsg('regMsg'); hideMsg('loginMsg'); hideMsg('bindMsg'); hideMsg('cpMsg'); hideMsg('rpMsg');
+  hideMsg('regMsg'); hideMsg('loginMsg'); hideMsg('rpMsg');
 }
 
 function showMsg(id, text, level) {
@@ -363,86 +493,6 @@ async function doLogin() {
   btn.disabled = false; btn.textContent = '登录';
 }
 
-async function doBind() {
-  var eid = document.getElementById('bindEid').value.trim();
-  var name = document.getElementById('bindName').value.trim();
-  var email = document.getElementById('bindEmail').value.trim();
-  var pwd = document.getElementById('bindPwd').value;
-  var pwd2 = document.getElementById('bindPwd2').value;
-  if (!eid) { showMsg('bindMsg', '请填写原工号', 'error'); return; }
-  if (!name) { showMsg('bindMsg', '请填写姓名', 'error'); return; }
-  if (!email) { showMsg('bindMsg', '请填写邮箱', 'error'); return; }
-  if (!pwd || pwd.length < 6) { showMsg('bindMsg', '密码至少6位', 'error'); return; }
-  if (pwd !== pwd2) { showMsg('bindMsg', '两次密码不一致', 'error'); return; }
-  if (!getServerUrl()) { showMsg('bindMsg', '请填写上报服务器地址', 'error'); return; }
-
-  var btn = document.getElementById('bindBtn');
-  btn.disabled = true; btn.textContent = '绑定中…';
-  hideMsg('bindMsg');
-
-  try {
-    var resp = await fetch(basePath + '/api/auth/bind-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ server_url: getServerUrl(), employee_id: eid, name: name, email: email, password: pwd }),
-    });
-    var data = await resp.json();
-    if (resp.ok && data.employee_id) {
-      authUser = { employee_id: data.employee_id, name: data.name || name, department: data.department || '', auth_token: data.auth_token || '' };
-      showMsg('bindMsg', '绑定成功！历史数据已保留。', 'success');
-      setTimeout(function(){ goToStep2(); }, 800);
-    } else {
-      var msg = data.detail || data.message || '绑定失败';
-      if (resp.status === 403) msg = '姓名与该工号记录不匹配';
-      if (resp.status === 404) msg = '未找到该工号对应的账号';
-      if (resp.status === 409) msg = '该邮箱已被其他账号使用';
-      showMsg('bindMsg', msg, 'error');
-    }
-  } catch(err) {
-    showMsg('bindMsg', '网络错误: ' + err.message, 'error');
-  }
-  btn.disabled = false; btn.textContent = '绑定邮箱';
-}
-
-async function doChangePassword() {
-  var email = document.getElementById('cpEmail').value.trim();
-  var oldPwd = document.getElementById('cpOldPwd').value;
-  var newPwd = document.getElementById('cpNewPwd').value;
-  var newPwd2 = document.getElementById('cpNewPwd2').value;
-  if (!email) { showMsg('cpMsg', '请填写邮箱', 'error'); return; }
-  if (!oldPwd) { showMsg('cpMsg', '请填写旧密码', 'error'); return; }
-  if (!newPwd || newPwd.length < 6) { showMsg('cpMsg', '新密码至少6位', 'error'); return; }
-  if (newPwd !== newPwd2) { showMsg('cpMsg', '两次新密码不一致', 'error'); return; }
-  if (oldPwd === newPwd) { showMsg('cpMsg', '新密码不能与旧密码相同', 'error'); return; }
-  if (!getServerUrl()) { showMsg('cpMsg', '请填写上报服务器地址', 'error'); return; }
-
-  var btn = document.getElementById('cpBtn');
-  btn.disabled = true; btn.textContent = '修改中…';
-  hideMsg('cpMsg');
-
-  try {
-    var resp = await fetch(basePath + '/api/auth/change-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ server_url: getServerUrl(), email: email, old_password: oldPwd, new_password: newPwd }),
-    });
-    var data = await resp.json();
-    if (resp.ok && data.employee_id) {
-      authUser = { employee_id: data.employee_id, name: data.name || '', department: data.department || '', auth_token: data.auth_token || '' };
-      showMsg('cpMsg', '密码修改成功！', 'success');
-      setTimeout(function(){ goToStep2(); }, 800);
-    } else {
-      var msg = data.detail || data.message || '修改失败';
-      if (resp.status === 401) msg = '邮箱或旧密码错误';
-      if (resp.status === 400) msg = data.detail || '新密码不能与旧密码相同';
-      showMsg('cpMsg', msg, 'error');
-    }
-  } catch(err) {
-    showMsg('cpMsg', '网络错误: ' + err.message, 'error');
-  }
-  btn.disabled = false; btn.textContent = '修改密码';
-}
-
 async function doResetPassword() {
   var email = document.getElementById('rpEmail').value.trim();
   var name = document.getElementById('rpName').value.trim();
@@ -486,6 +536,7 @@ function goToStep2() {
   document.getElementById('step2').classList.add('active');
   document.getElementById('dot1').classList.remove('active');
   document.getElementById('dot2').classList.add('active');
+  setSetupVisible(!!authUser);
   if (authUser) {
     document.getElementById('displayName').textContent = authUser.name + '（' + authUser.employee_id + '）';
     var detail = '';
@@ -495,13 +546,19 @@ function goToStep2() {
   }
 }
 
-function backToStep1() {
+function setSetupVisible(visible) {
+  var setupActions = document.getElementById('setupActions');
+  if (setupActions) setupActions.style.display = visible ? 'block' : 'none';
+}
+
+function showAuthStep(tab) {
   document.getElementById('step2').classList.remove('active');
   document.getElementById('step1').classList.add('active');
   document.getElementById('dot2').classList.remove('active');
   document.getElementById('dot1').classList.add('active');
   document.getElementById('status').className = '';
   document.getElementById('status').style.display = 'none';
+  switchTab(tab || 'login');
 }
 
 function toggleAdvanced() {
@@ -509,12 +566,12 @@ function toggleAdvanced() {
 }
 
 async function doInstall() {
-  if (!authUser) { alert('请先登录或注册'); backToStep1(); return; }
+  if (!authUser) { alert('请先登录或注册'); showAuthStep('login'); return; }
   var btn = document.getElementById('installBtn');
   var status = document.getElementById('status');
   btn.disabled = true; btn.textContent = '正在安装...';
   status.className = 'info'; status.style.display = 'block';
-  status.textContent = '正在安装证书、配置环境变量、注册开机自启...';
+  status.textContent = '正在保存配置并安装证书...';
 
   try {
     var resp = await fetch(basePath + '/api/setup', {
@@ -546,6 +603,15 @@ async function doInstall() {
     btn.disabled = false; btn.textContent = '重试安装';
   }
 }
+
+window.addEventListener('load', function() {
+  refreshConsoleStatus().then(function(supported) {
+    if (supported) {
+      // 运行态默认进入控制台页；已登录后不再展示注册/登录入口。
+      goToStep2();
+    }
+  });
+});
 </script>
 </body>
 </html>`
@@ -564,6 +630,37 @@ type setupResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 }
+
+type consoleStatusResponse struct {
+	Success       bool   `json:"success"`
+	Supported     bool   `json:"supported"`
+	Mode          string `json:"mode,omitempty"`
+	UserName      string `json:"user_name,omitempty"`
+	UserID        string `json:"user_id,omitempty"`
+	Department    string `json:"department,omitempty"`
+	ServerURL     string `json:"server_url,omitempty"`
+	UpstreamProxy string `json:"upstream_proxy,omitempty"`
+	TotalReported int64  `json:"total_reported,omitempty"`
+	Message       string `json:"message,omitempty"`
+}
+
+type consoleModeRequest struct {
+	Mode string `json:"mode"`
+}
+
+type consoleLaunchRequest struct {
+	Preset         string   `json:"preset"`
+	CustomBinary   string   `json:"custom_binary"`
+	CustomArgs     []string `json:"custom_args"`
+	RestartRunning bool     `json:"restart_running"`
+}
+
+type consoleActionResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+var wizardActionMu sync.Mutex
 
 // runWebWizard starts a local web server with a setup page and opens it in the browser.
 // Blocks until the user completes setup or closes the page.
@@ -645,6 +742,31 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
+	})
+
+	mux.HandleFunc("/api/console/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(consoleStatusResponse{
+			Success:   true,
+			Supported: false,
+			Message:   "当前为首次安装向导，尚未进入运行态控制台",
+		})
+	})
+	mux.HandleFunc("/api/console/mode", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(consoleActionResponse{
+			Success: false,
+			Message: "首次安装向导不支持切换运行模式，请先完成安装并正常启动 ai-monitor",
+		})
+	})
+	mux.HandleFunc("/api/console/launch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(consoleActionResponse{
+			Success: false,
+			Message: "首次安装向导不支持一键启动，请先完成安装并正常启动 ai-monitor",
+		})
 	})
 
 	// Handle setup submission
@@ -792,6 +914,19 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if subPath == "/api/console/status" && r.Method == http.MethodGet {
+		s.handleConsoleStatus(w, r)
+		return
+	}
+	if subPath == "/api/console/mode" && r.Method == http.MethodPost {
+		s.handleConsoleModeSwitch(w, r)
+		return
+	}
+	if subPath == "/api/console/launch" && r.Method == http.MethodPost {
+		s.handleConsoleLaunch(w, r)
+		return
+	}
+
 	// Proxy auth requests to the remote server
 	if strings.HasPrefix(subPath, "/api/auth/") && r.Method == http.MethodPost {
 		var reqBody struct {
@@ -886,6 +1021,156 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.NotFound(w, r)
+}
+
+func (s *ProxyServer) handleConsoleStatus(w http.ResponseWriter, _ *http.Request) {
+	resp := consoleStatusResponse{
+		Success:    true,
+		Supported:  true,
+		Mode:       s.currentTakeoverMode(),
+		UserName:   s.cfg.UserName,
+		UserID:     s.cfg.UserID,
+		Department: s.cfg.Department,
+		ServerURL:  s.cfg.ServerURL,
+		UpstreamProxy: func() string {
+			if strings.TrimSpace(s.cfg.UpstreamProxy) == "" {
+				return "(direct)"
+			}
+			return strings.TrimSpace(s.cfg.UpstreamProxy)
+		}(),
+	}
+	if s.reporter != nil {
+		resp.TotalReported = s.reporter.Stats.TotalReported.Load()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *ProxyServer) handleConsoleModeSwitch(w http.ResponseWriter, r *http.Request) {
+	var req consoleModeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "请求格式错误"})
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	wizardActionMu.Lock()
+	defer wizardActionMu.Unlock()
+
+	var message string
+	switch mode {
+	case "observe":
+		st := loadInstallState()
+		restoreProxyFromState(st)
+		restoreOrClearEnvVars(st)
+		if st != nil && st.SessionOnly {
+			clearInstallState()
+		}
+		s.SetTakeoverMode("observe")
+		message = "已切换到观察模式（当前不接管系统网络）"
+	case "session_pac":
+		st := loadInstallState()
+		if st != nil && st.SystemProxySet && !st.SessionOnly {
+			applySessionManagedProxy(s.cfg, s.certMgr, s.listenPort)
+			s.SetTakeoverMode("persistent")
+			message = "当前为全局接管配置，已保持持久接管模式生效"
+		} else {
+			applyTemporarySessionProxy(s.cfg, s.certMgr, s.listenPort)
+			s.SetTakeoverMode("session")
+			message = "已切换到会话PAC模式（退出自动还原）"
+		}
+	case "global_install":
+		doGlobalInstall(s.certMgr, s.cfg, s.configPath)
+		applySessionManagedProxy(s.cfg, s.certMgr, s.listenPort)
+		s.SetTakeoverMode("persistent")
+		message = "已切换到全局接管模式（持久）"
+	case "cleanup":
+		st := loadInstallState()
+		restoreProxyFromState(st)
+		clearAIMonitorPACIfCurrent()
+		restoreOrClearEnvVars(st)
+		removeAIMonitorIDEProxy()
+		if clearConfiguredUpstreamProxy(s.configPath) {
+			s.cfg.UpstreamProxy = ""
+		}
+		clearSavedUpstreamProxy()
+		clearInstallState()
+		s.SetTakeoverMode("observe")
+		message = "网络接管残留已清理，当前为观察模式"
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "未知模式"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: true, Message: message})
+}
+
+func (s *ProxyServer) handleConsoleLaunch(w http.ResponseWriter, r *http.Request) {
+	var req consoleLaunchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "请求格式错误"})
+		return
+	}
+	wizardActionMu.Lock()
+	defer wizardActionMu.Unlock()
+
+	presetName := strings.ToLower(strings.TrimSpace(req.Preset))
+	var command []string
+	var preset *launchPreset
+
+	if presetName != "" {
+		var err error
+		command, preset, err = resolveLaunchCommand(nil, presetName, exec.LookPath)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: err.Error()})
+			return
+		}
+		if req.RestartRunning {
+			if image, _ := managedPresetProcessImage(preset); image != "" {
+				_ = exec.Command("taskkill", "/F", "/IM", image).Run()
+				time.Sleep(1200 * time.Millisecond)
+			}
+		}
+	} else {
+		bin := strings.TrimSpace(req.CustomBinary)
+		if bin == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "请提供 preset 或 custom_binary"})
+			return
+		}
+		if !strings.ContainsAny(bin, `\/:`) {
+			if resolved, err := exec.LookPath(bin); err == nil {
+				bin = resolved
+			}
+		}
+		command = append([]string{bin}, req.CustomArgs...)
+	}
+
+	if err := launchChildWithExistingProxyDetached(s.cfg, s.certMgr, command, preset, s.listenPort); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "启动失败: " + err.Error()})
+		return
+	}
+
+	target := presetName
+	if target == "" {
+		target = command[0]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(consoleActionResponse{
+		Success: true,
+		Message: "已启动 " + target + "（自动注入代理环境）",
+	})
 }
 
 func openBrowser(url string) {

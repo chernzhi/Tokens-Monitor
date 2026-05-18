@@ -227,6 +227,38 @@ func ClearEnvProxy(keys []string) {
 	log.Println("[proxy] environment variables cleared")
 }
 
+// ReadUserLevelEnv 读取 HKCU\Environment 中指定环境变量的当前值（不依赖进程 env）。
+//
+// 用途：判断旧版 ai-monitor 全局安装是否在用户级环境变量里留下了诸如
+//
+//	HTTP_PROXY=http://127.0.0.1:18090
+//
+// 这类「指向自己」的残留。仅依赖 os.Getenv 时，如果父进程没继承（例如新开
+// 一个被 setx 清掉的会话），就完全检测不到 → 残留永远清不掉。
+//
+// 返回值：注册表里的字符串值；键不存在或读取失败时返回空串。
+func ReadUserLevelEnv(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	out, err := exec.Command("reg", "query", envRegPath, "/v", name).Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, name) {
+			continue
+		}
+		for _, regType := range []string{"REG_EXPAND_SZ", "REG_SZ"} {
+			if idx := strings.Index(line, regType); idx >= 0 {
+				return strings.TrimSpace(line[idx+len(regType):])
+			}
+		}
+	}
+	return ""
+}
+
 // ReadCurrentAutoConfigURL reads the current AutoConfigURL from the WinINet registry.
 // Returns "" if not set or on error.
 func ReadCurrentAutoConfigURL() string {

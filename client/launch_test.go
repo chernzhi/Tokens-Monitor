@@ -21,7 +21,15 @@ func TestResolveLaunchCommand_ExplicitCommand(t *testing.T) {
 	}
 }
 
+// 验证 resolveLaunchCommand 在「KnownPaths 全部不存在」时正确回退到 lookPath，
+// 同时附加 args 与 preset.Args 的拼接逻辑。
+// 用 t.Setenv 把 KnownPaths 里出现的 env vars 都指向不存在的目录，
+// 避免依赖本机是否真的装了 VS Code（v3.1.0 起 GUI 预设优先扫 KnownPaths）。
 func TestResolveLaunchCommand_Preset(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", `C:\__nope__\LOCALAPPDATA`)
+	t.Setenv("PROGRAMFILES", `C:\__nope__\PROGRAMFILES`)
+	t.Setenv("PROGRAMFILES(X86)", `C:\__nope__\PROGRAMFILES_X86`)
+
 	args, preset, err := resolveLaunchCommand([]string{"--new-window"}, "vscode", func(cmd string) (string, error) {
 		if cmd == "code.cmd" {
 			return `C:\Tools\code.cmd`, nil
@@ -67,25 +75,121 @@ func TestResolvePresetBinary_MissingBinary(t *testing.T) {
 	}
 }
 
-func TestResolvePresetBinary_FallsBackToKnownPaths(t *testing.T) {
+// GUI 预设：KnownPath 存在时 *必须先* 命中 KnownPath，不能去走 PATH 里的 .cmd shim。
+// 这是 3.1.0 修复的核心——cursor.cmd 这类 shim 启动 GUI 后立即返回 0，
+// ai-monitor 会跟着退出，监控失效。
+func TestResolvePresetBinary_GUIPresetPrefersKnownPathOverShim(t *testing.T) {
 	preset := launchPreset{
-		Name:       "vscode",
-		Candidates: []string{"code.cmd"},
-		KnownPaths: []string{`C:\Users\tester\AppData\Local\Programs\Microsoft VS Code\Code.exe`},
+		Name:       "cursor",
+		Candidates: []string{"cursor.exe", "cursor.cmd", "cursor"},
+		KnownPaths: []string{`C:\Program Files\Cursor\Cursor.exe`},
 	}
 	got, tried, err := resolvePresetBinary(preset, func(cmd string) (string, error) {
+		// 模拟用户机器：cursor.exe 不在 PATH，cursor.cmd 在 PATH（shim）
+		if cmd == "cursor.cmd" {
+			return `C:\Program Files\cursor\resources\app\bin\cursor.cmd`, nil
+		}
 		return "", fmt.Errorf("not found")
 	}, func(path string) bool {
-		return path == `C:\Users\tester\AppData\Local\Programs\Microsoft VS Code\Code.exe`
+		return path == `C:\Program Files\Cursor\Cursor.exe`
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != `C:\Users\tester\AppData\Local\Programs\Microsoft VS Code\Code.exe` {
-		t.Fatalf("unexpected resolved path: %q", got)
+	if got != `C:\Program Files\Cursor\Cursor.exe` {
+		t.Fatalf("GUI 预设必须优先用 KnownPath 的 .exe，避开 .cmd shim；got %q", got)
 	}
-	if len(tried) != 2 {
-		t.Fatalf("expected 2 tried entries, got %#v", tried)
+	// 解析顺序：先 KnownPath 命中即返回，不应再去走 lookPath。
+	if len(tried) != 1 {
+		t.Fatalf("expected 1 tried entry (KnownPath hit first), got %#v", tried)
+	}
+}
+
+// GUI 预设：KnownPath 都不存在时才回退到 PATH（可能拿到 .cmd shim）。
+// 这条路径会触发 resolveLaunchCommand 中的告警日志，但仍能让用户跑起来。
+func TestResolvePresetBinary_GUIPresetFallsBackToPathWhenKnownMissing(t *testing.T) {
+	preset := launchPreset{
+		Name:       "cursor",
+		Candidates: []string{"cursor.exe", "cursor.cmd"},
+		KnownPaths: []string{`C:\NonExistent\Cursor\Cursor.exe`},
+	}
+	got, tried, err := resolvePresetBinary(preset, func(cmd string) (string, error) {
+		if cmd == "cursor.cmd" {
+			return `C:\Program Files\cursor\resources\app\bin\cursor.cmd`, nil
+		}
+		return "", fmt.Errorf("not found")
+	}, func(path string) bool {
+		return false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `C:\Program Files\cursor\resources\app\bin\cursor.cmd` {
+		t.Fatalf("KnownPath 不存在时应回退到 lookPath；got %q", got)
+	}
+	// 解析顺序：先尝试 KnownPath（1 entry），再尝试 lookPath（2 entries：cursor.exe + cursor.cmd）。
+	if len(tried) != 3 {
+		t.Fatalf("expected 3 tried entries (1 KnownPath + 2 Candidates), got %#v", tried)
+	}
+}
+
+// CLI 预设（powershell / cmd / codex / claude-code）保留旧顺序：PATH 优先。
+// 这些工具的入口本来就是命令名，KnownPaths 只是兜底。
+func TestResolvePresetBinary_CLIPresetKeepsPathFirst(t *testing.T) {
+	preset := launchPreset{
+		Name:       "powershell",
+		Candidates: []string{"pwsh.exe", "powershell.exe"},
+		KnownPaths: []string{`C:\Program Files\PowerShell\7\pwsh.exe`},
+	}
+	got, _, err := resolvePresetBinary(preset, func(cmd string) (string, error) {
+		if cmd == "pwsh.exe" {
+			return `C:\Program Files\PowerShell\7\pwsh.exe`, nil
+		}
+		return "", fmt.Errorf("not found")
+	}, func(path string) bool {
+		// 故意让 KnownPaths 也存在，验证 CLI 预设*不会*被它顶上来
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `C:\Program Files\PowerShell\7\pwsh.exe` {
+		t.Fatalf("CLI 预设应保留 lookPath 优先；got %q", got)
+	}
+}
+
+func TestIsShimExecutable(t *testing.T) {
+	cases := map[string]bool{
+		`C:\Program Files\cursor\resources\app\bin\cursor.cmd`: true,
+		`C:\Tools\code.cmd`:                                    true,
+		`C:\Tools\foo.bat`:                                     true,
+		`C:\Tools\bar.ps1`:                                     true,
+		`C:\Program Files\cursor\Cursor.exe`:                   false,
+		`/usr/local/bin/cursor`:                                false,
+		``:                                                     false,
+	}
+	for path, want := range cases {
+		if got := isShimExecutable(path); got != want {
+			t.Errorf("isShimExecutable(%q)=%v want %v", path, got, want)
+		}
+	}
+}
+
+func TestIsGUIPreset(t *testing.T) {
+	gui := []string{"vscode", "cursor", "windsurf", "kiro", "vscodium", "trae"}
+	for _, n := range gui {
+		if !isGUIPreset(&launchPreset{Name: n}) {
+			t.Errorf("%s 应被识别为 GUI 预设", n)
+		}
+	}
+	cli := []string{"powershell", "cmd", "claude-code", "codex", "idea", "webstorm", "pycharm", "goland", "zed", "qoder"}
+	for _, n := range cli {
+		if isGUIPreset(&launchPreset{Name: n}) {
+			t.Errorf("%s 不应被识别为 GUI 预设（不会触发 KnownPaths 优先）", n)
+		}
+	}
+	if isGUIPreset(nil) {
+		t.Error("nil preset 不应被识别为 GUI")
 	}
 }
 

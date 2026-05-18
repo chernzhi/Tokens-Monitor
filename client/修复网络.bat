@@ -4,9 +4,10 @@ chcp 65001 >nul 2>&1
 cd /d "%~dp0"
 title AI Token 监控 — 修复网络
 echo.
-echo   若上次异常退出后，系统代理仍指向无效端口，可运行本脚本恢复。
-echo   优先：本目录或 dist 下的 ai-monitor.exe 执行 --heal（按 install_state 安全还原）；
-echo   若未找到程序：可选仅将「手动代理」开关置为关（不还原你曾用的具体公司代理，也不动 PAC/环境变量）。
+echo   一键修复因 ai-monitor 残留导致的网络异常。处理顺序：
+echo     1) 优先调用 ai-monitor --cleanup-network 全量清理（PAC/代理/环境变量/IDE/开机自启）；
+echo     2) 兜底调用 ai-monitor --heal（按 install_state 安全还原 + 扫除孤儿注册表项）；
+echo     3) 仍无 ai-monitor.exe 时，最后才可选「仅置 ProxyEnable=0」紧急关代理。
 echo.
 
 set "INET_REG=HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -20,6 +21,18 @@ if exist "%APPDATA%\ai-monitor\config.json" set "HEAL_CONFIG=%APPDATA%\ai-monito
 if not defined HEAL_CONFIG if exist "%~dp0config.json" set "HEAL_CONFIG=%~dp0config.json"
 
 if defined EXE (
+  echo   [1/2] 执行 --cleanup-network（停后台实例 / 清 PAC / 还原环境变量 / 清 IDE 代理）...
+  if defined HEAL_CONFIG (
+    "%EXE%" --cleanup-network --config "%HEAL_CONFIG%"
+  ) else (
+    "%EXE%" --cleanup-network
+  )
+  if errorlevel 1 (
+    echo   --cleanup-network 失败，继续尝试 --heal 兜底...
+  )
+
+  echo.
+  echo   [2/2] 执行 --heal（扫除孤儿 AutoConfigURL / HTTP_PROXY 等残留）...
   if defined HEAL_CONFIG (
     "%EXE%" --heal --config "%HEAL_CONFIG%"
   ) else (
@@ -32,7 +45,8 @@ if defined EXE (
     exit /b 1
   )
   echo.
-  echo   若浏览器/终端仍走旧代理，请完全关闭后重开，或重新打开本窗口后再试网络。
+  echo   完成。若浏览器/终端仍走旧代理，请完全关闭后重开，让 WinINet 重新读取注册表。
+  pause
   exit /b 0
 )
 

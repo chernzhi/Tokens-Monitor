@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,13 @@ import (
 func runHealMode(configPath string) int {
 	st := loadInstallState()
 	if st == nil || !st.SystemProxySet {
+		// install_state 没记录变更，也要兜底清理「孤儿 PAC URL」——上次异常
+		// 退出可能没写 install_state 但已写 AutoConfigURL，留下死链让浏览器/IDE
+		// 反复尝试加载不存在的 PAC，表现为「打开 ai-monitor 又关掉之后网络变差」。
+		if removed := healOrphanAIMonitorRegistry(); removed {
+			fmt.Println("  [heal] 已清理上次残留的 ai-monitor 注册表项（孤儿 PAC / 自指代理）。")
+			return 0
+		}
 		fmt.Println("  [heal] install_state 未记录系统代理变更，无需恢复。")
 		return 0
 	}
@@ -48,6 +56,9 @@ func runHealMode(configPath string) int {
 	if runtime.GOOS == "windows" {
 		restoreProxyFromState(st)
 		restoreOrClearEnvVars(st)
+		// 兜底：即使 install_state 没把 ai-monitor PAC URL 记到 PACFileSet 路径，
+		// 也尝试扫一遍当前注册表，剔除任何指向我们自己的孤儿值。
+		healOrphanAIMonitorRegistry()
 		fmt.Println("  [heal] 已恢复系统代理/PAC 与用户级环境变量。")
 	}
 
@@ -65,6 +76,48 @@ func runHealMode(configPath string) int {
 		fmt.Println("  [heal] 提示：下次启动 ai-monitor 时才会临时接管代理，关闭后会恢复。")
 	}
 	return 0
+}
+
+// healOrphanAIMonitorRegistry 扫除 Windows 注册表里残留的 ai-monitor 配置：
+//   - AutoConfigURL 是 file:///%APPDATA%/ai-monitor/proxy.pac
+//   - ProxyEnable=1 且 ProxyServer=127.0.0.1:<MITM 端口范围>
+//   - HKCU\Environment 里 HTTP_PROXY / HTTPS_PROXY 等指向自己
+//
+// 用于以下两类场景：
+//  1. taskkill /F 后 install_state 不存在但注册表残留；
+//  2. 用户手动改了 install_state 后又把 ai-monitor 当作普通程序运行。
+//
+// 返回 true 表示确实清理了某项配置；false 表示无残留。
+func healOrphanAIMonitorRegistry() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	cleaned := false
+	if pac := ReadCurrentAutoConfigURL(); isAIMonitorPACURL(pac) {
+		fmt.Printf("  [heal] 删除孤儿 AutoConfigURL: %s\n", pac)
+		DisableSystemProxyPAC()
+		removePACFile()
+		cleaned = true
+	}
+	if sys := readCurrentSystemProxy(); isSelfProxy(sys) {
+		fmt.Printf("  [heal] 关闭指向自身的系统代理: %s\n", sys)
+		DisableSystemProxy()
+		cleaned = true
+	}
+	var orphanKeys []string
+	for _, key := range proxyEnvKeys {
+		userV := strings.TrimSpace(ReadUserLevelEnv(key))
+		procV := strings.TrimSpace(os.Getenv(key))
+		if isAIMonitorManagedEnvValue(userV) || isAIMonitorManagedEnvValue(procV) {
+			orphanKeys = append(orphanKeys, key)
+		}
+	}
+	if len(orphanKeys) > 0 {
+		fmt.Printf("  [heal] 清理指向 ai-monitor 的用户级环境变量: %v\n", orphanKeys)
+		ClearEnvProxy(orphanKeys)
+		cleaned = true
+	}
+	return cleaned
 }
 
 // instanceHealthy 探测 instance.json 中记录的端口 /status 是否 200。

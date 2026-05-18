@@ -52,6 +52,37 @@ func detectUpstreamProxy(cfg *Config) string {
 		return v
 	}
 
+	// 4. Fallback: detect commonly used local proxy ports.
+	// 在企业网络里，很多机器会常驻 sing-box/clash（127.0.0.1:8089/7890 等），
+	// 但不会写到系统代理或环境变量。若 upstream_proxy 为空且直连外网被拦截，
+	// ai-monitor 会出现「本地服务正常但 AI 外联超时」。
+	// 这里做保守兜底：仅探测 loopback 常见端口且端口可连通时才采用。
+	if local := detectCommonLoopbackUpstreamProxy(); local != "" {
+		log.Printf("[upstream] auto-detected local loopback proxy fallback: %s", local)
+		return local
+	}
+
+	return ""
+}
+
+var commonLoopbackUpstreamPorts = []int{
+	8089,  // 用户现场常见：sing-box
+	7890,  // Clash 默认
+	7897,  // Clash Meta 常见
+	10809, // v2ray/sing-box 常见 HTTP 入站
+	20171, // 某些企业代理客户端常见本地端口
+}
+
+func detectCommonLoopbackUpstreamProxy() string {
+	for _, port := range commonLoopbackUpstreamPorts {
+		candidate := "http://127.0.0.1:" + intToString(port)
+		if isSelfProxy(candidate) {
+			continue
+		}
+		if isUsableDetectedProxy(candidate) {
+			return candidate
+		}
+	}
 	return ""
 }
 

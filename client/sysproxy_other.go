@@ -251,6 +251,14 @@ func macProxyExceptions(bypass string) []string {
 	return out
 }
 
+// ReadUserLevelEnv 在非 Windows 平台没有「用户级环境变量注册表」这种概念，
+// 进程级 os.Getenv 已经能拿到 shell 启动时注入的值，故直接返回空串。
+// 之所以仍保留同名 stub 是为了让 main.go 中跨平台逻辑无需 //go:build 分支。
+func ReadUserLevelEnv(name string) string {
+	_ = name
+	return ""
+}
+
 func parseMacAutoProxyURL(output string) string {
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
