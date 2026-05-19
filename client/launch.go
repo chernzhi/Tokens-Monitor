@@ -461,7 +461,10 @@ func launchChildWithExistingProxyDetached(cfg *Config, certMgr *CertManager, com
 	envVars := buildManagedLaunchEnv(cfg, certMgr, sourceApp, port, preset)
 	if runtime.GOOS == "windows" {
 		parts := append([]string{"/c", "start", ""}, commandArgs...)
-		cmd := exec.Command("cmd", parts...)
+		// 用 newHiddenCmd 包裹，避免 ai-monitor 在 WebView2 / 无控制台父进程下
+		// 启动 cmd.exe 时弹出一个临时 conhost 黑窗，让用户误以为「启动了多个终端」。
+		// 真正的目标窗口（powershell / cmd / GUI 编辑器）由 `start` 正常打开，不受影响。
+		cmd := newHiddenCmd("cmd", parts...)
 		cmd.Env = mergeEnv(os.Environ(), envVars)
 		return cmd.Start()
 	}
@@ -709,7 +712,8 @@ func killAndRelaunchEditors(editors []runningElectronEditor, out io.Writer) {
 func relaunchDetached(path string) error {
 	if runtime.GOOS == "windows" {
 		// start "" path  —— 第一个 "" 是 start 命令必需的窗口标题占位
-		return exec.Command("cmd", "/c", "start", "", path).Start()
+		// 用 newHiddenCmd 隐藏 cmd 包装器自身的 conhost 黑窗，避免「多出一个终端」。
+		return newHiddenCmd("cmd", "/c", "start", "", path).Start()
 	}
 	cmd := exec.Command(path)
 	return cmd.Start()
