@@ -77,7 +77,7 @@ func acquireSingletonLock() (release func(), ok bool, err error) {
 
 	lockHandle = h
 	lockFile = p
-	return func() { releaseSingletonLockLocked() }, true, nil
+	return func() { releaseSingletonLock() }, true, nil
 }
 
 func waitForSingletonLock(timeout time.Duration) (release func(), err error) {
