@@ -16,26 +16,44 @@ set "TARGET=%~1"
 set "NEW=%~2"
 set "BACKUP=%~3"
 set "LOG=%~4"
+set "OLDPID=%~5"
 
 > "%LOG%" echo [updater] %DATE% %TIME% start
 >>"%LOG%" echo TARGET=%TARGET%
 >>"%LOG%" echo NEW=%NEW%
 >>"%LOG%" echo BACKUP=%BACKUP%
+>>"%LOG%" echo OLDPID=%OLDPID%
 
-REM 备份当前 exe（即使父进程未退出 copy 仍可读）
+REM 1) 等待旧进程优雅退出，最多 ~10s
+set /a WAIT=0
+:waitloop
+tasklist /FI "PID eq %OLDPID%" 2>nul | findstr /C:"%OLDPID%" >nul
+if errorlevel 1 goto killed
+set /a WAIT+=1
+if %WAIT% GEQ 20 goto forcekill
+ping -n 2 127.0.0.1 >nul
+goto waitloop
+
+:forcekill
+>>"%LOG%" echo old pid %OLDPID% still alive after 10s, force kill
+taskkill /PID %OLDPID% /T /F >>"%LOG%" 2>&1
+ping -n 2 127.0.0.1 >nul
+
+:killed
+REM 2) 备份当前 exe
 copy /Y "%TARGET%" "%BACKUP%" >>"%LOG%" 2>&1
 if errorlevel 1 (
   >>"%LOG%" echo backup failed
   exit /b 1
 )
 
-REM 重试覆盖：父进程未退出时 move 会失败，循环至多 ~60s
+REM 3) 重试覆盖：旧进程理论上已死，给 10 次容错
 set /a TRIES=0
 :retry
 move /Y "%NEW%" "%TARGET%" >>"%LOG%" 2>&1
 if not errorlevel 1 goto launched
 set /a TRIES+=1
-if %TRIES% GEQ 60 goto rollback
+if %TRIES% GEQ 10 goto rollback
 ping -n 2 127.0.0.1 >nul
 goto retry
 
@@ -81,15 +99,16 @@ func (u *Updater) ApplyUpdate(info *ReleaseInfo) error {
 		return err
 	}
 
+	myPID := fmt.Sprintf("%d", os.Getpid())
 	cmd := newDetachedCmd("cmd", "/c", batPath,
-		currentExe, newExe, backupPath, logPath)
+		currentExe, newExe, backupPath, logPath, myPID)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	log.Printf("[updater] 已派发 updater.bat (pid=%d)，本进程将退出以释放 exe", cmd.Process.Pid)
+	log.Printf("[updater] 已派发 updater.bat (pid=%d)，本进程将优雅退出释放 exe", cmd.Process.Pid)
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		os.Exit(0)
+		RequestShutdown("update-apply")
 	}()
 	return nil
 }

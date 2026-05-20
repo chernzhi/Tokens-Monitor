@@ -111,6 +111,21 @@ func TestRenderUpdaterBat_ContainsKeyTokens(t *testing.T) {
 	}
 }
 
+func TestRenderUpdaterBat_WaitsForOldPID(t *testing.T) {
+	got := renderUpdaterBat()
+	must := []string{
+		`tasklist /FI "PID eq %OLDPID%"`,
+		"taskkill /PID %OLDPID% /T /F",
+		`start "" "%TARGET%" --post-update "%BACKUP%"`,
+		":waitloop",
+	}
+	for _, s := range must {
+		if !strings.Contains(got, s) {
+			t.Errorf("bat missing %q\n--- got ---\n%s", s, got)
+		}
+	}
+}
+
 func TestUpdaterDownload_VerifiesSha256(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMP", tmp)
