@@ -380,6 +380,7 @@ func main() {
 	if defaultRunMode {
 		openWizardOrBrowser(fmt.Sprintf("http://127.0.0.1:%d/wizard", runtime.listenPort), "AI Token 监控")
 	}
+	fmt.Println("  卡住/多实例时可执行: ai-monitor.exe --force-cleanup")
 	fmt.Println("  等待 AI 请求中... (Ctrl+C 退出)")
 	fmt.Println("  " + strings.Repeat("─", 55))
 
