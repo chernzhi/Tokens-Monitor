@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -52,5 +56,68 @@ func TestReleaseInfoUnmarshal(t *testing.T) {
 	}
 	if info.LatestVersion != "3.3.0" || !info.HasUpdate || info.SizeBytes != 18874368 {
 		t.Fatalf("bad parse: %+v", info)
+	}
+}
+
+func TestUpdaterCheckNow_HitsServerAndReturnsInfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/release/client/latest" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("current") != "3.2.9" {
+			t.Errorf("missing current param: %q", r.URL.Query().Get("current"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"latest_version":"3.3.0","has_update":true,"download_url":"/api/release/client/download/ai-monitor-3.3.0.exe","sha256":"deadbeef","size_bytes":7,"release_notes":""}`))
+	}))
+	defer srv.Close()
+
+	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", client: &http.Client{}, cfg: &Config{}}
+	info, err := u.CheckNow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.HasUpdate || info.LatestVersion != "3.3.0" {
+		t.Errorf("unexpected info: %+v", info)
+	}
+}
+
+func TestUpdaterCheckNow_404TreatedAsNoRelease(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", client: &http.Client{}, cfg: &Config{}}
+	info, err := u.CheckNow()
+	if err != nil || info != nil {
+		t.Errorf("404 should return (nil,nil); got info=%v err=%v", info, err)
+	}
+}
+
+func TestUpdaterDownload_VerifiesSha256(t *testing.T) {
+	payload := []byte("payload-bytes")
+	wantSum := sha256.Sum256(payload)
+	want := hex.EncodeToString(wantSum[:])
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", client: &http.Client{}, cfg: &Config{}}
+	info := &ReleaseInfo{DownloadURL: "/", SHA256: want, SizeBytes: int64(len(payload)), LatestVersion: "3.3.0-test"}
+	path, err := u.downloadToTemp(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("download file missing: %v", err)
+	}
+	// 篡改 sha 应失败
+	bad := *info
+	bad.SHA256 = "00"
+	bad.LatestVersion = "3.3.0-bad"
+	if _, err := u.downloadToTemp(&bad); err == nil {
+		t.Errorf("expected sha mismatch error")
 	}
 }
