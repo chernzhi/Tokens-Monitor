@@ -66,7 +66,12 @@ func main() {
 	configPath := flag.String("config", defaultConfigPath, "配置文件路径")
 	showVersion := flag.Bool("version", false, "显示版本号并退出")
 	postUpdate := flag.String("post-update", "", "（内部）由 updater.bat 调用，传入备份文件路径用于成功后清理")
+	forceCleanup := flag.Bool("force-cleanup", false, "强制清理: 杀掉所有 ai-monitor.exe + 删除 instance.json/instance.lock，用于多实例残留")
 	flag.Parse()
+	if *forceCleanup {
+		doForceCleanup()
+		return
+	}
 	if *postUpdate != "" {
 		if abs, aerr := filepath.Abs(*postUpdate); aerr == nil {
 			tmpRoot, _ := filepath.Abs(os.TempDir())
@@ -87,7 +92,8 @@ func main() {
 		!*uninstall &&
 		!*setup &&
 		!*heal &&
-		!*cleanupNetwork
+		!*cleanupNetwork &&
+		!*forceCleanup
 
 	if *showVersion {
 		fmt.Println(Version)
