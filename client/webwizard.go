@@ -408,6 +408,21 @@ const webWizardHTML = `<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- 自动更新横幅（无新版时隐藏） -->
+    <div id="updateBanner" style="display:none;padding:12px 16px;border-radius:8px;margin:12px 0;color:#0f172a;"></div>
+
+    <!-- 关于卡片 -->
+    <div class="panel" id="aboutCard" style="margin-top:12px">
+      <div class="panel-title">关于</div>
+      <div>当前版本：v<span id="curVer"></span></div>
+      <div>最新版本：<span id="latestVer">检查中…</span></div>
+      <div style="margin-top:8px">
+        <button class="btn-secondary btn-small" onclick="checkUpdate()">检查更新</button>
+        <button class="btn-secondary btn-small" id="applyBtn" onclick="applyUpdate()" disabled>立即更新</button>
+      </div>
+      <pre id="releaseNotes" style="margin-top:12px;white-space:pre-wrap;font-size:12px;color:#94a3b8"></pre>
+    </div>
     {{end}}
 
     <div id="setupActions">
@@ -996,6 +1011,61 @@ function initLogPanel() {
     } catch (err) {}
   });
 }
+
+// ── 自动更新（关于卡片 + 横幅） ─────────────────────────────────
+function renderUpdateState(s) {
+  var verEl = document.getElementById('curVer');
+  if (!verEl) return; // aboutCard 不在 DOM（首次安装模式）
+  verEl.textContent = (s && s.current_version) || '';
+  var banner = document.getElementById('updateBanner');
+  var applyBtn = document.getElementById('applyBtn');
+  var latest = document.getElementById('latestVer');
+  var notes = document.getElementById('releaseNotes');
+  if (s && s.release && s.release.has_update) {
+    latest.textContent = 'v' + s.release.latest_version;
+    notes.textContent = s.release.release_notes || '';
+    applyBtn.disabled = false;
+    banner.style.display = 'block';
+    banner.style.background = s.release.mandatory ? '#fee2e2' : '#fef3c7';
+    banner.innerHTML = '🆕 新版本 v' + s.release.latest_version +
+      ' 可用 · <button class="btn-secondary btn-small" onclick="applyUpdate()">立即更新</button>';
+  } else {
+    latest.textContent = '已是最新';
+    applyBtn.disabled = true;
+    banner.style.display = 'none';
+  }
+  if (s && s.downloading) {
+    banner.style.display = 'block';
+    banner.style.background = '#dbeafe';
+    banner.innerHTML = '下载中… ' + (s.progress || 0) + '%';
+  }
+  if (s && s.error) {
+    banner.style.display = 'block';
+    banner.style.background = '#fecaca';
+    banner.textContent = '更新检查失败: ' + s.error;
+  }
+}
+function refreshUpdateStatus() {
+  fetch(basePath + '/api/wizard/update/status')
+    .then(function(r){return r.json();})
+    .then(renderUpdateState)
+    .catch(function(){});
+}
+function checkUpdate() {
+  fetch(basePath + '/api/wizard/update/check', {method:'POST', headers: wizardHeaders()})
+    .then(function(r){return r.json();})
+    .then(function(){ refreshUpdateStatus(); })
+    .catch(function(){});
+}
+function applyUpdate() {
+  if (!confirm('确认立即更新？应用会自动重启。')) return;
+  fetch(basePath + '/api/wizard/update/apply', {method:'POST', headers: wizardHeaders()})
+    .catch(function(){});
+}
+if (document.getElementById('aboutCard')) {
+  setInterval(refreshUpdateStatus, 5000);
+  refreshUpdateStatus();
+}
 </script>
 </body>
 </html>`
@@ -1400,6 +1470,75 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 	}
 	if subPath == "/api/overview" && r.Method == http.MethodGet {
 		s.handleOverviewProxy(w, r)
+		return
+	}
+
+	if subPath == "/api/wizard/update/status" && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		if s.Updater == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"current_version": Version,
+				"release":         nil,
+				"error":           "",
+				"progress":        int32(0),
+				"downloading":     false,
+			})
+			return
+		}
+		info, lastErr, pct, downloading := s.Updater.Snapshot()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"current_version": Version,
+			"release":         info,
+			"error":           lastErr,
+			"progress":        pct,
+			"downloading":     downloading,
+		})
+		return
+	}
+	if subPath == "/api/wizard/update/check" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if s.Updater == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "updater 未启用"})
+			return
+		}
+		info, err := s.Updater.CheckNow(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"release": info})
+		return
+	}
+	if subPath == "/api/wizard/update/apply" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if s.Updater == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "updater 未启用"})
+			return
+		}
+		info, _, _, _ := s.Updater.Snapshot()
+		if info == nil || !info.HasUpdate {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "当前没有可用的新版本"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "starting"})
+		u := s.Updater
+		go func() {
+			if err := u.ApplyUpdate(info); err != nil {
+				log.Printf("[updater] ApplyUpdate 失败: %v", err)
+			}
+		}()
 		return
 	}
 

@@ -82,3 +82,12 @@ func TestWizardTemplateRendersForRuntime(t *testing.T) {
 	}
 	t.Logf("runtime: rendered %d bytes successfully", len(out))
 }
+
+func TestWebWizardHTML_HasAboutCard(t *testing.T) {
+	if !strings.Contains(webWizardHTML, `id="aboutCard"`) {
+		t.Fatal("about card missing from webWizardHTML")
+	}
+	if !strings.Contains(webWizardHTML, "/api/wizard/update/status") {
+		t.Fatal("update status endpoint missing from JS")
+	}
+}
