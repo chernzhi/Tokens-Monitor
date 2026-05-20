@@ -68,7 +68,15 @@ func main() {
 	postUpdate := flag.String("post-update", "", "（内部）由 updater.bat 调用，传入备份文件路径用于成功后清理")
 	flag.Parse()
 	if *postUpdate != "" {
-		PostUpdateCleanup(*postUpdate)
+		if abs, aerr := filepath.Abs(*postUpdate); aerr == nil {
+			tmpRoot, _ := filepath.Abs(os.TempDir())
+			rel, rerr := filepath.Rel(tmpRoot, abs)
+			if rerr == nil && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) {
+				PostUpdateCleanup(abs)
+			} else {
+				log.Printf("[updater] 拒绝 --post-update 非 TempDir 路径: %s", *postUpdate)
+			}
+		}
 	}
 	defaultRunMode := !*install &&
 		!*globalInstall &&

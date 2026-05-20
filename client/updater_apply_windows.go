@@ -63,12 +63,16 @@ func (u *Updater) ApplyUpdate(info *ReleaseInfo) error {
 	if err != nil {
 		return err
 	}
-	currentExe, _ = filepath.Abs(currentExe)
+	absExe, err := filepath.Abs(currentExe)
+	if err != nil {
+		return fmt.Errorf("解析当前 exe 路径失败: %w", err)
+	}
+	currentExe = absExe
 
 	tmpDir := filepath.Dir(newExe)
 	batPath := filepath.Join(tmpDir, "updater.bat")
 	logPath := filepath.Join(tmpDir, "updater.log")
-	backupPath := filepath.Join(tmpDir, fmt.Sprintf("ai-monitor-backup-%d.exe", time.Now().Unix()))
+	backupPath := filepath.Join(tmpDir, fmt.Sprintf("ai-monitor-backup-%d.exe", time.Now().UnixNano()))
 
 	if err := os.WriteFile(batPath, []byte(renderUpdaterBat()), 0o755); err != nil {
 		return err
