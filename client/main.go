@@ -226,19 +226,54 @@ func main() {
 	// 当成"用户原 PAC"还原回去（A3 修的污染源头的入口侧防护）。
 	pruneGhostInstallState()
 
-	// Singleton check: if a healthy instance already exists, don't start a second one.
+	// Singleton check: real file lock (Windows: LockFileEx, others: no-op stub).
+	// 进程崩溃 / 被 kill 时 OS 自动释放，不会留死锁。
+	// --post-update 模式给旧进程优雅退出留出时间窗口。
+	if *postUpdate != "" {
+		if _, err := waitForSingletonLock(10 * time.Second); err != nil {
+			log.Printf("[singleton] --post-update 抢锁超时: %v；降级走旧 HTTP 探活", err)
+		}
+	} else {
+		_, ok, err := acquireSingletonLock()
+		if err != nil {
+			log.Printf("[singleton] 锁文件错误: %v；降级走旧 HTTP 探活", err)
+		} else if !ok {
+			// 锁被占 → 必然有另一实例（可能正在启动还没监听 HTTP）。
+			// 仍走旧 HTTP 探活流程把向导对准已运行端口；探不到再提示残留清理。
+			existingPort, alive := checkExistingInstance()
+			if alive {
+				log.Printf("[EXIT] reason=singleton-lock-held port=%d pid=%d defaultRunMode=%v",
+					existingPort, os.Getpid(), defaultRunMode)
+				fmt.Printf("  已有 ai-monitor 实例运行于端口 %d，当前进程退出。\n", existingPort)
+				if defaultRunMode {
+					wizardURL := fmt.Sprintf("http://127.0.0.1:%d/wizard", existingPort)
+					done, _ := openWizardOrBrowser(wizardURL, "AI Token 监控")
+					if done != nil {
+						<-done
+					}
+				} else {
+					fmt.Println("  如需重启，请先终止已有进程。")
+				}
+				os.Exit(0)
+			}
+			fmt.Println("  ⚠ 检测到 instance.lock 被占但服务端口不可达，可能有残留进程。")
+			fmt.Println("    请执行: ai-monitor.exe --force-cleanup")
+			log.Printf("[EXIT] reason=singleton-lock-held-but-unreachable pid=%d", os.Getpid())
+			os.Exit(1)
+		}
+	}
+
+	// 旧的 HTTP-only 探活，作为防御性兜底（极端时锁拿到了但 instance.json 还残留）。
 	existingPort, alive := checkExistingInstance()
 	if alive {
 		log.Printf("[EXIT] reason=singleton-existing-instance port=%d pid=%d defaultRunMode=%v",
 			existingPort, os.Getpid(), defaultRunMode)
 		fmt.Printf("  已有 ai-monitor 实例运行于端口 %d，当前进程退出。\n", existingPort)
-		// 第二次双击 exe 时把配置窗口拉起来，对准已运行实例的端口。
-		// 内嵌窗口不可用时会自动回退到系统浏览器。
 		if defaultRunMode {
 			wizardURL := fmt.Sprintf("http://127.0.0.1:%d/wizard", existingPort)
 			done, _ := openWizardOrBrowser(wizardURL, "AI Token 监控")
 			if done != nil {
-				<-done // 等用户关闭窗口再退出，体感上像 "打开了配置面板"
+				<-done
 			}
 		} else {
 			fmt.Println("  如需重启，请先终止已有进程。")
@@ -300,12 +335,19 @@ func main() {
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
+		select {
+		case <-sigCh:
+			log.Println("[shutdown] signal received")
+		case <-shutdownCh:
+			log.Println("[shutdown] internal request received")
+		}
 		fmt.Println("\n  正在关闭...")
+		closeActiveWizardWindow()
 		removeInstanceInfo()
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		runtime.Shutdown(ctx)
+		releaseSingletonLock()
 	}()
 
 	printTakeoverBanner(takeoverMode)
