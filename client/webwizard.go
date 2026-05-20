@@ -1027,8 +1027,15 @@ function renderUpdateState(s) {
     applyBtn.disabled = false;
     banner.style.display = 'block';
     banner.style.background = s.release.mandatory ? '#fee2e2' : '#fef3c7';
-    banner.innerHTML = '🆕 新版本 v' + s.release.latest_version +
-      ' 可用 · <button class="btn-secondary btn-small" onclick="applyUpdate()">立即更新</button>';
+    banner.textContent = '';
+    var label = document.createElement('span');
+    label.textContent = '🆕 新版本 v' + s.release.latest_version + ' 可用 · ';
+    banner.appendChild(label);
+    var btn = document.createElement('button');
+    btn.className = 'btn-secondary btn-small';
+    btn.textContent = '立即更新';
+    btn.onclick = applyUpdate;
+    banner.appendChild(btn);
   } else {
     latest.textContent = '已是最新';
     applyBtn.disabled = true;
@@ -1037,7 +1044,7 @@ function renderUpdateState(s) {
   if (s && s.downloading) {
     banner.style.display = 'block';
     banner.style.background = '#dbeafe';
-    banner.innerHTML = '下载中… ' + (s.progress || 0) + '%';
+    banner.textContent = '下载中… ' + (s.progress || 0) + '%';
   }
   if (s && s.error) {
     banner.style.display = 'block';
