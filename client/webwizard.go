@@ -1537,6 +1537,21 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if subPath == "/api/wizard/instance" && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		info, _ := readInstanceInfo()
+		if info == nil {
+			info = &InstanceInfo{
+				PID:     os.Getpid(),
+				Port:    s.listenPort,
+				Version: Version,
+			}
+		}
+		_ = json.NewEncoder(w).Encode(info)
+		return
+	}
+
 	if subPath == "/api/wizard/update/status" && r.Method == http.MethodGet {
 		w.Header().Set("Content-Type", "application/json")
 		if s.Updater == nil {
