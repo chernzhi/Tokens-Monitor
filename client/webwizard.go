@@ -1114,9 +1114,11 @@ function applyUpdate() {
         updateState.busy = false;
         btn.disabled = false;
         btn.textContent = '立即更新';
-      } else {
-        setUpdateMsg('已派发更新，应用将自动重启…', '#34d399');
+        return;
       }
+      setUpdateMsg('已派发更新，等待新版本启动…', '#34d399');
+      btn.textContent = '重启中…';
+      startReconnectPolling();
     })
     .catch(function(e){
       setUpdateMsg('✗ ' + e.message, '#f87171');
@@ -1124,6 +1126,31 @@ function applyUpdate() {
       btn.disabled = false;
       btn.textContent = '立即更新';
     });
+}
+
+function startReconnectPolling() {
+  var elapsed = 0;
+  var currentPort = location.port || '80';
+  var t = setInterval(function() {
+    elapsed += 1;
+    fetch('/api/wizard/instance', {cache:'no-store'})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(info){
+        if (!info || !info.port) return;
+        if (String(info.port) !== currentPort) {
+          clearInterval(t);
+          location.href = location.protocol + '//127.0.0.1:' + info.port + '/wizard';
+          return;
+        }
+        clearInterval(t);
+        location.reload();
+      })
+      .catch(function(){ /* 仍在重启窗口期 */ });
+    if (elapsed >= 30) {
+      clearInterval(t);
+      setUpdateMsg('重启耗时较长，请手动关闭本窗口后重新打开 ai-monitor。', '#f87171');
+    }
+  }, 1000);
 }
 
 if (document.getElementById('updateBtn')) {

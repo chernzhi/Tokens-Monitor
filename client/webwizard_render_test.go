@@ -91,3 +91,11 @@ func TestWebWizardHTML_HasAboutCard(t *testing.T) {
 		t.Fatal("update status endpoint missing from JS")
 	}
 }
+
+func TestWebWizardHTML_HasReconnectPolling(t *testing.T) {
+	for _, s := range []string{"/api/wizard/instance", "startReconnectPolling"} {
+		if !strings.Contains(webWizardHTML, s) {
+			t.Errorf("template missing %q", s)
+		}
+	}
+}
