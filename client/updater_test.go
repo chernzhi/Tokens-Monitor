@@ -95,6 +95,22 @@ func TestUpdaterCheckNow_404TreatedAsNoRelease(t *testing.T) {
 	}
 }
 
+func TestRenderUpdaterBat_ContainsKeyTokens(t *testing.T) {
+	got := renderUpdaterBat()
+	for _, s := range []string{
+		"setlocal",
+		"copy /Y",
+		"tasklist /FI",
+		"move /Y",
+		"start \"\"",
+		"--post-update",
+	} {
+		if !strings.Contains(got, s) {
+			t.Errorf("bat missing %q", s)
+		}
+	}
+}
+
 func TestUpdaterDownload_VerifiesSha256(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMP", tmp)

@@ -65,7 +65,11 @@ func main() {
 	defaultConfigPath := filepath.Join(appDataDir(), "config.json")
 	configPath := flag.String("config", defaultConfigPath, "配置文件路径")
 	showVersion := flag.Bool("version", false, "显示版本号并退出")
+	postUpdate := flag.String("post-update", "", "（内部）由 updater.bat 调用，传入备份文件路径用于成功后清理")
 	flag.Parse()
+	if *postUpdate != "" {
+		PostUpdateCleanup(*postUpdate)
+	}
 	defaultRunMode := !*install &&
 		!*globalInstall &&
 		!*globalUninstall &&
