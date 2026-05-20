@@ -165,18 +165,20 @@ func (c *Config) EffectiveStrictPolicyCheck() bool {
 	return *c.StrictPolicyCheck
 }
 
-// EffectiveWatchdogInterval 返回 watchdog 自检间隔秒数，默认 10。
+// EffectiveWatchdogInterval 返回 watchdog 自检间隔秒数，默认 30。
 func (c *Config) EffectiveWatchdogInterval() int {
 	if c == nil || c.WatchdogIntervalSec <= 0 {
-		return 10
+		return 30
 	}
 	return c.WatchdogIntervalSec
 }
 
-// EffectiveWatchdogFailures 返回连续失败阈值，默认 2。
+// EffectiveWatchdogFailures 返回连续失败阈值，默认 3。
+// （3.1.x 之前是 2；线上发现 Windows 杀软扫描偶发会让 /healthz 单次失败，
+// 阈值 2 容易误杀进程，调到 3 给一个额外的宽容窗口。）
 func (c *Config) EffectiveWatchdogFailures() int {
 	if c == nil || c.WatchdogFailures <= 0 {
-		return 2
+		return 3
 	}
 	return c.WatchdogFailures
 }

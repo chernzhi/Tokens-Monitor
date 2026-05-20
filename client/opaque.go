@@ -23,6 +23,7 @@ var opaqueEndpointDenylist = []string{
 	"optimizer",
 	"usageevents",
 	"teammemberusage",
+	"/backend-api/wham",
 	"spend",
 	"cdn",
 	"download",
@@ -34,6 +35,32 @@ var opaqueEndpointDenylist = []string{
 	"getmodels",       // 各类模型枚举端点
 	"modelinfo",       // 模型元数据
 	"listmodels",      // 模型列表
+	// Qoder 非 LLM 噪音端点（任务/会话/工作区 CRUD、APM、心跳、配置等，不含 token）：
+	"remoteagent",     // /algo/api/v2/remoteAgent/* 任务/会话 CRUD
+	"/apm/",           // /apm/trace, /apm/metric, /apm/meta（OpenTelemetry/ARMS）
+	"/arms/",          // Aliyun ARMS 上报路径
+	"tracking",        // /algo/api/v1/tracking
+	"heartbeat",       // /algo/telemetry/.../heartbeat
+	"knowledgepolicy", // 知识库策略配置
+	"byok",            // /algo/api/v2/byok/config
+	"region/endpoints",
+	"/algo/api/update/", // 自动更新检查
+	"codebase/file",     // codebase 文件发现
+	"codebase/commit",   // commit 状态批量查询
+	"business/finish",   // 任务结束 RPC
+	"events/stream",     // SSE 事件流（非聊天）
+	"user/plan",         // 账户套餐
+	"model/list",        // 模型枚举
+	"codebase/sync",     // Merkle/codebase 同步
+	"codebase/embedding", // 嵌入索引（非聊天）
+	"codebase/",         // 兜底：其它 codebase 子路径
+	"marketplace",       // 插件市场
+	"/release/",         // 资源/版本静态文件
+	"/i18n/",            // 翻译资源
+	"/organizations/",   // 组织/标签 CRUD
+	"/tags",             // 标签列表
+	"/mcp",              // Copilot/IDE MCP 握手（JSON-RPC over SSE，非聊天）
+	"controlurl.json",   // marketplace 控制 URL
 }
 
 var opaqueEndpointAllowlist = []string{

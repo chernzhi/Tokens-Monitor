@@ -81,6 +81,10 @@ class TokenUsageLog(Base):
     cost_usd: Mapped[float] = mapped_column(Numeric(12, 6), default=0)
     cost_cny: Mapped[float] = mapped_column(Numeric(12, 4), default=0)
     request_id: Mapped[str | None] = mapped_column(String(100))
+    source_kind: Mapped[str | None] = mapped_column(String(30))
+    accuracy: Mapped[str | None] = mapped_column(String(20))
+    correlation_key: Mapped[str | None] = mapped_column(String(200))
+    merge_status: Mapped[str | None] = mapped_column(String(30))
     request_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 

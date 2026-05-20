@@ -5,6 +5,7 @@ Receives batched usage records from the Go client applications.
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -48,6 +49,30 @@ class UsageRecordIn(BaseModel):
     source_app: str | None = None
     endpoint: str | None = None
     cost_multiplier: float | None = None
+    source_kind: str | None = None
+    accuracy: str | None = None
+    correlation_key: str | None = None
+    merge_status: str | None = None
+
+
+@dataclass(frozen=True)
+class CursorReportingFields:
+    source_kind: str | None
+    accuracy: str | None
+    correlation_key: str | None
+    merge_status: str | None
+
+
+CURSOR_OFFICIAL_SOURCE = "cursor-official-api"
+CURSOR_LOCAL_ESTIMATE_SOURCE = "client-mitm-estimate"
+CURSOR_SOURCE_KIND_OFFICIAL = "official"
+CURSOR_SOURCE_KIND_LOCAL_ESTIMATE = "local_estimate"
+CURSOR_ACCURACY_EXACT = "exact"
+CURSOR_ACCURACY_ESTIMATED = "estimated"
+CURSOR_MERGE_STATUS_UNMATCHED = "unmatched"
+CURSOR_MERGE_STATUS_MERGED = "merged"
+CURSOR_MERGE_STATUS_SUPPRESSED = "suppressed"
+CURSOR_STRICT_TIME_WINDOW = timedelta(seconds=60)
 
 
 class IdentityCheckResponse(BaseModel):
@@ -145,6 +170,117 @@ def _same_person_name(left: str | None, right: str | None) -> bool:
 
 def _safe_non_negative_int(value: int | None) -> int:
     return max(int(value or 0), 0)
+
+
+def _clean_optional(value: str | None) -> str | None:
+    normalized = (value or "").strip()
+    return normalized or None
+
+
+def _cursor_reporting_fields(rec: UsageRecordIn, provider_key: str) -> CursorReportingFields:
+    if provider_key != "cursor":
+        return CursorReportingFields(
+            source_kind=_clean_optional(rec.source_kind),
+            accuracy=_clean_optional(rec.accuracy),
+            correlation_key=_clean_optional(rec.correlation_key),
+            merge_status=_clean_optional(rec.merge_status),
+        )
+
+    source = rec.source or "client"
+    source_kind = _clean_optional(rec.source_kind)
+    accuracy = _clean_optional(rec.accuracy)
+    merge_status = _clean_optional(rec.merge_status)
+
+    if source == CURSOR_OFFICIAL_SOURCE:
+        source_kind = source_kind or CURSOR_SOURCE_KIND_OFFICIAL
+        accuracy = accuracy or CURSOR_ACCURACY_EXACT
+    elif source == CURSOR_LOCAL_ESTIMATE_SOURCE:
+        source_kind = source_kind or CURSOR_SOURCE_KIND_LOCAL_ESTIMATE
+        accuracy = accuracy or CURSOR_ACCURACY_ESTIMATED
+
+    if source_kind in {CURSOR_SOURCE_KIND_OFFICIAL, CURSOR_SOURCE_KIND_LOCAL_ESTIMATE}:
+        merge_status = merge_status or CURSOR_MERGE_STATUS_UNMATCHED
+
+    return CursorReportingFields(
+        source_kind=source_kind,
+        accuracy=accuracy,
+        correlation_key=_clean_optional(rec.correlation_key),
+        merge_status=merge_status,
+    )
+
+
+def _cursor_strict_merge_candidate(official: UsageRecordIn, local: UsageRecordIn, provider_key: str) -> bool:
+    if provider_key != "cursor":
+        return False
+    official_fields = _cursor_reporting_fields(official, provider_key)
+    local_fields = _cursor_reporting_fields(local, provider_key)
+    return bool(
+        official_fields.source_kind == CURSOR_SOURCE_KIND_OFFICIAL
+        and official_fields.accuracy == CURSOR_ACCURACY_EXACT
+        and local_fields.source_kind == CURSOR_SOURCE_KIND_LOCAL_ESTIMATE
+        and local_fields.accuracy == CURSOR_ACCURACY_ESTIMATED
+        and official_fields.correlation_key
+        and official_fields.correlation_key == local_fields.correlation_key
+    )
+
+
+def _cursor_log_matches_official(log: TokenUsageLog) -> bool:
+    return (
+        log.provider == "cursor"
+        and log.source_kind == CURSOR_SOURCE_KIND_OFFICIAL
+        and log.accuracy == CURSOR_ACCURACY_EXACT
+        and log.merge_status != CURSOR_MERGE_STATUS_SUPPRESSED
+    )
+
+
+def _cursor_log_matches_local_estimate(log: TokenUsageLog) -> bool:
+    return (
+        log.provider == "cursor"
+        and log.source_kind == CURSOR_SOURCE_KIND_LOCAL_ESTIMATE
+        and log.accuracy == CURSOR_ACCURACY_ESTIMATED
+        and log.merge_status == CURSOR_MERGE_STATUS_UNMATCHED
+    )
+
+
+async def _merge_cursor_usage_if_strict(db: AsyncSession, log_entry: TokenUsageLog) -> None:
+    if log_entry.provider != "cursor":
+        return
+    if log_entry.source_kind not in {CURSOR_SOURCE_KIND_OFFICIAL, CURSOR_SOURCE_KIND_LOCAL_ESTIMATE}:
+        return
+
+    # 客户端 MITM 估算无法预知 Cursor 服务端的事件时间戳，故 correlation_key 仅官方侧会写。
+    # 合并必须同时支持「先本地后官方」和「先官方后本地」两种到达顺序，因此始终用
+    # (user, model, ±60s 时间窗) 作为候选条件；correlation_key 只参与命中后的强匹配判定（如有）。
+    conditions = [
+        TokenUsageLog.provider == "cursor",
+        TokenUsageLog.merge_status != CURSOR_MERGE_STATUS_SUPPRESSED,
+        TokenUsageLog.user_id == log_entry.user_id,
+        TokenUsageLog.model_name == log_entry.model_name,
+        TokenUsageLog.request_at.between(
+            log_entry.request_at - CURSOR_STRICT_TIME_WINDOW,
+            log_entry.request_at + CURSOR_STRICT_TIME_WINDOW,
+        ),
+    ]
+
+    result = await db.execute(
+        select(TokenUsageLog)
+        .where(*conditions)
+        .order_by(TokenUsageLog.id)
+    )
+    candidates = result.scalars().all()
+    official_candidates = [log for log in candidates if _cursor_log_matches_official(log)]
+    local_candidates = [log for log in candidates if _cursor_log_matches_local_estimate(log)]
+    if len(official_candidates) != 1 or len(local_candidates) != 1:
+        return
+
+    official = official_candidates[0]
+    local = local_candidates[0]
+    if local.endpoint and not official.endpoint:
+        official.endpoint = local.endpoint
+    if local.source_app and (not official.source_app or official.source_app == "cursor"):
+        official.source_app = local.source_app
+    official.merge_status = CURSOR_MERGE_STATUS_MERGED
+    local.merge_status = CURSOR_MERGE_STATUS_SUPPRESSED
 
 
 def _sum_tokscale_tokens(tokens) -> int:
@@ -461,6 +597,7 @@ async def collect_usage(
         source_app_value = (rec.source_app or "").strip() or None
         if source_app_value is None and provider_key == "cursor":
             source_app_value = "cursor"
+        cursor_fields = _cursor_reporting_fields(rec, provider_key)
 
         log_entry = TokenUsageLog(
             user_id=internal_user_id,
@@ -478,9 +615,15 @@ async def collect_usage(
             cost_usd=cost_usd,
             cost_cny=cost_cny,
             request_id=rec.request_id,
+            source_kind=cursor_fields.source_kind,
+            accuracy=cursor_fields.accuracy,
+            correlation_key=cursor_fields.correlation_key,
+            merge_status=cursor_fields.merge_status,
             request_at=request_at,
         )
         db.add(log_entry)
+        await db.flush()
+        await _merge_cursor_usage_if_strict(db, log_entry)
         inserted += 1
         if rec.request_id:
             existing_pairs.add((rec.request_id, source))

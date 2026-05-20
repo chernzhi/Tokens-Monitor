@@ -85,13 +85,23 @@ func detectVendorFromRequest(r *http.Request) string {
 
 	// 5. Peek at request body model field
 	if r.Body != nil && r.ContentLength != 0 {
-		bodyBytes, err := io.ReadAll(r.Body)
-		r.Body.Close()
+		// 仅需要 JSON 顶层的 model 字段，1MB 头部足够覆盖所有正常请求。
+		// 上限是为了避免大上传（multipart / codex compact）把整包灌进内存做嗅探。
+		const sniffMax = 1 * 1024 * 1024
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, sniffMax))
+		// 无论读成功还是失败，都要把已读字节粘回 r.Body，否则下游转发只能拿到截断后的请求体。
+		if len(bodyBytes) > 0 {
+			rest := r.Body
+			r.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(bytes.NewReader(bodyBytes), rest), rest}
+			// ContentLength 此时未必准确（chunked / 大于 sniffMax / 读出错）；置 -1 让 Go transport 自己处理。
+			if int64(len(bodyBytes)) < r.ContentLength || err != nil {
+				r.ContentLength = -1
+			}
+		}
 		if err == nil && len(bodyBytes) > 0 {
-			// Restore body for downstream processing
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			r.ContentLength = int64(len(bodyBytes))
-
 			var req map[string]interface{}
 			if json.Unmarshal(bodyBytes, &req) == nil {
 				if model, ok := req["model"].(string); ok {

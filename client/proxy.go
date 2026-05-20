@@ -23,6 +23,8 @@ import (
 	"golang.org/x/net/http2"
 )
 
+const maxErrorBodyLogBytes int64 = 2048
+
 // aiDomains maps AI API hostnames to their vendor short name.
 // 场景说明：Cursor（*.cursor.sh）；GitHub Copilot（VS Code / Visual Studio 等）；Claude Code（api.anthropic.com 等）；
 // OpenCode 上游通常直连各厂商 API（本仓库已列 OpenAI/Anthropic/Google/Bedrock 等），本地 opencode serve 默认 127.0.0.1 为直连、不经 MITM。
@@ -239,6 +241,39 @@ func isPinnedTLSHost(hostname string, cfg *Config) bool {
 	return false
 }
 
+// quietTunnelHostSuffixes 列出已知的遥测/崩溃上报/分析平台，CONNECT 透传时不打印日志，
+// 避免控制台被 OS/IDE/插件的后台心跳刷屏（与 token 监控无关）。
+var quietTunnelHostSuffixes = []string{
+	".events.data.microsoft.com",
+	".in.applicationinsights.azure.com",
+	"dc.services.visualstudio.com",
+	".visualstudio.com",
+	"otel.gitkraken.com",
+	".gitkraken.com",
+	".posthog.com",
+	".sentry.io",
+	".segment.io",
+	".amplitude.com",
+	".datadoghq.com",
+	".newrelic.com",
+	".bugsnag.com",
+	".rollbar.com",
+	"vortex.data.microsoft.com",
+	"settings-win.data.microsoft.com",
+	"mobile.events.data.microsoft.com",
+	".aria.microsoft.com",
+}
+
+func isQuietTunnelHost(hostname string) bool {
+	hostname = strings.ToLower(hostname)
+	for _, suf := range quietTunnelHostSuffixes {
+		if hostname == strings.TrimPrefix(suf, ".") || strings.HasSuffix(hostname, suf) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchAIDomain 判断主机名是否应走 MITM，并返回供应商标签（内置表 + config 扩展）。
 func (s *ProxyServer) matchAIDomain(hostname string) (string, bool) {
 	hostname = normalizeProxyHostname(hostname) // ToLower + TrimSpace + 去除末尾点号
@@ -317,6 +352,7 @@ type ProxyServer struct {
 	// 通过 SetTakeoverMode 注入；仅用于 /status 诊断展示。允许值："observe" / "session" / "persistent"。
 	takeoverMu   sync.RWMutex
 	takeoverMode string
+	wizardToken  string
 }
 
 // SetTakeoverMode 在 main.go 决定本次接管模式后调用，让 /status 能如实展示。
@@ -348,11 +384,11 @@ func (s *ProxyServer) currentTakeoverMode() string {
 }
 
 var (
-	upstreamDialTimeout              = 15 * time.Second
-	upstreamProxyConnectTimeout      = 20 * time.Second
-	upstreamTLSHandshakeTimeout      = 20 * time.Second
-	upstreamBodyIdleTimeout          = 5 * time.Minute
-	proxyTunnelIdleTimeout           = 5 * time.Minute
+	upstreamDialTimeout         = 15 * time.Second
+	upstreamProxyConnectTimeout = 20 * time.Second
+	upstreamTLSHandshakeTimeout = 20 * time.Second
+	upstreamBodyIdleTimeout     = 5 * time.Minute
+	proxyTunnelIdleTimeout      = 5 * time.Minute
 	// 上游在返回任何响应头之前的最大等待时间（HTTP/2：timeout awaiting response headers）。
 	// Codex /chatgpt backend 的 responses/compact 可能由服务端长时间计算后才下发头；
 	// 过短会导致 MITM forward error，即便随后直连重试已成功。
@@ -391,6 +427,7 @@ func NewProxyServer(cfg *Config, reporter *Reporter, certMgr *CertManager, confi
 		startedAt:        time.Now(),
 		copilotDiscounts: map[string]float64{},
 		transport:        buildUpstreamTransport(proxyFunc),
+		wizardToken:      newRequestID(),
 	}
 }
 
@@ -403,6 +440,17 @@ func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Status page
 	if (r.URL.Host == "" || r.URL.Host == r.Host) && (r.URL.Path == "/" || r.URL.Path == "/status") {
 		s.statusPage(w, r)
+		return
+	}
+
+	// 极简健康探针：watchdog / 外部 keepalive 用，纯内存判断，不读注册表、不动配置。
+	// 之所以单独拆出来：/status 要返回 networkTakeoverDiagnostics（4 个 Windows
+	// 注册表 read），杀软扫描或 Defender RTP 抢锁时这条路径会偶发 3s+ 超时；
+	// 而 watchdog 阈值默认 2 次连续失败就 os.Exit(2)——表象就是"窗口自己没了"。
+	if (r.URL.Host == "" || r.URL.Host == r.Host) && (r.URL.Path == "/healthz" || r.URL.Path == "/health") {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
 		return
 	}
 
@@ -475,7 +523,7 @@ func (s *ProxyServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if vendor != "" {
 			log.Printf("[CONNECT] tunnel → %s (钉证书主机，跳过 MITM)", hostname)
-		} else {
+		} else if !isQuietTunnelHost(hostname) {
 			log.Printf("[CONNECT] tunnel → %s", hostname)
 		}
 		go safeGo("tunnel "+hostname, func() { s.tunnelConnection(clientConn, host, vendor, hostname) })
@@ -558,6 +606,10 @@ func (s *ProxyServer) maybeReportTunnelOpaqueUsage(vendor, hostname string, a, b
 	if vendor == "" {
 		return
 	}
+	// 官方同步活跃时不再上报 cursor 体积估算，避免与精确数据双计。
+	if vendor == "cursor" && CursorOfficialSyncActive() {
+		return
+	}
 	var downBytes int64
 	if a.direction == "server->client" {
 		downBytes += a.bytes
@@ -588,7 +640,7 @@ func (s *ProxyServer) maybeReportTunnelOpaqueUsage(vendor, hostname string, a, b
 	if vendor == "cursor" {
 		sourceApp = "cursor"
 	}
-	s.reporter.Add(UsageRecord{
+	rec := UsageRecord{
 		Vendor:           vendor,
 		Model:            opaqueModelLabel(vendor),
 		Endpoint:         "connect://" + hostname,
@@ -597,7 +649,13 @@ func (s *ProxyServer) maybeReportTunnelOpaqueUsage(vendor, hostname string, a, b
 		TotalTokens:      total,
 		Source:           opaqueSourceEstimate,
 		SourceApp:        sourceApp,
-	})
+	}
+	if vendor == "cursor" {
+		rec.SourceKind = "local_estimate"
+		rec.Accuracy = "estimated"
+		rec.MergeStatus = "unmatched"
+	}
+	s.reporter.Add(rec)
 	log.Printf("[opaque-tunnel] %s %s: estimated total=%d (down_bytes=%d)", vendor, hostname, total, downBytes)
 }
 
@@ -759,11 +817,9 @@ func (s *ProxyServer) mitmConnection(clientConn net.Conn, host, hostname, vendor
 
 		log.Printf("[MITM] %s %s%s → %d", req.Method, hostname, endpoint, resp.StatusCode)
 
-		if resp.StatusCode >= 400 && monitorUsage {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-			resp.Body.Close()
+		if resp.StatusCode >= 400 && monitorUsage && !responseEndpointHasNoTokenUsage(endpoint) {
+			errBody := peekAndRestoreResponseBody(resp, maxErrorBodyLogBytes)
 			log.Printf("[MITM] error response %s%s: status=%d body=%q", hostname, endpoint, resp.StatusCode, string(errBody))
-			resp.Body = io.NopCloser(bytes.NewReader(errBody))
 		} else if monitorUsage {
 			var buf bytes.Buffer
 			resp.Body = &recordingBody{
@@ -830,11 +886,9 @@ func (s *ProxyServer) serveMitmHTTP2(tlsConn *tls.Conn, hostname, vendor string)
 
 			log.Printf("[MITM/h2] %s %s%s → %d", r.Method, hostname, endpoint, resp.StatusCode)
 
-			if resp.StatusCode >= 400 && monitorUsage {
-				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-				resp.Body.Close()
+			if resp.StatusCode >= 400 && monitorUsage && !responseEndpointHasNoTokenUsage(endpoint) {
+				errBody := peekAndRestoreResponseBody(resp, maxErrorBodyLogBytes)
 				log.Printf("[MITM/h2] error response %s%s: status=%d body=%q", hostname, endpoint, resp.StatusCode, string(errBody))
-				resp.Body = io.NopCloser(bytes.NewReader(errBody))
 			} else if monitorUsage {
 				var buf bytes.Buffer
 				resp.Body = &recordingBody{
@@ -1060,7 +1114,16 @@ func isClosedNetworkError(err error) bool {
 }
 
 func isExpectedDisconnectError(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isClosedNetworkError(err)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isClosedNetworkError(err) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	// net/http 在 body 被提前消费后再次 RoundTrip 抛出的内部错误，常见于 APM
+	// 心跳/批量上报这类 fire-and-forget 流量，对终端用户没有诊断价值。
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "invalid read on closed body")
 }
 
 func isTimeoutNetworkError(err error) bool {
@@ -1360,9 +1423,8 @@ func (s *ProxyServer) handleHTTPForward(w http.ResponseWriter, r *http.Request) 
 	log.Printf("[HTTP] %s %s → %d", r.Method, r.URL.String(), resp.StatusCode)
 
 	if monitorUsage && resp.StatusCode >= 400 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		errBody := peekAndRestoreResponseBody(resp, maxErrorBodyLogBytes)
 		log.Printf("[HTTP] error response %s %s: status=%d body=%q", r.Method, r.URL.String(), resp.StatusCode, string(errBody))
-		resp.Body = io.NopCloser(bytes.NewReader(errBody))
 	}
 
 	for k, vs := range resp.Header {
@@ -1514,7 +1576,31 @@ func (s *ProxyServer) processRequestBody(r *http.Request) (model string, promptT
 	if r.Body == nil || r.ContentLength == 0 {
 		return "", 0
 	}
-	bodyBytes, err := io.ReadAll(r.Body)
+	// 体积上限：超过 16MB 的请求体不再整包读入。
+	// 触发场景：Codex /backend-api/codex/responses/compact 把完整会话历史塞进单条请求，
+	// 量级可能到几十 MB；之前无上限的 io.ReadAll 会把整个 body 灌进内存，
+	// 既让 self-watchdog 探针 3s 内拿不到 /status 把进程踢掉，又在低内存机器上引发 OOM。
+	// 超限路径下我们放弃模型识别 / prompt 估算，但流量照常透传，不影响用户使用。
+	const maxReqBodyPeek = 16 * 1024 * 1024
+	if r.ContentLength > maxReqBodyPeek {
+		log.Printf("[proxy] 请求体 %d 字节超过 %d 上限，跳过解析直接透传 (host=%s path=%s)",
+			r.ContentLength, maxReqBodyPeek, r.URL.Hostname(), r.URL.Path)
+		return "", 0
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxReqBodyPeek+1))
+	if err == nil && len(bodyBytes) > maxReqBodyPeek {
+		// ContentLength 未知 / chunked 编码下后置兜底：把已读字节 + 剩余流粘回去再透传。
+		rest := r.Body
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(bodyBytes), rest), rest}
+		r.ContentLength = -1
+		r.TransferEncoding = nil
+		log.Printf("[proxy] 请求体超过 %d 上限（chunked），跳过解析直接透传 (host=%s path=%s)",
+			maxReqBodyPeek, r.URL.Hostname(), r.URL.Path)
+		return "", 0
+	}
 	r.Body.Close()
 	if err != nil || len(bodyBytes) == 0 {
 		return "", 0
@@ -1648,6 +1734,9 @@ func responseEndpointHasNoTokenUsage(endpoint string) bool {
 }
 
 func isNoUsageMetadataEndpoint(ep string) bool {
+	if ep == "/agents/sessions" || strings.HasSuffix(ep, "/agents/sessions") || strings.Contains(ep, "/agents/sessions/") {
+		return true
+	}
 	if ep == "/models" || ep == "/v1/models" || ep == "/api/v1/models" ||
 		ep == "/models/session" || strings.HasSuffix(ep, "/models/session") ||
 		ep == "/agents" || strings.HasSuffix(ep, "/agents") {
@@ -1656,10 +1745,16 @@ func isNoUsageMetadataEndpoint(ep string) bool {
 	if strings.HasSuffix(ep, "/models") && (strings.Contains(ep, "/agents/") || strings.Contains(ep, "/agent/")) {
 		return true
 	}
+	if strings.Contains(ep, "/agents/swe/") && strings.HasSuffix(ep, "/enabled") {
+		return true
+	}
 	return false
 }
 
 func shouldSuppressForwardError(endpoint string, monitorUsage bool, err error) bool {
+	if responseEndpointHasNoTokenUsage(endpoint) && isExpectedDisconnectError(err) {
+		return true
+	}
 	return !monitorUsage && responseEndpointHasNoTokenUsage(endpoint) && isExpectedDisconnectError(err)
 }
 
@@ -1670,6 +1765,25 @@ func isLinkLocalMetadataHost(hostname string) bool {
 
 func shouldMonitorAIEndpoint(endpoint string) bool {
 	return !responseEndpointHasNoTokenUsage(endpoint)
+}
+
+func peekAndRestoreResponseBody(resp *http.Response, maxBytes int64) []byte {
+	if resp == nil || resp.Body == nil || maxBytes <= 0 {
+		return nil
+	}
+	peek, _ := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	if len(peek) == 0 {
+		return peek
+	}
+	originalBody := resp.Body
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{
+		Reader: io.MultiReader(bytes.NewReader(peek), originalBody),
+		Closer: originalBody,
+	}
+	return peek
 }
 
 func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, sourceApp string, data []byte, promptTextBytes int) {
@@ -1705,7 +1819,7 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		}
 		log.Printf("[usage] %s %s: reported model=%q prompt=%d completion=%d total=%d sourceApp=%q",
 			vendor, endpoint, model, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens, sourceApp)
-		s.reporter.Add(UsageRecord{
+		rec := UsageRecord{
 			Vendor:              vendor,
 			Model:               model,
 			Endpoint:            endpoint,
@@ -1717,7 +1831,17 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 			CostMultiplier:      s.githubCopilotDiscountMultiplier(model),
 			Source:              "client",
 			SourceApp:           sourceApp,
-		})
+		}
+		if vendor == "cursor" {
+			if CursorOfficialSyncActive() {
+				// 官方同步活跃 → 这条估算注定与官方精确记录重复，直接丢弃。
+				return
+			}
+			rec.SourceKind = "local_estimate"
+			rec.Accuracy = "estimated"
+			rec.MergeStatus = "unmatched"
+		}
+		s.reporter.Add(rec)
 		return
 	}
 
@@ -1746,7 +1870,7 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 	if tt <= 0 {
 		return
 	}
-	s.reporter.Add(UsageRecord{
+	rec := UsageRecord{
 		Vendor:           vendor,
 		Model:            opaqueModelLabelWithHint(vendor, modelHint),
 		Endpoint:         endpoint,
@@ -1755,7 +1879,16 @@ func (s *ProxyServer) processResponseData(vendor, endpoint, requestModel, source
 		TotalTokens:      tt,
 		Source:           opaqueSourceEstimate,
 		SourceApp:        sourceApp,
-	})
+	}
+	if vendor == "cursor" {
+		if CursorOfficialSyncActive() {
+			return
+		}
+		rec.SourceKind = "local_estimate"
+		rec.Accuracy = "estimated"
+		rec.MergeStatus = "unmatched"
+	}
+	s.reporter.Add(rec)
 }
 
 func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
@@ -1765,22 +1898,22 @@ func (s *ProxyServer) statusPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":            "running",
-		"version":           Version,
-		"mode":              "transparent-mitm",
-		"network_takeover":  s.networkTakeoverDiagnostics(),
-		"pid":               os.Getpid(),
-		"port":              s.listenPort,
-		"wizard_url":        fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
-		"uptime_seconds":    int(time.Since(s.startedAt).Seconds()),
-		"upstream_proxy":    upstreamLabel,
-		"user":              s.cfg.UserName,
-		"department":        s.cfg.Department,
-		"source_app":        s.reporter.sourceApp,
-		"server":            s.cfg.ServerURL,
-		"monitor_hosts":     len(effectiveMonitorHosts(s.cfg)),
-		"monitor_suffixes":  len(effectiveMonitorSuffixes(s.cfg)),
-		"mitm_cursor":       s.cfg.EffectiveMitmCursor(),
+		"status":           "running",
+		"version":          Version,
+		"mode":             "transparent-mitm",
+		"network_takeover": s.networkTakeoverDiagnostics(),
+		"pid":              os.Getpid(),
+		"port":             s.listenPort,
+		"wizard_url":       fmt.Sprintf("http://127.0.0.1:%d/wizard", s.listenPort),
+		"uptime_seconds":   int(time.Since(s.startedAt).Seconds()),
+		"upstream_proxy":   upstreamLabel,
+		"user":             s.cfg.UserName,
+		"department":       s.cfg.Department,
+		"source_app":       s.reporter.sourceApp,
+		"server":           s.cfg.ServerURL,
+		"monitor_hosts":    len(effectiveMonitorHosts(s.cfg)),
+		"monitor_suffixes": len(effectiveMonitorSuffixes(s.cfg)),
+		"mitm_cursor":      s.cfg.EffectiveMitmCursor(),
 		"stats": map[string]interface{}{
 			"total_reported": s.reporter.Stats.TotalReported.Load(),
 			"total_tokens":   s.reporter.Stats.TotalTokens.Load(),
@@ -1808,15 +1941,15 @@ func (s *ProxyServer) networkTakeoverDiagnostics() map[string]interface{} {
 		caPath = s.certMgr.CACertPath()
 	}
 	return map[string]interface{}{
-		"mode":             mode,
-		"auto_config_url":  autoConfigURL,
-		"pac_is_self":      isAIMonitorPACURL(autoConfigURL),
-		"system_proxy":     sysProxy,
+		"mode":                 mode,
+		"auto_config_url":      autoConfigURL,
+		"pac_is_self":          isAIMonitorPACURL(autoConfigURL),
+		"system_proxy":         sysProxy,
 		"system_proxy_is_self": isSelfProxy(sysProxy),
-		"user_http_proxy":  ReadUserLevelEnv("HTTP_PROXY"),
-		"user_https_proxy": ReadUserLevelEnv("HTTPS_PROXY"),
-		"user_no_proxy":    ReadUserLevelEnv("NO_PROXY"),
-		"ca_path":          caPath,
+		"user_http_proxy":      ReadUserLevelEnv("HTTP_PROXY"),
+		"user_https_proxy":     ReadUserLevelEnv("HTTPS_PROXY"),
+		"user_no_proxy":        ReadUserLevelEnv("NO_PROXY"),
+		"ca_path":              caPath,
 	}
 }
 

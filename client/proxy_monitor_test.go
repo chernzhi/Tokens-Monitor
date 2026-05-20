@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io"
+	"net/http"
 	"testing"
 )
 
@@ -17,10 +19,15 @@ func TestShouldMonitorAIEndpointSkipsTelemetry(t *testing.T) {
 		{endpoint: "/api/v1/models", want: false},
 		{endpoint: "/models/session", want: false},
 		{endpoint: "/agents", want: false},
+		{endpoint: "/agents/sessions", want: false},
+		{endpoint: "/agents/sessions/session-123", want: false},
+		{endpoint: "/agents/sessions/session-123/messages", want: false},
 		{endpoint: "/agents/swe/models", want: false},
+		{endpoint: "/agents/swe/v1/jobs/chernzhi/Tokens-Monitor/enabled", want: false},
 		{endpoint: "/extensions-control", want: false},
 		{endpoint: "/tev1/v1/rgstr", want: false},
 		{endpoint: "/backend-api/accounts/check", want: false},
+		{endpoint: "/backend-api/wham/usage", want: false},
 		{endpoint: "/backend-api/codex/responses", want: true},
 		{endpoint: "/v1/chat/completions", want: true},
 	}
@@ -29,6 +36,24 @@ func TestShouldMonitorAIEndpointSkipsTelemetry(t *testing.T) {
 		if got := shouldMonitorAIEndpoint(tc.endpoint); got != tc.want {
 			t.Fatalf("%s: got %v want %v", tc.endpoint, got, tc.want)
 		}
+	}
+}
+
+func TestPeekAndRestoreResponseBodyDoesNotTruncate(t *testing.T) {
+	body := []byte("abcdefghijklmnopqrstuvwxyz")
+	resp := &http.Response{Body: io.NopCloser(bytes.NewReader(body))}
+
+	peek := peekAndRestoreResponseBody(resp, 5)
+	if string(peek) != "abcde" {
+		t.Fatalf("peek = %q, want %q", string(peek), "abcde")
+	}
+
+	restored, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if !bytes.Equal(restored, body) {
+		t.Fatalf("restored body = %q, want %q", string(restored), string(body))
 	}
 }
 

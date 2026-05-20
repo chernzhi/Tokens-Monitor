@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -276,7 +277,7 @@ const webWizardHTML = `<!DOCTYPE html>
       <div class="user-name" id="displayName"></div>
       <div class="user-detail" id="displayDetail"></div>
     </div>
-    <div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct)</div>
+    {{if not .FirstInstall}}<div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct)</div>
 
     <div class="panel">
       <div class="panel-title">使用统计</div>
@@ -352,6 +353,18 @@ const webWizardHTML = `<!DOCTYPE html>
             <span class="launch-ico" style="background:linear-gradient(135deg,#f43f5e 0%,#e11d48 100%);color:#fff;font-weight:700;font-size:14px;">T</span>
             <span class="launch-name">Trae</span>
           </button>
+          <button class="launch-btn" onclick="launchPreset('qoder')" title="启动 Qoder（阿里 AI IDE）">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#f97316 0%,#ea580c 100%);color:#fff;font-weight:700;font-size:14px;">Q</span>
+            <span class="launch-name">Qoder</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('zed')" title="启动 Zed Editor">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#0ea5e9 0%,#0369a1 100%);color:#fff;font-weight:700;font-size:14px;">Z</span>
+            <span class="launch-name">Zed</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('claude-code')" title="在 PowerShell 中启动 Claude Code CLI，自动注入本地 MITM 环境变量。">
+            <span class="launch-ico" style="background:linear-gradient(135deg,#d97706 0%,#b45309 100%);color:#fff;font-weight:700;font-size:14px;">CC</span>
+            <span class="launch-name">Claude Code</span>
+          </button>
         </div>
       </div>
 
@@ -394,17 +407,8 @@ const webWizardHTML = `<!DOCTYPE html>
           </button>
         </div>
       </div>
-      <div class="launch-section-title" style="margin-top:14px;border-top:1px solid #1f2a3a;padding-top:12px;">自定义程序</div>
-      <div class="field" style="margin-top:6px;">
-        <label>自定义程序路径</label>
-        <input id="customBinary" type="text" placeholder="例如：C:\Program Files\Git\bin\bash.exe" />
-      </div>
-      <div class="field">
-        <label>参数（可选）</label>
-        <input id="customArgs" type="text" placeholder='例如：-l -i' />
-      </div>
-      <button class="btn-secondary btn-small" onclick="launchCustom()">启动自定义程序</button>
     </div>
+    {{end}}
 
     <div id="setupActions">
       <div class="advanced-toggle"><a onclick="toggleAdvanced()">▶ 高级选项</a></div>
@@ -436,7 +440,14 @@ const webWizardHTML = `<!DOCTYPE html>
 <script>
 var authUser = null;
 var basePath = '{{.BasePath}}';
+var wizardToken = '{{.WizardToken}}';
 var consoleStatus = null;
+
+function wizardHeaders(extra) {
+  var headers = extra || {};
+  if (wizardToken) headers['X-AI-Monitor-Wizard-Token'] = wizardToken;
+  return headers;
+}
 
 var statusHideTimer = null;
 function setStatus(level, text) {
@@ -525,26 +536,55 @@ async function refreshConsoleStatus() {
   return false;
 }
 
+var modeSwitchInFlight = false;
+
+function setModeButtonsDisabled(disabled) {
+  ['modeObserveBtn','modeSessionBtn','modeGlobalBtn','modeCleanupBtn'].forEach(function(id){
+    var el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  });
+}
+
 async function switchMode(mode) {
+  if (modeSwitchInFlight) {
+    setStatus('info', '上一次切换还在进行，请稍候 ...');
+    return;
+  }
   var label = modeText(mode);
   if (mode === 'global_install' && !confirm('确认切换到全局接管模式？这会写入持久网络设置。')) return;
   if (mode === 'cleanup' && !confirm('确认执行一键恢复网络？这会清理当前代理接管设置。')) return;
+
+  modeSwitchInFlight = true;
+  setModeButtonsDisabled(true);
+  var startedAt = Date.now();
+  var elapsedTimer = setInterval(function(){
+    var sec = Math.floor((Date.now() - startedAt) / 1000);
+    setStatus('info', '正在切换模式：' + label + ' ...（已耗时 ' + sec + 's）');
+  }, 1000);
   setStatus('info', '正在切换模式：' + label + ' ...');
+
   try {
     var resp = await fetch(basePath + '/api/console/mode', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ mode: mode }),
     });
-    var data = await resp.json();
+    var data = {};
+    try { data = await resp.json(); } catch(e) { data = {}; }
+    var took = ((Date.now() - startedAt) / 1000).toFixed(1) + 's';
     if (resp.ok && data.success) {
-      setStatus('success', '✓ ' + data.message);
-      await refreshConsoleStatus();
+      setStatus('success', '✓ ' + data.message + '（' + took + '）');
     } else {
-      setStatus('error', '✗ ' + (data.message || '模式切换失败'));
+      setStatus('error', '✗ ' + (data.message || ('HTTP ' + resp.status)) + '（' + took + '）');
     }
   } catch (err) {
     setStatus('error', '✗ 网络错误: ' + err.message);
+  } finally {
+    clearInterval(elapsedTimer);
+    modeSwitchInFlight = false;
+    setModeButtonsDisabled(false);
+    // 无论成功失败都强制刷新一次状态，避免 UI 停在旧模式。
+    try { await refreshConsoleStatus(); } catch(e) {}
   }
 }
 
@@ -553,34 +593,8 @@ async function launchPreset(name) {
   try {
     var resp = await fetch(basePath + '/api/console/launch', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ preset: name, restart_running: true }),
-    });
-    var data = await resp.json();
-    if (resp.ok && data.success) {
-      setStatus('success', '✓ ' + data.message);
-    } else {
-      setStatus('error', '✗ ' + (data.message || '启动失败'));
-    }
-  } catch (err) {
-    setStatus('error', '✗ 网络错误: ' + err.message);
-  }
-}
-
-async function launchCustom() {
-  var binary = document.getElementById('customBinary').value.trim();
-  var argsText = document.getElementById('customArgs').value.trim();
-  if (!binary) {
-    setStatus('error', '✗ 请先输入自定义程序路径');
-    return;
-  }
-  var args = argsText ? argsText.split(/\s+/).filter(Boolean) : [];
-  setStatus('info', '正在启动自定义程序...');
-  try {
-    var resp = await fetch(basePath + '/api/console/launch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ custom_binary: binary, custom_args: args, restart_running: true }),
     });
     var data = await resp.json();
     if (resp.ok && data.success) {
@@ -645,7 +659,7 @@ async function doRegister() {
   try {
     var resp = await fetch(basePath + '/api/auth/register', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ server_url: getServerUrl(), name: name, email: email, department: dept, password: pwd }),
     });
     var data = await resp.json();
@@ -675,7 +689,7 @@ async function doLogin() {
   try {
     var resp = await fetch(basePath + '/api/auth/login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ server_url: getServerUrl(), email: id, password: pwd }),
     });
     var data = await resp.json();
@@ -712,7 +726,7 @@ async function doResetPassword() {
   try {
     var resp = await fetch(basePath + '/api/auth/reset-password', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ server_url: getServerUrl(), email: email, name: name, new_password: newPwd }),
     });
     var data = await resp.json();
@@ -766,6 +780,35 @@ function toggleAdvanced() {
   document.getElementById('advancedSection').classList.toggle('show');
 }
 
+function waitForMonitorAndRedirect(nextURL, statusEl) {
+  // 拆出 origin 探活（/status 是无认证 JSON 健康端点），200 即认为代理就绪。
+  var origin = nextURL.replace(/\/wizard.*$/, '');
+  var probeURL = origin + '/status';
+  var deadline = Date.now() + 60000;
+  var attempts = 0;
+  function tick() {
+    attempts++;
+    fetch(probeURL, { cache: 'no-store' }).then(function(r) {
+      if (r.ok) {
+        if (statusEl) statusEl.innerHTML = '✓ 监控服务已就绪，正在跳转...';
+        setTimeout(function() { window.location.replace(nextURL); }, 400);
+        return;
+      }
+      throw new Error('status ' + r.status);
+    }).catch(function() {
+      if (Date.now() > deadline) {
+        if (statusEl) {
+          statusEl.className = 'error';
+          statusEl.innerHTML = '✗ 监控服务未在 60 秒内就绪。<br>请手动打开：<a href="' + nextURL + '" style="color:#38bdf8;">' + nextURL + '</a>';
+        }
+        return;
+      }
+      setTimeout(tick, attempts < 5 ? 600 : 1200);
+    });
+  }
+  tick();
+}
+
 async function doInstall() {
   if (!authUser) { alert('请先登录或注册'); showAuthStep('login'); return; }
   var btn = document.getElementById('installBtn');
@@ -777,7 +820,7 @@ async function doInstall() {
   try {
     var resp = await fetch(basePath + '/api/setup', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         user_name: authUser.name,
         user_id: authUser.employee_id,
@@ -791,8 +834,16 @@ async function doInstall() {
     var result = await resp.json();
     if (result.success) {
       status.className = 'success';
-      status.innerHTML = '✓ 安装成功！<br><br>' + result.message.replace(/\n/g, '<br>') + '<br><br>此页面可以关闭了。';
       btn.textContent = '✓ 已完成';
+      if (result.next_url) {
+        // 立即给一个可点链接做兜底——即使 60s 轮询失败，用户仍可手动跳过去。
+        status.innerHTML = '✓ 安装成功，正在启动监控服务...<br>'
+          + '<span style="opacity:.7;">如未自动跳转，请点击：</span> '
+          + '<a href="' + result.next_url + '" style="color:#38bdf8;">' + result.next_url + '</a>';
+        waitForMonitorAndRedirect(result.next_url, status);
+      } else {
+        status.innerHTML = '✓ 安装成功！<br><br>' + result.message.replace(/\n/g, '<br>') + '<br><br>此页面可以关闭了。';
+      }
     } else {
       status.className = 'error';
       status.textContent = '✗ ' + result.message;
@@ -962,6 +1013,7 @@ type setupRequest struct {
 type setupResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	NextURL string `json:"next_url,omitempty"`
 }
 
 type consoleStatusResponse struct {
@@ -995,6 +1047,21 @@ type consoleActionResponse struct {
 
 var wizardActionMu sync.Mutex
 
+const wizardTokenHeader = "X-AI-Monitor-Wizard-Token"
+
+func (s *ProxyServer) authorizeWizardAction(r *http.Request) bool {
+	if s == nil || strings.TrimSpace(s.wizardToken) == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get(wizardTokenHeader)), []byte(s.wizardToken)) == 1
+}
+
+func (s *ProxyServer) rejectUnauthorizedWizardAction(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "wizard token 无效"})
+}
+
 // runWebWizard starts a local web server with a setup page and opens it in the browser.
 // Blocks until the user completes setup or closes the page.
 func runWebWizard(configPath string, certMgr *CertManager) error {
@@ -1018,16 +1085,22 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 			return
 		}
 		data := struct {
-			UserName  string
-			ServerURL string
-			BasePath  string
+			UserName     string
+			ServerURL    string
+			BasePath     string
+			WizardToken  string
+			FirstInstall bool
 		}{
-			UserName:  getOSUserName(),
-			ServerURL: DefaultServerURL,
-			BasePath:  "",
+			UserName:     getOSUserName(),
+			ServerURL:    DefaultServerURL,
+			BasePath:     "",
+			WizardToken:  "",
+			FirstInstall: true,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		tmpl.Execute(w, data)
+		if err := tmpl.Execute(w, data); err != nil {
+			log.Printf("[wizard] template execute failed: %v", err)
+		}
 	})
 
 	// Proxy auth requests to the remote server (register / login)
@@ -1175,9 +1248,23 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 		messages = append(messages, "后续通过 低侵入监控.bat 或 启动-VSCode监控.bat / 启动-Cursor监控.bat 打开监控。")
 
 		w.Header().Set("Content-Type", "application/json")
+		nextPort := req.Port
+		if nextPort <= 0 || nextPort > 65535 {
+			nextPort = 18090
+		}
+		// 关键：如果机器上已有一个 ai-monitor 在跑（比如旧版未关），新进程会因为
+		// 单例检查直接 os.Exit，新配置永远不会生效。这里主动把它干掉，让 main.go
+		// 在 runWebWizard 返回后能顺利 startMonitorRuntime 起到 req.Port 上。
+		if existingPort, alive := checkExistingInstance(); alive {
+			log.Printf("[wizard] 检测到旧实例占用 :%d，正在终止以便新配置生效", existingPort)
+			stopExistingInstanceForUninstall()
+			// 给被 kill 的进程让一点点时间释放端口
+			time.Sleep(800 * time.Millisecond)
+		}
 		json.NewEncoder(w).Encode(setupResponse{
 			Success: true,
 			Message: strings.Join(messages, "\n"),
+			NextURL: fmt.Sprintf("http://127.0.0.1:%d/wizard", nextPort),
 		})
 
 		// Signal completion after a short delay (let response send)
@@ -1217,17 +1304,16 @@ func runWebWizard(configPath string, certMgr *CertManager) error {
 	}
 	select {
 	case <-done:
-		// Setup completed (or HTTP server errored). Dismiss the embedded window so
-		// the user doesn't have to close it manually. 等窗口真正销毁后再返回——
-		// 否则 main goroutine 会马上打开「运行态」配置窗口，老窗口还没关掉，
-		// 用户看到两个窗口，老窗口卡死无响应。
+		// Setup completed (or HTTP server errored).
+		// 成功路径也关闭首次安装窗口，后续由运行态重新打开控制台窗口。
+		// 这样可以避免旧向导窗口停留在已关闭的临时端口页面。
 		if closeWindow != nil {
 			closeWindow()
-		}
-		select {
-		case <-windowDone:
-		case <-time.After(3 * time.Second):
-			log.Println("[wizard] 安装向导窗口未在 3s 内关闭，继续后续流程")
+			select {
+			case <-windowDone:
+			case <-time.After(3 * time.Second):
+				log.Println("[wizard] 安装向导窗口未在 3s 内关闭，继续后续流程")
+			}
 		}
 	case <-windowDone:
 		// User closed the wizard window before completing setup. Treat as abort.
@@ -1265,15 +1351,19 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data := struct {
-			UserName  string
-			UserID    string
-			ServerURL string
-			BasePath  string
+			UserName     string
+			UserID       string
+			ServerURL    string
+			BasePath     string
+			WizardToken  string
+			FirstInstall bool
 		}{
-			UserName:  s.cfg.UserName,
-			UserID:    s.cfg.UserID,
-			ServerURL: s.cfg.ServerURL,
-			BasePath:  "/wizard",
+			UserName:     s.cfg.UserName,
+			UserID:       s.cfg.UserID,
+			ServerURL:    s.cfg.ServerURL,
+			BasePath:     "/wizard",
+			WizardToken:  s.wizardToken,
+			FirstInstall: false,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		tmpl.Execute(w, data)
@@ -1285,10 +1375,18 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if subPath == "/api/console/mode" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
 		s.handleConsoleModeSwitch(w, r)
 		return
 	}
 	if subPath == "/api/console/launch" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
 		s.handleConsoleLaunch(w, r)
 		return
 	}
@@ -1307,6 +1405,10 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 
 	// Proxy auth requests to the remote server
 	if strings.HasPrefix(subPath, "/api/auth/") && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
 		var reqBody struct {
 			ServerURL string `json:"server_url"`
 		}
@@ -1350,6 +1452,10 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 
 	// Handle setup submission (runtime mode: only update config, no install steps)
 	if subPath == "/api/setup" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
 		var req setupRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.Header().Set("Content-Type", "application/json")
@@ -1462,47 +1568,69 @@ func (s *ProxyServer) handleConsoleModeSwitch(w http.ResponseWriter, r *http.Req
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))
-	wizardActionMu.Lock()
+
+	// 锁尝试 100ms：如果有切换在跑，直接告诉用户「忙」，不要让 HTTP 请求挂着排队，
+	// 否则前端连续点几下会全部卡在 Mutex 上，看起来像「点了没反应」。
+	if !tryLockWithTimeout(&wizardActionMu, 100*time.Millisecond) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "上一次切换还在进行，请稍候再试"})
+		return
+	}
 	defer wizardActionMu.Unlock()
+
+	overallStart := time.Now()
+	log.Printf("[mode-switch] ▶ 开始切换：%s", mode)
+	defer func() {
+		log.Printf("[mode-switch] ◀ 结束切换：%s 共耗时 %s", mode, time.Since(overallStart).Round(time.Millisecond))
+	}()
+
+	step := func(name string, fn func()) {
+		t0 := time.Now()
+		fn()
+		log.Printf("[mode-switch]   · %s 耗时 %s", name, time.Since(t0).Round(time.Millisecond))
+	}
 
 	var message string
 	switch mode {
 	case "observe":
-		st := loadInstallState()
-		restoreProxyFromState(st)
-		restoreOrClearEnvVars(st)
+		var st *InstallState
+		step("loadInstallState", func() { st = loadInstallState() })
+		step("restoreProxyFromState", func() { restoreProxyFromState(st) })
+		step("restoreOrClearEnvVars", func() { restoreOrClearEnvVars(st) })
 		if st != nil && st.SessionOnly {
-			clearInstallState()
+			step("clearInstallState", func() { clearInstallState() })
 		}
 		s.SetTakeoverMode("observe")
 		message = "已切换到观察模式（当前不接管系统网络）"
 	case "session_pac":
 		st := loadInstallState()
 		if st != nil && st.SystemProxySet && !st.SessionOnly {
-			applySessionManagedProxy(s.cfg, s.certMgr, s.listenPort)
+			step("applySessionManagedProxy", func() { applySessionManagedProxy(s.cfg, s.certMgr, s.listenPort) })
 			s.SetTakeoverMode("persistent")
 			message = "当前为全局接管配置，已保持持久接管模式生效"
 		} else {
-			applyTemporarySessionProxy(s.cfg, s.certMgr, s.listenPort)
+			step("applyTemporarySessionProxy", func() { applyTemporarySessionProxy(s.cfg, s.certMgr, s.listenPort) })
 			s.SetTakeoverMode("session")
 			message = "已切换到会话PAC模式（退出自动还原）"
 		}
 	case "global_install":
-		doGlobalInstall(s.certMgr, s.cfg, s.configPath)
-		applySessionManagedProxy(s.cfg, s.certMgr, s.listenPort)
+		step("doGlobalInstall", func() { doGlobalInstall(s.certMgr, s.cfg, s.configPath) })
+		step("applySessionManagedProxy", func() { applySessionManagedProxy(s.cfg, s.certMgr, s.listenPort) })
 		s.SetTakeoverMode("persistent")
 		message = "已切换到全局接管模式（持久）"
 	case "cleanup":
-		st := loadInstallState()
-		restoreProxyFromState(st)
-		clearAIMonitorPACIfCurrent()
-		restoreOrClearEnvVars(st)
-		removeAIMonitorIDEProxy()
+		var st *InstallState
+		step("loadInstallState", func() { st = loadInstallState() })
+		step("restoreProxyFromState", func() { restoreProxyFromState(st) })
+		step("clearAIMonitorPACIfCurrent", func() { clearAIMonitorPACIfCurrent() })
+		step("restoreOrClearEnvVars", func() { restoreOrClearEnvVars(st) })
+		step("removeAIMonitorIDEProxy", func() { removeAIMonitorIDEProxy() })
 		if clearConfiguredUpstreamProxy(s.configPath) {
 			s.cfg.UpstreamProxy = ""
 		}
-		clearSavedUpstreamProxy()
-		clearInstallState()
+		step("clearSavedUpstreamProxy", func() { clearSavedUpstreamProxy() })
+		step("clearInstallState", func() { clearInstallState() })
 		s.SetTakeoverMode("observe")
 		message = "网络接管残留已清理，当前为观察模式"
 	default:
@@ -1516,6 +1644,31 @@ func (s *ProxyServer) handleConsoleModeSwitch(w http.ResponseWriter, r *http.Req
 	_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: true, Message: message})
 }
 
+// tryLockWithTimeout 尝试在 timeout 内获取 mu；成功返回 true。
+// sync.Mutex 自身没有 TryLock+timeout 组合，这里用轮询模拟，开销可以忽略（1ms 一次）。
+func tryLockWithTimeout(mu *sync.Mutex, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+}
+
+func validateConsoleLaunchRequest(req consoleLaunchRequest) consoleActionResponse {
+	if strings.TrimSpace(req.CustomBinary) != "" || len(req.CustomArgs) > 0 {
+		return consoleActionResponse{Success: false, Message: "仅允许使用 preset 启动内置应用"}
+	}
+	if strings.TrimSpace(req.Preset) == "" {
+		return consoleActionResponse{Success: false, Message: "请提供 preset"}
+	}
+	return consoleActionResponse{Success: true}
+}
+
 func (s *ProxyServer) handleConsoleLaunch(w http.ResponseWriter, r *http.Request) {
 	var req consoleLaunchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1524,42 +1677,29 @@ func (s *ProxyServer) handleConsoleLaunch(w http.ResponseWriter, r *http.Request
 		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "请求格式错误"})
 		return
 	}
+	if validation := validateConsoleLaunchRequest(req); !validation.Success {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(validation)
+		return
+	}
+
 	wizardActionMu.Lock()
 	defer wizardActionMu.Unlock()
 
 	presetName := strings.ToLower(strings.TrimSpace(req.Preset))
-	var command []string
-	var preset *launchPreset
-
-	if presetName != "" {
-		var err error
-		command, preset, err = resolveLaunchCommand(nil, presetName, exec.LookPath)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: err.Error()})
-			return
+	command, preset, err := resolveLaunchCommand(nil, presetName, exec.LookPath)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if req.RestartRunning {
+		if image, _ := managedPresetProcessImage(preset); image != "" {
+			_ = newHiddenCmd("taskkill", "/F", "/IM", image).Run()
+			time.Sleep(1200 * time.Millisecond)
 		}
-		if req.RestartRunning {
-			if image, _ := managedPresetProcessImage(preset); image != "" {
-				_ = newHiddenCmd("taskkill", "/F", "/IM", image).Run()
-				time.Sleep(1200 * time.Millisecond)
-			}
-		}
-	} else {
-		bin := strings.TrimSpace(req.CustomBinary)
-		if bin == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: "请提供 preset 或 custom_binary"})
-			return
-		}
-		if !strings.ContainsAny(bin, `\/:`) {
-			if resolved, err := exec.LookPath(bin); err == nil {
-				bin = resolved
-			}
-		}
-		command = append([]string{bin}, req.CustomArgs...)
 	}
 
 	if err := launchChildWithExistingProxyDetached(s.cfg, s.certMgr, command, preset, s.listenPort); err != nil {

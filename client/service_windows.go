@@ -197,8 +197,7 @@ func startBackgroundInstance(configPath string) error {
 	exePath, _ = filepath.Abs(exePath)
 	absConfig, _ := filepath.Abs(configPath)
 
-	cmd := newHiddenCmd("cmd", "/C", "start", "/b", "",
-		exePath, "--config", absConfig)
+	cmd := newDetachedCmd(exePath, "--config", absConfig)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Stdin = nil

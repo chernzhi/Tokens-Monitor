@@ -65,6 +65,10 @@ CREATE TABLE token_usage_logs (
     cost_usd NUMERIC(12, 6) DEFAULT 0,   -- 美元成本
     cost_cny NUMERIC(12, 4) DEFAULT 0,   -- 人民币成本
     request_id VARCHAR(100),
+    source_kind VARCHAR(30),
+    accuracy VARCHAR(20),
+    correlation_key VARCHAR(200),
+    merge_status VARCHAR(30),
     request_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -75,6 +79,8 @@ CREATE INDEX idx_usage_request_at ON token_usage_logs(request_at);
 CREATE INDEX idx_usage_source ON token_usage_logs(source);
 CREATE INDEX idx_usage_source_app ON token_usage_logs(source_app, request_at);
 CREATE INDEX idx_usage_endpoint ON token_usage_logs(endpoint, request_at);
+CREATE INDEX idx_usage_cursor_correlation ON token_usage_logs(provider, correlation_key, source_kind, merge_status, request_at)
+    WHERE provider = 'cursor' AND correlation_key IS NOT NULL;
 
 -- 日汇总表（ETL 定时聚合）
 CREATE TABLE daily_usage_summary (
