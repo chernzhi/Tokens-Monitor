@@ -273,9 +273,16 @@ const webWizardHTML = `<!DOCTYPE html>
 
   <!-- ========== Step 2: 安装 ========== -->
   <div class="step" id="step2">
-    <div class="user-info">
-      <div class="user-name" id="displayName"></div>
-      <div class="user-detail" id="displayDetail"></div>
+    <div class="user-info" style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+      <div style="flex:1;min-width:0">
+        <div class="user-name" id="displayName"></div>
+        <div class="user-detail" id="displayDetail"></div>
+      </div>
+      <div id="updateBox" style="text-align:right;font-size:12px;color:#94a3b8;flex-shrink:0">
+        <div>当前 v<span id="curVer">-</span> · <span id="latestVer">检查中…</span></div>
+        <button id="updateBtn" class="btn-secondary btn-small" onclick="updateBtnClick()" style="margin-top:6px;min-width:88px">检查更新</button>
+        <div id="updateMsg" style="margin-top:4px;font-size:11px;color:#64748b;min-height:14px"></div>
+      </div>
     </div>
     {{if not .FirstInstall}}<div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct)</div>
 
@@ -409,20 +416,8 @@ const webWizardHTML = `<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- 自动更新横幅（无新版时隐藏） -->
-    <div id="updateBanner" style="display:none;padding:12px 16px;border-radius:8px;margin:12px 0;color:#0f172a;"></div>
-
-    <!-- 关于卡片 -->
-    <div class="panel" id="aboutCard" style="margin-top:12px">
-      <div class="panel-title">关于</div>
-      <div>当前版本：v<span id="curVer"></span></div>
-      <div>最新版本：<span id="latestVer">检查中…</span></div>
-      <div style="margin-top:8px">
-        <button class="btn-secondary btn-small" onclick="checkUpdate()">检查更新</button>
-        <button class="btn-secondary btn-small" id="applyBtn" onclick="applyUpdate()" disabled>立即更新</button>
-      </div>
-      <pre id="releaseNotes" style="margin-top:12px;white-space:pre-wrap;font-size:12px;color:#94a3b8"></pre>
-    </div>
+    <!-- 自动更新横幅（下载进度/错误时显示） -->
+    <div id="updateBanner" style="display:none;padding:10px 14px;border-radius:8px;margin:12px 0;color:#0f172a;font-size:13px"></div>
     {{end}}
 
     <div id="setupActions">
@@ -1012,64 +1007,126 @@ function initLogPanel() {
   });
 }
 
-// ── 自动更新（关于卡片 + 横幅） ─────────────────────────────────
+// ── 自动更新（顶部信息栏） ─────────────────────────────────
+var updateState = { hasUpdate: false, latest: '', busy: false };
+
+function setUpdateMsg(text, color) {
+  var el = document.getElementById('updateMsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = color || '#64748b';
+}
+
 function renderUpdateState(s) {
   var verEl = document.getElementById('curVer');
-  if (!verEl) return; // aboutCard 不在 DOM（首次安装模式）
+  if (!verEl) return;
   verEl.textContent = (s && s.current_version) || '';
-  var banner = document.getElementById('updateBanner');
-  var applyBtn = document.getElementById('applyBtn');
   var latest = document.getElementById('latestVer');
-  var notes = document.getElementById('releaseNotes');
-  if (s && s.release && s.release.has_update) {
-    latest.textContent = 'v' + s.release.latest_version;
-    notes.textContent = s.release.release_notes || '';
-    applyBtn.disabled = false;
-    banner.style.display = 'block';
-    banner.style.background = s.release.mandatory ? '#fee2e2' : '#fef3c7';
-    banner.textContent = '';
-    var label = document.createElement('span');
-    label.textContent = '🆕 新版本 v' + s.release.latest_version + ' 可用 · ';
-    banner.appendChild(label);
-    var btn = document.createElement('button');
-    btn.className = 'btn-secondary btn-small';
-    btn.textContent = '立即更新';
-    btn.onclick = applyUpdate;
-    banner.appendChild(btn);
+  var btn = document.getElementById('updateBtn');
+  var banner = document.getElementById('updateBanner');
+
+  var hasUpdate = !!(s && s.release && s.release.has_update);
+  updateState.hasUpdate = hasUpdate;
+  updateState.latest = hasUpdate ? s.release.latest_version : '';
+
+  if (hasUpdate) {
+    latest.textContent = '新版 v' + s.release.latest_version;
+    latest.style.color = '#fbbf24';
+    if (!updateState.busy) {
+      btn.textContent = '立即更新';
+      btn.disabled = false;
+    }
   } else {
     latest.textContent = '已是最新';
-    applyBtn.disabled = true;
-    banner.style.display = 'none';
+    latest.style.color = '#94a3b8';
+    if (!updateState.busy) {
+      btn.textContent = '检查更新';
+      btn.disabled = false;
+    }
   }
+
   if (s && s.downloading) {
     banner.style.display = 'block';
     banner.style.background = '#dbeafe';
     banner.textContent = '下载中… ' + (s.progress || 0) + '%';
-  }
-  if (s && s.error) {
+  } else if (s && s.error) {
     banner.style.display = 'block';
     banner.style.background = '#fecaca';
     banner.textContent = '更新检查失败: ' + s.error;
+  } else {
+    banner.style.display = 'none';
   }
 }
+
 function refreshUpdateStatus() {
   fetch(basePath + '/api/wizard/update/status')
     .then(function(r){return r.json();})
     .then(renderUpdateState)
     .catch(function(){});
 }
+
+function updateBtnClick() {
+  if (updateState.busy) return;
+  if (updateState.hasUpdate) {
+    applyUpdate();
+  } else {
+    checkUpdate();
+  }
+}
+
 function checkUpdate() {
+  var btn = document.getElementById('updateBtn');
+  updateState.busy = true;
+  btn.disabled = true;
+  btn.textContent = '检查中…';
+  setUpdateMsg('正在向服务器查询新版本…');
   fetch(basePath + '/api/wizard/update/check', {method:'POST', headers: wizardHeaders()})
-    .then(function(r){return r.json();})
-    .then(function(){ refreshUpdateStatus(); })
-    .catch(function(){});
+    .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, data:d}; }); })
+    .then(function(res){
+      if (!res.ok) {
+        setUpdateMsg('✗ ' + (res.data && res.data.error || 'HTTP 错误'), '#f87171');
+      } else if (res.data && res.data.release && res.data.release.has_update) {
+        setUpdateMsg('🆕 发现 v' + res.data.release.latest_version, '#fbbf24');
+      } else {
+        setUpdateMsg('已是最新版本', '#34d399');
+      }
+    })
+    .catch(function(e){ setUpdateMsg('✗ 网络错误: ' + e.message, '#f87171'); })
+    .finally(function(){
+      updateState.busy = false;
+      refreshUpdateStatus();
+      setTimeout(function(){ setUpdateMsg(''); }, 4000);
+    });
 }
+
 function applyUpdate() {
-  if (!confirm('确认立即更新？应用会自动重启。')) return;
+  if (!confirm('确认立即更新到 v' + updateState.latest + '？应用会自动重启。')) return;
+  var btn = document.getElementById('updateBtn');
+  updateState.busy = true;
+  btn.disabled = true;
+  btn.textContent = '更新中…';
+  setUpdateMsg('正在下载新版本…');
   fetch(basePath + '/api/wizard/update/apply', {method:'POST', headers: wizardHeaders()})
-    .catch(function(){});
+    .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, data:d}; }); })
+    .then(function(res){
+      if (!res.ok) {
+        setUpdateMsg('✗ ' + (res.data && res.data.error || 'HTTP 错误'), '#f87171');
+        updateState.busy = false;
+        btn.disabled = false;
+        btn.textContent = '立即更新';
+      } else {
+        setUpdateMsg('已派发更新，应用将自动重启…', '#34d399');
+      }
+    })
+    .catch(function(e){
+      setUpdateMsg('✗ ' + e.message, '#f87171');
+      updateState.busy = false;
+      btn.disabled = false;
+      btn.textContent = '立即更新';
+    });
 }
-if (document.getElementById('aboutCard')) {
+
+if (document.getElementById('updateBtn')) {
   setInterval(refreshUpdateStatus, 5000);
   refreshUpdateStatus();
 }

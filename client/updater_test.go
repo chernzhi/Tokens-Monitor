@@ -100,7 +100,7 @@ func TestRenderUpdaterBat_ContainsKeyTokens(t *testing.T) {
 	for _, s := range []string{
 		"setlocal",
 		"copy /Y",
-		"tasklist /FI",
+		":retry",
 		"move /Y",
 		"start \"\"",
 		"--post-update",

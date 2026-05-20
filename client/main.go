@@ -99,6 +99,7 @@ func main() {
 	// 内嵌窗口里的「运行日志」面板通过 /wizard/logs/stream 实时拉取。
 	// 必须在第一行 fmt.Println / log.Printf 之前调用。
 	initLogCapture(2000)
+	hideOwnedConsoleWindow()
 
 	fmt.Println()
 	fmt.Println("  ╔══════════════════════════════════════════╗")

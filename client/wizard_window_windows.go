@@ -179,7 +179,7 @@ func openWizardWindow(url, title string, closeOnRequest *func()) (<-chan struct{
 				Title:  title,
 				Width:  1440,
 				Height: 920,
-				IconId: 2,
+				IconId: 1,
 				Center: true,
 			},
 		})

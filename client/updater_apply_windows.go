@@ -11,40 +11,43 @@ import (
 )
 
 const updaterBatTemplate = `@echo off
-setlocal
-set TARGET=%~1
-set NEW=%~2
-set BACKUP=%~3
-set LOG=%~4
-set PARENTPID=%~5
+setlocal EnableExtensions
+set "TARGET=%~1"
+set "NEW=%~2"
+set "BACKUP=%~3"
+set "LOG=%~4"
 
-REM 备份当前 exe
+> "%LOG%" echo [updater] %DATE% %TIME% start
+>>"%LOG%" echo TARGET=%TARGET%
+>>"%LOG%" echo NEW=%NEW%
+>>"%LOG%" echo BACKUP=%BACKUP%
+
+REM 备份当前 exe（即使父进程未退出 copy 仍可读）
 copy /Y "%TARGET%" "%BACKUP%" >>"%LOG%" 2>&1
+if errorlevel 1 (
+  >>"%LOG%" echo backup failed
+  exit /b 1
+)
 
-REM 等待父进程退出（最多 30s）
+REM 重试覆盖：父进程未退出时 move 会失败，循环至多 ~60s
 set /a TRIES=0
-:waitloop
-tasklist /FI "PID eq %PARENTPID%" 2>nul | find "%PARENTPID%" >nul
-if errorlevel 1 goto replace
-set /a TRIES+=1
-if %TRIES% GEQ 60 goto fail
-ping -n 2 127.0.0.1 >nul
-goto waitloop
-
-:replace
+:retry
 move /Y "%NEW%" "%TARGET%" >>"%LOG%" 2>&1
-if errorlevel 1 goto rollback
+if not errorlevel 1 goto launched
+set /a TRIES+=1
+if %TRIES% GEQ 60 goto rollback
+ping -n 2 127.0.0.1 >nul
+goto retry
 
+:launched
+>>"%LOG%" echo move ok after %TRIES% retries
 start "" "%TARGET%" --post-update "%BACKUP%"
 exit /b 0
 
 :rollback
+>>"%LOG%" echo move failed, rolling back
 copy /Y "%BACKUP%" "%TARGET%" >>"%LOG%" 2>&1
 start "" "%TARGET%"
-exit /b 1
-
-:fail
-echo updater: parent did not exit within 30s >>"%LOG%"
 exit /b 2
 `
 
@@ -79,7 +82,7 @@ func (u *Updater) ApplyUpdate(info *ReleaseInfo) error {
 	}
 
 	cmd := newDetachedCmd("cmd", "/c", batPath,
-		currentExe, newExe, backupPath, logPath, fmt.Sprint(os.Getpid()))
+		currentExe, newExe, backupPath, logPath)
 	if err := cmd.Start(); err != nil {
 		return err
 	}

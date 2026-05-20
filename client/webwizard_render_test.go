@@ -84,8 +84,8 @@ func TestWizardTemplateRendersForRuntime(t *testing.T) {
 }
 
 func TestWebWizardHTML_HasAboutCard(t *testing.T) {
-	if !strings.Contains(webWizardHTML, `id="aboutCard"`) {
-		t.Fatal("about card missing from webWizardHTML")
+	if !strings.Contains(webWizardHTML, `id="updateBtn"`) {
+		t.Fatal("update button missing from webWizardHTML header")
 	}
 	if !strings.Contains(webWizardHTML, "/api/wizard/update/status") {
 		t.Fatal("update status endpoint missing from JS")
