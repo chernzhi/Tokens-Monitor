@@ -162,26 +162,37 @@ func startSelfWatchdog(port int, cfg *Config) {
 	go func() {
 		interval := time.Duration(cfg.EffectiveWatchdogInterval()) * time.Second
 		failureThreshold := cfg.EffectiveWatchdogFailures()
-		client := &http.Client{Timeout: 3 * time.Second}
+		client := &http.Client{Timeout: 15 * time.Second}
 		failures := 0
+		var lastReason string
 		// 启动后先等 interval，避免冷启动期间偶发失败误触发。
 		time.Sleep(interval)
 		for {
-			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/status", port))
+			// 用 /healthz（纯内存）而不是 /status（要读 Windows 注册表 4 次）——
+			// 后者在杀软扫描时会偶发超时，把好好的进程误杀。
+			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
 			if err == nil {
 				resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
 					failures = 0
+					lastReason = ""
 					time.Sleep(interval)
 					continue
 				}
+				lastReason = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			} else {
+				lastReason = err.Error()
 			}
 			failures++
+			log.Printf("[watchdog] /healthz 探测失败 %d/%d: %s", failures, failureThreshold, lastReason)
 			if failures < failureThreshold {
 				time.Sleep(interval)
 				continue
 			}
-			log.Printf("[watchdog] 连续 %d 次自检失败，立即恢复系统代理并退出，避免污染本地网络。", failures)
+			// 退出前打一次内存快照，便于事后定位「是不是因为内存爆了被自己 kill」。
+			logMemStatsSnapshot("watchdog-exit")
+			log.Printf("[EXIT] reason=watchdog failures=%d last=%q port=%d pid=%d — 立即恢复系统代理并退出，避免污染本地网络。",
+				failures, lastReason, port, os.Getpid())
 			restoreSessionManagedProxyOnShutdown()
 			removeInstanceInfo()
 			os.Exit(2)

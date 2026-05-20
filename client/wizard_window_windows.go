@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	webview2 "github.com/jchv/go-webview2"
@@ -50,6 +51,90 @@ func postWMClose(hwnd uintptr) {
 	user32 := syscall.NewLazyDLL("user32.dll")
 	post := user32.NewProc("PostMessageW")
 	_, _, _ = post.Call(hwnd, uintptr(wmClose), 0, 0)
+}
+
+// 把指定窗口强行拉到前台。Windows 对 SetForegroundWindow 有严格限制
+// （只有当前持有前台锁的进程才能直接抢前台），所以这里组合用：
+//   1) AttachThreadInput 借用当前前台线程的输入队列 →
+//      SetForegroundWindow / BringWindowToTop / SetActiveWindow 才会真正生效
+//   2) SetWindowPos(HWND_TOPMOST) → SetWindowPos(HWND_NOTOPMOST) 把 Z 序顶到最上
+//   3) ShowWindow(SW_RESTORE) 把可能被最小化的窗口还原
+//   4) FlashWindowEx 作为兜底：即便抢不到前台，任务栏也会闪烁吸引用户注意
+//
+// 这是常见的「在安装/异步操作之后弹回前台」的 hack，比单纯 SetForegroundWindow 可靠。
+const (
+	hwndTopmost     = ^uintptr(0)     // (HWND)-1
+	hwndNotopmost   = ^uintptr(0) - 1 // (HWND)-2
+	swpNoMove       = 0x0002
+	swpNoSize       = 0x0001
+	swpShowWindow   = 0x0040
+	swRestore       = 9
+	swShow          = 5
+	flashwAll       = 0x00000003
+	flashwTimernofg = 0x0000000C
+)
+
+type flashwinfo struct {
+	Size    uint32
+	Hwnd    uintptr
+	Flags   uint32
+	Count   uint32
+	Timeout uint32
+}
+
+func forceWindowToFront(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	user32 := syscall.NewLazyDLL("user32.dll")
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+
+	getForegroundWindow := user32.NewProc("GetForegroundWindow")
+	getWindowThreadProcessId := user32.NewProc("GetWindowThreadProcessId")
+	attachThreadInput := user32.NewProc("AttachThreadInput")
+	setForegroundWindow := user32.NewProc("SetForegroundWindow")
+	bringWindowToTop := user32.NewProc("BringWindowToTop")
+	setActiveWindow := user32.NewProc("SetActiveWindow")
+	setWindowPos := user32.NewProc("SetWindowPos")
+	showWindow := user32.NewProc("ShowWindow")
+	flashWindowEx := user32.NewProc("FlashWindowEx")
+	getCurrentThreadId := kernel32.NewProc("GetCurrentThreadId")
+
+	fg, _, _ := getForegroundWindow.Call()
+	var fgThread uintptr
+	if fg != 0 {
+		fgThread, _, _ = getWindowThreadProcessId.Call(fg, 0)
+	}
+	curThread, _, _ := getCurrentThreadId.Call()
+
+	attached := false
+	if fgThread != 0 && fgThread != curThread {
+		ok, _, _ := attachThreadInput.Call(curThread, fgThread, 1)
+		attached = ok != 0
+	}
+	defer func() {
+		if attached {
+			attachThreadInput.Call(curThread, fgThread, 0)
+		}
+	}()
+
+	// 先恢复 + 顶到 Z 序最上
+	showWindow.Call(hwnd, uintptr(swRestore))
+	setWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0, uintptr(swpNoMove|swpNoSize|swpShowWindow))
+	setWindowPos.Call(hwnd, hwndNotopmost, 0, 0, 0, 0, uintptr(swpNoMove|swpNoSize|swpShowWindow))
+	bringWindowToTop.Call(hwnd)
+	setForegroundWindow.Call(hwnd)
+	setActiveWindow.Call(hwnd)
+
+	// 兜底：哪怕前台抢不到，任务栏也闪一下提醒
+	fi := flashwinfo{
+		Hwnd:    hwnd,
+		Flags:   flashwAll | flashwTimernofg,
+		Count:   3,
+		Timeout: 0,
+	}
+	fi.Size = uint32(unsafe.Sizeof(fi))
+	flashWindowEx.Call(uintptr(unsafe.Pointer(&fi)))
 }
 
 // openWizardWindow opens the given URL inside an embedded WebView2 window.
@@ -112,6 +197,20 @@ func openWizardWindow(url, title string, closeOnRequest *func()) (<-chan struct{
 		}
 
 		w.Navigate(url)
+
+		// Navigate 后立即把窗口拽到前台。在「安装完成→关旧窗→开新窗」这种
+		// 异步串联流程里，新进程往往拿不到前台焦点，AutoFocus 不够用；
+		// 不主动 SetForegroundWindow + 任务栏闪烁，用户根本注意不到新窗口已出现。
+		if hwnd != 0 {
+			localHwnd := hwnd
+			// 第一次：立刻试
+			go forceWindowToFront(localHwnd)
+			// 第二次：300ms 后再试一次（让 WebView2 完成首屏渲染，避免被它自己的初始化抢回去）
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				forceWindowToFront(localHwnd)
+			}()
+		}
 
 		if closeOnRequest != nil {
 			localW := w

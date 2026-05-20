@@ -21,27 +21,35 @@ import (
 
 const maxQueueSize = 10000
 
+// 后端 /api/collect 单批上限（见 backend/app/routers/collect.py: MAX_BATCH_SIZE=500）。
+// 客户端必须按此切片，否则失败的批次永远重试不掉。
+const maxBatchSize = 500
+
 // 上报重试次数（瞬时网络抖动、服务端短暂重启）
 const reportMaxAttempts = 4
 
 // UsageRecord is a single token usage event to be reported to the server.
 type UsageRecord struct {
-	ClientID         string  `json:"client_id"`
-	UserName         string  `json:"user_name"`
-	UserID           string  `json:"user_id"`
-	Department       string  `json:"department"`
-	RequestID        string  `json:"request_id,omitempty"`
-	SourceApp        string  `json:"source_app,omitempty"`
-	Vendor           string  `json:"vendor"`
-	Model            string  `json:"model"`
-	Endpoint         string  `json:"endpoint"`
+	ClientID            string  `json:"client_id"`
+	UserName            string  `json:"user_name"`
+	UserID              string  `json:"user_id"`
+	Department          string  `json:"department"`
+	RequestID           string  `json:"request_id,omitempty"`
+	SourceApp           string  `json:"source_app,omitempty"`
+	Vendor              string  `json:"vendor"`
+	Model               string  `json:"model"`
+	Endpoint            string  `json:"endpoint"`
 	PromptTokens        int     `json:"prompt_tokens"`
 	CompletionTokens    int     `json:"completion_tokens"`
 	TotalTokens         int     `json:"total_tokens"`
 	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
 	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
 	CostMultiplier      float64 `json:"cost_multiplier,omitempty"`
-	RequestTime      string  `json:"request_time"`
+	RequestTime         string  `json:"request_time"`
+	SourceKind          string  `json:"source_kind,omitempty"`
+	Accuracy            string  `json:"accuracy,omitempty"`
+	CorrelationKey      string  `json:"correlation_key,omitempty"`
+	MergeStatus         string  `json:"merge_status,omitempty"`
 	// Source 上报来源：client 为 JSON 解析；client-mitm-estimate 为 gRPC/二进制体积估算。
 	Source string `json:"source,omitempty"`
 }
@@ -272,7 +280,9 @@ func (r *Reporter) Add(record UsageRecord) {
 	if record.SourceApp == "" {
 		record.SourceApp = r.sourceApp
 	}
-	record.RequestTime = time.Now().Format(time.RFC3339)
+	if record.RequestTime == "" {
+		record.RequestTime = time.Now().Format(time.RFC3339)
+	}
 	if record.RequestID == "" {
 		record.RequestID = newRequestID()
 	}
@@ -417,29 +427,37 @@ func (r *Reporter) Flush() {
 	r.queue = nil
 	r.mu.Unlock()
 
-	data, err := json.Marshal(records)
-	if err != nil {
-		log.Printf("[上报] 序列化失败: %v", err)
-		r.requeue(records)
-		return
-	}
+	for start := 0; start < len(records); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(records) {
+			end = len(records)
+		}
+		chunk := records[start:end]
 
-	resp, err := r.postJSONRetry("/api/collect", data)
-	if err != nil {
-		log.Printf("[上报] 最终失败: %v (将重试)", err)
-		r.Stats.TotalFailed.Add(int64(len(records)))
-		r.requeue(records)
-		return
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			log.Printf("[上报] 序列化失败: %v", err)
+			r.requeue(records[start:])
+			return
+		}
 
-	r.Stats.TotalReported.Add(int64(len(records)))
-	for _, rec := range records {
-		r.Stats.TotalTokens.Add(int64(rec.TotalTokens))
+		resp, err := r.postJSONRetry("/api/collect", data)
+		if err != nil {
+			log.Printf("[上报] 最终失败: %v (将重试)", err)
+			r.Stats.TotalFailed.Add(int64(len(chunk)))
+			r.requeue(records[start:])
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		r.Stats.TotalReported.Add(int64(len(chunk)))
+		for _, rec := range chunk {
+			r.Stats.TotalTokens.Add(int64(rec.TotalTokens))
+		}
+		log.Printf("[上报] 成功 %d 条 → %s (累计: %d 条, %d tokens)",
+			len(chunk), r.cfg.ServerURL, r.Stats.TotalReported.Load(), r.Stats.TotalTokens.Load())
 	}
-	log.Printf("[上报] 成功 %d 条 → %s (累计: %d 条, %d tokens)",
-		len(records), r.cfg.ServerURL, r.Stats.TotalReported.Load(), r.Stats.TotalTokens.Load())
 }
 
 func (r *Reporter) requeue(records []UsageRecord) {

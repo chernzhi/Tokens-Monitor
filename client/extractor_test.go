@@ -259,3 +259,20 @@ func TestOpenAICachedTokensExposed(t *testing.T) {
 		t.Fatalf("PromptTokens=%d want 800 (cost-weighted)", u.PromptTokens)
 	}
 }
+
+// Qoder agent_chat_generation 的 SSE 把真正的 OpenAI 风格 payload 字符串化塞在 body 字段里。
+// extractor 需要解开这层包装，否则 token 永远抽不到。
+func TestQoderAgentChatGenerationSSE(t *testing.T) {
+	const sse = "data:{\"headers\":{\"Content-Type\":[\"application/json\"]},\"body\":\"{\\\"choices\\\":[{\\\"delta\\\":{\\\"content\\\":\\\"hi\\\",\\\"role\\\":\\\"assistant\\\"}}],\\\"model\\\":\\\"qwen3-coder\\\"}\"}\n" +
+		"data:{\"headers\":{\"Content-Type\":[\"application/json\"]},\"body\":\"{\\\"choices\\\":[{\\\"delta\\\":{}}],\\\"usage\\\":{\\\"prompt_tokens\\\":42,\\\"completion_tokens\\\":7,\\\"total_tokens\\\":49},\\\"model\\\":\\\"qwen3-coder\\\"}\"}\n"
+	u := ExtractUsage("qoder", []byte(sse))
+	if u == nil {
+		t.Fatal("nil usage")
+	}
+	if u.TotalTokens != 49 || u.PromptTokens != 42 || u.CompletionTokens != 7 {
+		t.Fatalf("got %+v", u)
+	}
+	if u.Model != "qwen3-coder" {
+		t.Fatalf("model=%q want qwen3-coder", u.Model)
+	}
+}

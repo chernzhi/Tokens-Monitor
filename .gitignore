@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# === IDE / 工具缓存 ===
+.qoder/
 .Python
 build/
 develop-eggs/

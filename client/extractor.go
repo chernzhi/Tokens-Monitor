@@ -424,6 +424,16 @@ func extractFromSSE(vendor string, data []byte) *UsageInfo {
 		if json.Unmarshal([]byte(payload), &m) != nil {
 			continue
 		}
+		// Qoder agent_chat_generation 把真正的 OpenAI 风格 payload 字符串化塞进 body 字段：
+		//   data:{"headers":{...},"body":"{\"choices\":[{\"delta\":...}],\"usage\":{...}}"}
+		// 解开一层，让后面的 usage/model 抽取走标准 OpenAI 分支。
+		if body, ok := m["body"].(string); ok && strings.HasPrefix(strings.TrimSpace(body), "{") {
+			var inner map[string]interface{}
+			if json.Unmarshal([]byte(body), &inner) == nil {
+				m = inner
+				payload = body
+			}
+		}
 		events = append(events, sseEvent{raw: payload, data: m})
 		if mm := deepFindModel(m); mm != "" {
 			modelHint = mm

@@ -28,6 +28,25 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
 ESTIMATE_SOURCE = "client-mitm-estimate"
+CURSOR_LOCAL_ESTIMATE_SOURCE_KIND = "local_estimate"
+CURSOR_SUPPRESSED_STATUS = "suppressed"
+CURSOR_UNMATCHED_STATUS = "unmatched"
+
+
+def _is_cursor_excluded_from_main_stats(
+    provider: str | None,
+    source: str | None,
+    source_kind: str | None,
+    merge_status: str | None,
+) -> bool:
+    if (provider or "").strip() != "cursor":
+        return False
+    if (source or "").strip() == ESTIMATE_SOURCE:
+        return True
+    return (
+        (source_kind or "").strip() == CURSOR_LOCAL_ESTIMATE_SOURCE_KIND
+        and (merge_status or "").strip() in {CURSOR_UNMATCHED_STATUS, CURSOR_SUPPRESSED_STATUS}
+    )
 
 
 def _request_count_expr():
@@ -65,6 +84,23 @@ def _apply_source_app_filter(stmt, source_app: str | None):
     if not normalized:
         return stmt
     return stmt.where(_source_app_key_expr() == normalized)
+
+
+def _cursor_main_stats_filter():
+    return ~(
+        (TokenUsageLog.provider == "cursor")
+        & (
+            (TokenUsageLog.source == ESTIMATE_SOURCE)
+            | (
+                (func.coalesce(TokenUsageLog.source_kind, "") == CURSOR_LOCAL_ESTIMATE_SOURCE_KIND)
+                & (func.coalesce(TokenUsageLog.merge_status, "").in_([CURSOR_UNMATCHED_STATUS, CURSOR_SUPPRESSED_STATUS]))
+            )
+        )
+    )
+
+
+def _apply_main_stats_filter(stmt):
+    return stmt.where(_cursor_main_stats_filter())
 
 
 def _ts_range(days: int, start_date: date | None = None, end_date: date | None = None):
@@ -129,7 +165,7 @@ async def get_overview(
         func.coalesce(func.sum(TokenUsageLog.cache_creation_tokens), 0),
         func.coalesce(func.sum(TokenUsageLog.input_tokens), 0),
         func.coalesce(func.sum(TokenUsageLog.output_tokens), 0),
-    ).where(TokenUsageLog.request_at.between(start_ts, end_ts))
+    ).where(TokenUsageLog.request_at.between(start_ts, end_ts), _cursor_main_stats_filter())
     if user_filter_ids is not None:
         current_base = current_base.where(TokenUsageLog.user_id.in_(user_filter_ids))
     current_stmt = _apply_source_app_filter(current_base, source_app)
@@ -145,7 +181,7 @@ async def get_overview(
     prev_base = select(
         func.coalesce(func.sum(TokenUsageLog.total_tokens), 0),
         func.coalesce(func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)), 0),
-    ).where(TokenUsageLog.request_at.between(prev_start_ts, start_ts - timedelta(seconds=1)))
+    ).where(TokenUsageLog.request_at.between(prev_start_ts, start_ts - timedelta(seconds=1)), _cursor_main_stats_filter())
     if user_filter_ids is not None:
         prev_base = prev_base.where(TokenUsageLog.user_id.in_(user_filter_ids))
     prev_stmt = _apply_source_app_filter(prev_base, source_app)
@@ -201,7 +237,7 @@ async def get_trend(
             func.coalesce(func.sum(TokenUsageLog.cache_read_tokens), 0),
             func.coalesce(func.sum(TokenUsageLog.cache_creation_tokens), 0),
         )
-        .where(TokenUsageLog.request_at.between(start_ts, end_ts))
+        .where(TokenUsageLog.request_at.between(start_ts, end_ts), _cursor_main_stats_filter())
         .group_by(dt)
         .order_by(dt),
         source_app,
@@ -242,6 +278,7 @@ async def get_by_user(
         .join(User, TokenUsageLog.user_id == User.id)
         .where(
             TokenUsageLog.request_at.between(start_ts, end_ts),
+            _cursor_main_stats_filter(),
             User.is_test == False,  # noqa: E712
             User.is_active == True,  # noqa: E712
         )
@@ -278,6 +315,7 @@ async def get_by_department(
         .join(Department, User.department_id == Department.id)
         .where(
             TokenUsageLog.request_at.between(start_ts, end_ts),
+            _cursor_main_stats_filter(),
             User.department_id.isnot(None),
             User.is_test == False,  # noqa: E712
             User.is_active == True,  # noqa: E712
@@ -308,7 +346,7 @@ async def get_by_model(
             func.sum(TokenUsageLog.total_tokens),
             func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)),
         )
-        .where(TokenUsageLog.request_at.between(start_ts, end_ts))
+        .where(TokenUsageLog.request_at.between(start_ts, end_ts), _cursor_main_stats_filter())
         .group_by(TokenUsageLog.model_name)
         .order_by(func.sum(TokenUsageLog.total_tokens).desc()),
         source_app,
@@ -343,7 +381,7 @@ async def get_by_provider(
             func.sum(TokenUsageLog.total_tokens),
             func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)),
         )
-        .where(TokenUsageLog.request_at.between(start_ts, end_ts))
+        .where(TokenUsageLog.request_at.between(start_ts, end_ts), _cursor_main_stats_filter())
         .group_by(canon_provider)
         .order_by(func.sum(TokenUsageLog.total_tokens).desc()),
         source_app,
@@ -377,7 +415,7 @@ async def get_by_source(
             func.sum(TokenUsageLog.total_tokens),
             func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)),
         )
-        .where(TokenUsageLog.request_at.between(start_ts, end_ts))
+        .where(TokenUsageLog.request_at.between(start_ts, end_ts), _cursor_main_stats_filter())
         .group_by(TokenUsageLog.source)
         .order_by(func.sum(TokenUsageLog.total_tokens).desc()),
         source_app,
@@ -413,7 +451,7 @@ async def get_by_source_app(
             func.sum(TokenUsageLog.total_tokens),
             func.sum(_billable_cost_expr(TokenUsageLog.cost_cny)),
         )
-        .where(TokenUsageLog.request_at.between(start_ts, end_ts))
+        .where(TokenUsageLog.request_at.between(start_ts, end_ts), _cursor_main_stats_filter())
         .group_by(source_app_key)
         .order_by(func.sum(TokenUsageLog.total_tokens).desc()),
         source_app,
@@ -450,6 +488,7 @@ async def get_by_endpoint(
         )
         .where(
             TokenUsageLog.request_at.between(start_ts, end_ts),
+            _cursor_main_stats_filter(),
             TokenUsageLog.endpoint.is_not(None),
             TokenUsageLog.endpoint != "",
         )
@@ -586,7 +625,7 @@ async def get_unpriced_models(
             func.sum(func.coalesce(TokenUsageLog.total_tokens, 0)).label("total_tokens"),
             func.count().label("requests"),
         )
-        .where(TokenUsageLog.request_at >= start)
+        .where(TokenUsageLog.request_at >= start, _cursor_main_stats_filter())
         .where(TokenUsageLog.source != ESTIMATE_SOURCE)
         .group_by(TokenUsageLog.model_name)
         .order_by(func.sum(func.coalesce(TokenUsageLog.total_tokens, 0)).desc())

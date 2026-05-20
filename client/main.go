@@ -95,6 +95,14 @@ func main() {
 	fmt.Println("  ╚══════════════════════════════════════════╝")
 	fmt.Println()
 
+	// 启动指纹：版本 + PID + 父进程 PID + 工作目录。用户排障时发回来的日志
+	// 头部就能看清「是哪个 exe 在哪个 cwd 下被谁拉起来的」，免去反复问。
+	if exe, eerr := os.Executable(); eerr == nil {
+		log.Printf("[boot] version=%s pid=%d ppid=%d exe=%s", Version, os.Getpid(), os.Getppid(), exe)
+	} else {
+		log.Printf("[boot] version=%s pid=%d ppid=%d", Version, os.Getpid(), os.Getppid())
+	}
+
 	dataDir := appDataDir()
 	os.MkdirAll(dataDir, 0755)
 
@@ -105,6 +113,7 @@ func main() {
 
 	certMgr, err := NewCertManager(dataDir)
 	if err != nil {
+		log.Printf("[EXIT] reason=cert-init-failed pid=%d err=%v", os.Getpid(), err)
 		log.Fatalf("  证书管理初始化失败: %v", err)
 	}
 
@@ -207,6 +216,8 @@ func main() {
 	// Singleton check: if a healthy instance already exists, don't start a second one.
 	existingPort, alive := checkExistingInstance()
 	if alive {
+		log.Printf("[EXIT] reason=singleton-existing-instance port=%d pid=%d defaultRunMode=%v",
+			existingPort, os.Getpid(), defaultRunMode)
 		fmt.Printf("  已有 ai-monitor 实例运行于端口 %d，当前进程退出。\n", existingPort)
 		// 第二次双击 exe 时把配置窗口拉起来，对准已运行实例的端口。
 		// 内嵌窗口不可用时会自动回退到系统浏览器。
@@ -225,6 +236,7 @@ func main() {
 
 	runtime, err := startMonitorRuntime(cfg, certMgr, "", *configPath)
 	if err != nil {
+		log.Printf("[EXIT] reason=monitor-runtime-start-failed pid=%d err=%v", os.Getpid(), err)
 		log.Fatalf("  %v", err)
 	}
 	if err := writeInstanceInfo(runtime.listenPort); err != nil {
@@ -322,6 +334,7 @@ func main() {
 	if err := runtime.server.Serve(runtime.listener); err != http.ErrServerClosed {
 		// 不使用 log.Fatalf：它会直接 os.Exit(1)，绕过 restoreSessionManagedProxyOnShutdown，
 		// 导致用户级 HTTP_PROXY / 系统代理仍指向已 dead 的端口，整机网络会坏。
+		log.Printf("[EXIT] reason=server-serve-returned pid=%d err=%v", os.Getpid(), err)
 		log.Printf("  服务器启动失败: %v", err)
 	}
 	restoreSessionManagedProxyOnShutdown()

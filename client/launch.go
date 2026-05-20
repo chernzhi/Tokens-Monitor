@@ -197,6 +197,11 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 	reporter.sourceApp = sourceApp
 	reporterCtx, reporterCancel := context.WithCancel(context.Background())
 	go reporter.Start(reporterCtx)
+	// 后台同步 Cursor 官方精确用量；失败/未登录会静默降级到 MITM 估算。
+	StartCursorOfficialSync(reporterCtx, reporter)
+	// 启动时打一次内存快照 + 每 10 分钟一次，便于回溯长跑后的内存涨幅。
+	logMemStatsSnapshot("start")
+	startMemStatsTicker()
 
 	ctxPing, cancelPing := context.WithTimeout(context.Background(), 6*time.Second)
 	go func() {
@@ -460,11 +465,10 @@ func launchChildWithExistingProxyDetached(cfg *Config, certMgr *CertManager, com
 	sourceApp := inferSourceApp(commandArgs, preset)
 	envVars := buildManagedLaunchEnv(cfg, certMgr, sourceApp, port, preset)
 	if runtime.GOOS == "windows" {
-		parts := append([]string{"/c", "start", ""}, commandArgs...)
-		// 用 newHiddenCmd 包裹，避免 ai-monitor 在 WebView2 / 无控制台父进程下
-		// 启动 cmd.exe 时弹出一个临时 conhost 黑窗，让用户误以为「启动了多个终端」。
-		// 真正的目标窗口（powershell / cmd / GUI 编辑器）由 `start` 正常打开，不受影响。
-		cmd := newHiddenCmd("cmd", parts...)
+		// 优先用 newDetachedCmd 直接 spawn 目标，避开 cmd /c start "" 包装。
+		// 少一层 cmd+conhost 能显著减少 Default Desktop 堆占用，
+		// 缓解长时间运行后偶发的 "Not enough memory resources" CreateProcess 失败。
+		cmd := newDetachedCmd(commandArgs[0], commandArgs[1:]...)
 		cmd.Env = mergeEnv(os.Environ(), envVars)
 		return cmd.Start()
 	}
@@ -711,9 +715,9 @@ func killAndRelaunchEditors(editors []runningElectronEditor, out io.Writer) {
 // 非 Windows 平台直接 exec.Command(path).Start()，对 GUI Editor 已经够用。
 func relaunchDetached(path string) error {
 	if runtime.GOOS == "windows" {
-		// start "" path  —— 第一个 "" 是 start 命令必需的窗口标题占位
-		// 用 newHiddenCmd 隐藏 cmd 包装器自身的 conhost 黑窗，避免「多出一个终端」。
-		return newHiddenCmd("cmd", "/c", "start", "", path).Start()
+		// 直接 spawn 目标 .exe，跳过 cmd /c start "" 包装。
+		// 见 newDetachedCmd 注释：少一层 cmd+conhost 可缓解桌面堆耗尽问题。
+		return newDetachedCmd(path).Start()
 	}
 	cmd := exec.Command(path)
 	return cmd.Start()

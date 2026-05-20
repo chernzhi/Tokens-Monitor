@@ -39,6 +39,11 @@ SOURCE_APP_ALIASES: dict[str, str] = {
     "goland": "jetbrains",
     "rider": "jetbrains",
     "windsurf": "windsurf",
+    "qoder": "qoder",
+    "qoder-ide": "qoder",
+    "qoder_ide": "qoder",
+    "aliyun-qoder": "qoder",
+    "aliyun_qoder": "qoder",
 }
 
 SOURCE_APP_LABELS: dict[str, str] = {
@@ -50,6 +55,7 @@ SOURCE_APP_LABELS: dict[str, str] = {
     "vscodium": "VS Codium",
     "trae": "Trae",
     "windsurf": "Windsurf",
+    "qoder": "Qoder",
     "jetbrains": "JetBrains AI",
     "claude": "Claude Code",
     "opencode": "OpenCode",
@@ -129,6 +135,7 @@ PROVIDER_ALIASES: dict[str, str] = {
 PROVIDER_LABELS: dict[str, str] = {
     "github-copilot": "GitHub Copilot",
     "cursor": "Cursor",
+    "qoder": "Qoder",
     "openai": "OpenAI",
     "anthropic": "Anthropic",
     "google": "Google",
@@ -159,7 +166,7 @@ def source_app_key_sql_case(source_app_col, source_col_for_gateway):
     for alias, canon in SOURCE_APP_ALIASES.items():
         buckets.setdefault(canon, []).append(alias)
     inner = lo
-    for canon in ("github-copilot", "cursor", "kiro", "jetbrains", "windsurf"):
+    for canon in ("github-copilot", "cursor", "kiro", "jetbrains", "windsurf", "qoder"):
         aliases = sorted(set(buckets.get(canon, [])))
         if aliases:
             inner = case((lo.in_(aliases), canon), else_=inner)
