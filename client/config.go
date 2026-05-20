@@ -98,6 +98,10 @@ type Config struct {
 	// 指向本程序端口的流量才会被监控。适合「想自己用 --launch / --global-install
 	// 完全掌控接管时机」的高级用户，或临时排障。
 	AutoInstallSessionPAC *bool `json:"auto_install_session_pac,omitempty"`
+	// 自动更新（空 / 0 视为默认：1 小时轮询、不自动安装）
+	UpdateCheckURL             string `json:"update_check_url,omitempty"`
+	UpdateCheckIntervalSeconds int    `json:"update_check_interval_seconds,omitempty"`
+	UpdateAutoApply            bool   `json:"update_auto_apply,omitempty"`
 }
 
 // EffectiveAutoInstallSessionPAC 默认 true（会话 PAC 模式）。
