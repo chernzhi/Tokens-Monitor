@@ -9,3 +9,6 @@ import "errors"
 func openWizardWindow(url, title string, closeOnRequest *func()) (<-chan struct{}, error) {
 	return nil, errors.New("embedded wizard window is only supported on Windows")
 }
+
+// closeActiveWizardWindow is a no-op on non-Windows platforms.
+func closeActiveWizardWindow() {}
