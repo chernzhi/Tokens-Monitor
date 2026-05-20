@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -72,8 +73,8 @@ func TestUpdaterCheckNow_HitsServerAndReturnsInfo(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", client: &http.Client{}, cfg: &Config{}}
-	info, err := u.CheckNow()
+	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", checkClient: &http.Client{}, downloadClient: &http.Client{}, cfg: &Config{}}
+	info, err := u.CheckNow(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,14 +88,18 @@ func TestUpdaterCheckNow_404TreatedAsNoRelease(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
-	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", client: &http.Client{}, cfg: &Config{}}
-	info, err := u.CheckNow()
+	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", checkClient: &http.Client{}, downloadClient: &http.Client{}, cfg: &Config{}}
+	info, err := u.CheckNow(context.Background())
 	if err != nil || info != nil {
 		t.Errorf("404 should return (nil,nil); got info=%v err=%v", info, err)
 	}
 }
 
 func TestUpdaterDownload_VerifiesSha256(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMP", tmp)
+	t.Setenv("TEMP", tmp)
+
 	payload := []byte("payload-bytes")
 	wantSum := sha256.Sum256(payload)
 	want := hex.EncodeToString(wantSum[:])
@@ -103,13 +108,12 @@ func TestUpdaterDownload_VerifiesSha256(t *testing.T) {
 		_, _ = w.Write(payload)
 	}))
 	defer srv.Close()
-	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", client: &http.Client{}, cfg: &Config{}}
+	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", checkClient: &http.Client{}, downloadClient: &http.Client{}, cfg: &Config{}}
 	info := &ReleaseInfo{DownloadURL: "/", SHA256: want, SizeBytes: int64(len(payload)), LatestVersion: "3.3.0-test"}
 	path, err := u.downloadToTemp(info)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(path)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("download file missing: %v", err)
 	}

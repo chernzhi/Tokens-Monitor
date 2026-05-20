@@ -26,6 +26,7 @@ const (
 	defaultCheckEvery  = 1 * time.Hour
 	firstCheckDelay    = 10 * time.Second
 	downloadTimeout    = 5 * time.Minute
+	updaterPlatform    = "win32-x64"
 )
 
 // ReleaseInfo 对应后端 /api/release/client/latest 响应。
@@ -41,11 +42,13 @@ type ReleaseInfo struct {
 	PublishedAt    string `json:"published_at"`
 }
 
+// Updater polls the release server and downloads new client binaries.
 type Updater struct {
 	cfg            *Config
 	serverURL      string
 	currentVersion string
-	client         *http.Client
+	checkClient    *http.Client
+	downloadClient *http.Client
 
 	mu             sync.RWMutex
 	latest         *ReleaseInfo
@@ -65,7 +68,8 @@ func NewUpdater(cfg *Config) *Updater {
 		cfg:            cfg,
 		serverURL:      srv,
 		currentVersion: Version,
-		client:         &http.Client{Timeout: 30 * time.Second},
+		checkClient:    &http.Client{Timeout: 30 * time.Second},
+		downloadClient: &http.Client{}, // 下载依赖 context 控时长，避免 30s 截流大文件
 	}
 }
 
@@ -81,7 +85,7 @@ func (u *Updater) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			if _, err := u.CheckNow(); err != nil {
+			if _, err := u.CheckNow(ctx); err != nil {
 				log.Printf("[updater] 检查失败: %v", err)
 			}
 			timer.Reset(interval)
@@ -89,26 +93,28 @@ func (u *Updater) Start(ctx context.Context) {
 	}
 }
 
-func (u *Updater) CheckNow() (*ReleaseInfo, error) {
+func (u *Updater) CheckNow(ctx context.Context) (*ReleaseInfo, error) {
 	if u.serverURL == "" {
 		return nil, errors.New("updater: 未配置上报服务地址")
 	}
 	q := url.Values{}
 	q.Set("current", u.currentVersion)
-	q.Set("platform", "win32-x64")
+	q.Set("platform", updaterPlatform)
 	endpoint := u.serverURL + "/api/release/client/latest?" + q.Encode()
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := u.client.Do(req)
+	resp, err := u.checkClient.Do(req)
 	if err != nil {
 		u.setError(err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		u.setLatest(nil)
+		u.mu.Lock()
+		u.lastError = ""
+		u.mu.Unlock()
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -153,6 +159,11 @@ func (u *Updater) downloadToTemp(info *ReleaseInfo) (string, error) {
 	if info == nil || info.DownloadURL == "" || info.SHA256 == "" {
 		return "", errors.New("updater: ReleaseInfo 缺 download_url 或 sha256")
 	}
+	if !u.downloading.CompareAndSwap(false, true) {
+		return "", errors.New("download already in progress")
+	}
+	defer u.downloading.Store(false)
+
 	tmpDir := filepath.Join(os.TempDir(), updaterTempDirName)
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return "", err
@@ -161,9 +172,7 @@ func (u *Updater) downloadToTemp(info *ReleaseInfo) (string, error) {
 	partPath := filepath.Join(tmpDir, finalName+".part")
 	finalPath := filepath.Join(tmpDir, finalName)
 
-	u.downloading.Store(true)
 	u.progressPct.Store(0)
-	defer u.downloading.Store(false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
 	defer cancel()
@@ -176,7 +185,7 @@ func (u *Updater) downloadToTemp(info *ReleaseInfo) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resp, err := u.client.Do(req)
+	resp, err := u.downloadClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -189,6 +198,12 @@ func (u *Updater) downloadToTemp(info *ReleaseInfo) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer f.Close()
+	removePart := func() {
+		if rerr := os.Remove(partPath); rerr != nil && !os.IsNotExist(rerr) {
+			log.Printf("[updater] 清理临时文件失败 %s: %v", partPath, rerr)
+		}
+	}
 	h := sha256.New()
 	var written int64
 	buf := make([]byte, 64*1024)
@@ -196,8 +211,7 @@ func (u *Updater) downloadToTemp(info *ReleaseInfo) (string, error) {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := f.Write(buf[:n]); werr != nil {
-				f.Close()
-				os.Remove(partPath)
+				removePart()
 				return "", werr
 			}
 			h.Write(buf[:n])
@@ -210,23 +224,30 @@ func (u *Updater) downloadToTemp(info *ReleaseInfo) (string, error) {
 			break
 		}
 		if rerr != nil {
-			f.Close()
-			os.Remove(partPath)
+			removePart()
 			return "", rerr
 		}
 	}
-	f.Close()
+	if err := f.Sync(); err != nil {
+		removePart()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		removePart()
+		return "", err
+	}
 
 	if info.SizeBytes > 0 && written != info.SizeBytes {
-		os.Remove(partPath)
+		removePart()
 		return "", fmt.Errorf("大小不符: got %d want %d", written, info.SizeBytes)
 	}
 	got := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(got, info.SHA256) {
-		os.Remove(partPath)
+		removePart()
 		return "", fmt.Errorf("sha256 不符: got %s want %s", got, info.SHA256)
 	}
 	if err := os.Rename(partPath, finalPath); err != nil {
+		removePart()
 		return "", err
 	}
 	u.progressPct.Store(100)
