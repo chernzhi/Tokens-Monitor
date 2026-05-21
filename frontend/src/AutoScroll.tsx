@@ -52,8 +52,8 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
     if (!shouldAnimate || paused) {
       cancelAnimationFrame(raf.current);
       lastTime.current = 0;
-      offset.current = 0;
-      if (inner) {
+      if (!shouldAnimate && inner) {
+        offset.current = 0;
         inner.style.transform = "translateY(0)";
       }
       return;

@@ -149,7 +149,7 @@ body {
 /* Stat cards */
 .stat-cards {
   display: grid;
-  grid-template-columns: repeat(8, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: clamp(4px, 0.5vw, 10px);
   margin-bottom: clamp(4px, 0.5vh, 10px);
   flex-shrink: 0;
@@ -419,7 +419,7 @@ body {
 }
 
 .rank-user-metrics {
-  width: clamp(118px, 9.5vw, 160px);
+  width: clamp(180px, 14vw, 240px);
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -428,8 +428,13 @@ body {
 }
 
 .rank-val-token,
+.rank-val-requests,
 .rank-val-cost {
   width: auto;
+}
+
+.rank-val-requests {
+  color: #b794f4;
 }
 
 .rank-val-cost {
@@ -438,7 +443,7 @@ body {
 
 @media (max-width: 1600px) {
   .stat-cards {
-    grid-template-columns: repeat(8, 1fr);
+    grid-template-columns: repeat(6, 1fr);
   }
 }
 

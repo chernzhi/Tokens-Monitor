@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useState, useEffect, useCallback } from "react";
-import { Alert, Button, Radio, Select, Space } from "antd";
+import { Alert, Button, Radio, Select, Space, Tooltip } from "antd";
 import {
   DashboardOutlined,
   ThunderboltOutlined,
@@ -7,7 +7,6 @@ import {
   TeamOutlined,
   ApiOutlined,
   RobotOutlined,
-  DesktopOutlined,
   DownloadOutlined,
 } from "@ant-design/icons";
 import { api, type Overview, type TrendData, type RankingItem, type BreakdownItem } from "./api";
@@ -130,14 +129,12 @@ function App() {
 
   // ── Stat Cards (with animated numbers) ──
   const statCards = [
-    { label: "总 Token 消耗", icon: <ThunderboltOutlined />, rawValue: overview.total_tokens, format: formatTokens, color: "yellow", sub: overview.tokens_change_pct != null ? `环比 ${overview.tokens_change_pct > 0 ? "+" : ""}${overview.tokens_change_pct}%` : "所有 AI 模型消耗的 Token 总数" },
-    { label: "总成本", icon: <DollarOutlined />, rawValue: overview.total_cost_cny, format: formatCNY, color: "green", sub: overview.cost_change_pct != null ? `环比 ${overview.cost_change_pct > 0 ? "+" : ""}${overview.cost_change_pct}%　已定价 ${pricedPct.toFixed(0)}%` : `环比 暂无　已定价 ${pricedPct.toFixed(0)}%` },
-    { label: "总请求数", icon: <ApiOutlined />, rawValue: overview.total_requests, format: formatNumber, color: "purple", sub: "API 调用总次数" },
-    { label: "精确 Token 占比", icon: <ThunderboltOutlined />, rawValue: exactTokenPct, format: (n: number) => `${n.toFixed(1)}%`, color: "orange", sub: `精确 ${formatTokens(overview.exact_tokens)} / 估算 ${formatTokens(overview.estimated_tokens)}` },
-    { label: "活跃用户", icon: <TeamOutlined />, rawValue: overview.active_users, format: (n: number) => Math.round(n).toString(), color: "cyan", sub: "本月有 AI 调用的用户数" },
-    { label: "在线客户端", icon: <DesktopOutlined />, rawValue: onlineClients, format: (n: number) => Math.round(n).toString(), color: "blue", sub: "当前在线的监控客户端" },
-    { label: "估算请求数", icon: <ApiOutlined />, rawValue: overview.estimated_requests, format: formatNumber, color: "purple", sub: `占全部请求 ${estimatedRequestPct.toFixed(1)}%` },
-    { label: "人均 Token", icon: <RobotOutlined />, rawValue: overview.avg_tokens_per_user, format: formatTokens, color: "pink", sub: `人均成本 ${formatCNY(overview.avg_cost_per_user)}` },
+    { label: "总 Token 消耗", icon: <ThunderboltOutlined />, rawValue: overview.total_tokens, format: formatTokens, color: "yellow", sub: overview.tokens_change_pct != null ? `环比 ${overview.tokens_change_pct > 0 ? "+" : ""}${overview.tokens_change_pct}%` : "所有 AI 模型消耗的 Token 总数", hint: `当前区间所有 AI 模型消耗 Token 总数。环比基准：上一同长度区间（共 ${trendDays} 天）。精确 ${formatTokens(overview.exact_tokens)} / 估算 ${formatTokens(overview.estimated_tokens)}` },
+    { label: "总成本", icon: <DollarOutlined />, rawValue: overview.total_cost_cny, format: formatCNY, color: "green", sub: overview.cost_change_pct != null ? `环比 ${overview.cost_change_pct > 0 ? "+" : ""}${overview.cost_change_pct}%　已定价 ${pricedPct.toFixed(0)}%` : `环比 暂无　已定价 ${pricedPct.toFixed(0)}%`, hint: `按各供应商定价表估算的人民币成本。已定价 ${formatTokens(overview.priced_tokens)}（${pricedPct.toFixed(1)}%），未定价 ${formatTokens(overview.unpriced_tokens)}。环比基准：上一同长度区间。` },
+    { label: "总请求数", icon: <ApiOutlined />, rawValue: overview.total_requests, format: formatNumber, color: "purple", sub: `估算 ${estimatedRequestPct.toFixed(0)}%　精确 ${(100 - estimatedRequestPct).toFixed(0)}%`, hint: `API 调用总次数 ${formatNumber(overview.total_requests)}。其中精确 token 计数 ${formatNumber(overview.exact_requests)}，估算 ${formatNumber(overview.estimated_requests)}（无 usage 字段，按 token 数倒推）。` },
+    { label: "Token 精确占比", icon: <ThunderboltOutlined />, rawValue: exactTokenPct, format: (n: number) => `${n.toFixed(1)}%`, color: "orange", sub: `精确 ${formatTokens(overview.exact_tokens)} / 估算 ${formatTokens(overview.estimated_tokens)}`, hint: "上游返回了 usage 的 token 视为精确，其余按响应字符估算。占比越高数据越可靠。" },
+    { label: "活跃用户", icon: <TeamOutlined />, rawValue: overview.active_users, format: (n: number) => Math.round(n).toString(), color: "cyan", sub: `在线客户端 ${onlineClients}`, hint: `活跃用户：当前区间有 AI 调用记录的去重用户数。在线客户端：心跳 5 分钟内的监控客户端数（独立口径，含同一用户多设备）。` },
+    { label: "人均 Token", icon: <RobotOutlined />, rawValue: overview.avg_tokens_per_user, format: formatTokens, color: "pink", sub: `人均成本 ${formatCNY(overview.avg_cost_per_user)}`, hint: "总 Token / 活跃用户。可用于识别异常用户：排行榜中远高于人均的需关注。" },
   ];
 
   // ── Trend Chart ──
@@ -228,11 +225,11 @@ function App() {
   const modelPieOption = {
     backgroundColor: "transparent",
     tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
-    legend: { orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 18 ? name.slice(0, 18) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8 },
+    legend: { type: "scroll" as const, orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 14 ? name.slice(0, 14) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
     series: [{
       type: "pie",
-      radius: ["35%", "65%"],
-      center: ["50%", "42%"],
+      radius: ["38%", "70%"],
+      center: ["50%", "40%"],
       data: modelBreakdown.map((m, i) => ({
         name: m.name, value: m.total_tokens,
         itemStyle: { color: BAR_COLORS[i % BAR_COLORS.length] },
@@ -246,11 +243,11 @@ function App() {
   const providerPieOption = {
     backgroundColor: "transparent",
     tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
-    legend: { orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, itemWidth: 10, itemHeight: 10, itemGap: 8 },
+    legend: { type: "scroll" as const, orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 14 ? name.slice(0, 14) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
     series: [{
       type: "pie",
-      radius: ["35%", "65%"],
-      center: ["50%", "42%"],
+      radius: ["38%", "70%"],
+      center: ["50%", "40%"],
       data: providerBreakdown.map((m, i) => ({
         name: m.name, value: m.total_tokens,
         itemStyle: { color: BAR_COLORS[i % BAR_COLORS.length] },
@@ -279,6 +276,7 @@ function App() {
             className="dashboard-select"
           />
           <Radio.Group className="dashboard-radio-group" value={trendDays} onChange={(e) => setTrendDays(e.target.value)} buttonStyle="solid" size="small">
+            <Radio.Button value={1}>今日</Radio.Button>
             <Radio.Button value={7}>近7天</Radio.Button>
             <Radio.Button value={15}>近15天</Radio.Button>
             <Radio.Button value={30}>近30天</Radio.Button>
@@ -317,13 +315,15 @@ function App() {
       {/* Stat Cards */}
       <div className="stat-cards">
         {statCards.map((card) => (
-          <div className="stat-card" key={card.label}>
-            <div className="label">{card.icon} {card.label}</div>
-            <div className={`value color-${card.color}`}>
-              <AnimatedNumber value={card.rawValue} format={card.format} />
+          <Tooltip key={card.label} title={card.hint} placement="bottom" mouseEnterDelay={0.3}>
+            <div className="stat-card">
+              <div className="label">{card.icon} {card.label}</div>
+              <div className={`value color-${card.color}`}>
+                <AnimatedNumber value={card.rawValue} format={card.format} />
+              </div>
+              <div className="sub">{card.sub}</div>
             </div>
-            <div className="sub">{card.sub}</div>
-          </div>
+          </Tooltip>
         ))}
       </div>
 
@@ -373,12 +373,13 @@ function App() {
                 {userRanking.map((u, i) => (
                   <div className="rank-row" key={u.id}>
                     <span className="rank-idx" style={{ color: i < 3 ? COLORS.yellow : "#8b949e" }}>{i + 1}</span>
-                    <span className="rank-name rank-name-user" title={u.employee_id ? `${u.name}(${u.employee_id})` : u.name}>{u.name}{u.employee_id ? `(${u.employee_id})` : ""}</span>
+                    <span className="rank-name rank-name-user" title={u.name}>{u.name}</span>
                     <div className="rank-bar-bg">
                       <div className="rank-bar" style={{ width: `${(u.total_tokens / maxUserTokens) * 100}%`, background: BAR_COLORS[i % BAR_COLORS.length] }} />
                     </div>
                     <span className="rank-user-metrics">
                       <span className="rank-val rank-val-token">{formatTokens(u.total_tokens)}</span>
+                      <span className="rank-val rank-val-requests">{formatNumber(u.requests)} 次</span>
                       <span className="rank-val rank-val-cost">{formatCNY(u.cost_cny)}</span>
                     </span>
                   </div>
