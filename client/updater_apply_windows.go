@@ -100,7 +100,10 @@ func (u *Updater) ApplyUpdate(info *ReleaseInfo) error {
 	}
 
 	myPID := fmt.Sprintf("%d", os.Getpid())
-	cmd := newDetachedCmd("cmd", "/c", batPath,
+	// 直接传 batPath 让 newDetachedCmd 走 .bat 分支（CREATE_NO_WINDOW + start /b），
+	// 避免 DETACHED_PROCESS 组合下 cmd 的子进程（ping/tasklist/taskkill）被强行
+	// 分配新控制台导致黑窗持续闪烁。
+	cmd := newDetachedCmd(batPath,
 		currentExe, newExe, backupPath, logPath, myPID)
 	if err := cmd.Start(); err != nil {
 		return err
