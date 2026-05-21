@@ -44,6 +44,35 @@ SOURCE_APP_ALIASES: dict[str, str] = {
     "qoder_ide": "qoder",
     "aliyun-qoder": "qoder",
     "aliyun_qoder": "qoder",
+    # claude-code 客户端常以 "claude-code" / "Claude Code" 双形态上报，归入 claude
+    "claude": "claude",
+    "claude-code": "claude",
+    "claudecode": "claude",
+    "anthropic-claude-code": "claude",
+    # 其余在 SOURCE_APP_LABELS 中显式有 label 的标准键，加入便于 SQL 归一覆盖
+    "codex": "codex",
+    "codex-cli": "codex",
+    "opencode": "opencode",
+    "openclaw": "openclaw",
+    "gemini": "gemini",
+    "gemini-cli": "gemini",
+    "amp": "amp",
+    "droid": "droid",
+    "hermes": "hermes",
+    "pi": "pi",
+    "kimi": "kimi",
+    "qwen": "qwen",
+    "roocode": "roocode",
+    "kilocode": "kilocode",
+    "kilo": "kilo",
+    "mux": "mux",
+    "crush": "crush",
+    "synthetic": "synthetic",
+    "powershell": "powershell",
+    "cmd": "cmd",
+    "vscode": "vscode",
+    "vs-code": "vscode",
+    "vscode-insiders": "vscode-insiders",
 }
 
 SOURCE_APP_LABELS: dict[str, str] = {
@@ -105,7 +134,7 @@ def canonical_source_app_key(raw: str | None) -> str | None:
     s = (raw or "").strip()
     if not s:
         return None
-    key = s.lower().replace("_", "-")
+    key = s.lower().replace("_", "-").replace(" ", "-")
     if key in SOURCE_APP_ALIASES:
         return SOURCE_APP_ALIASES[key]
     low = s.lower()
@@ -159,17 +188,23 @@ def provider_display_name(provider_key: str | None) -> str:
 
 
 def source_app_key_sql_case(source_app_col, source_col_for_gateway):
-    """大屏按应用聚合：与 canonical_source_app_key 一致。"""
+    """大屏按应用聚合：与 canonical_source_app_key 一致。
+
+    归一化步骤：trim → lower → 把空格/下划线统一替换为 `-` → 命中别名映射。
+    确保 "Claude Code" / "claude_code" / "claude-code" 都映射到同一个 canonical key。
+    """
     t = func.trim(source_app_col)
-    lo = func.lower(t)
+    # 把空格和下划线统一成连字符，避免 "Claude Code" vs "claude-code" 拆成两条
+    normalized = func.replace(func.replace(func.lower(t), " ", "-"), "_", "-")
     buckets: dict[str, list[str]] = {}
     for alias, canon in SOURCE_APP_ALIASES.items():
-        buckets.setdefault(canon, []).append(alias)
-    inner = lo
-    for canon in ("github-copilot", "cursor", "kiro", "jetbrains", "windsurf", "qoder"):
+        buckets.setdefault(canon, []).append(alias.lower().replace("_", "-").replace(" ", "-"))
+    inner = normalized
+    # 覆盖全部 canonical，而不仅前 6 个
+    for canon in sorted(set(SOURCE_APP_ALIASES.values())):
         aliases = sorted(set(buckets.get(canon, [])))
         if aliases:
-            inner = case((lo.in_(aliases), canon), else_=inner)
+            inner = case((normalized.in_(aliases), canon), else_=inner)
     return case(
         (
             (source_app_col.is_(None)) | (t == ""),
