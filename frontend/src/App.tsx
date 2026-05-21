@@ -195,67 +195,138 @@ function App() {
   const costTrendOption = {
     backgroundColor: "transparent",
     tooltip: { trigger: "axis" as const, formatter: (params: any) => {
-      const p = params[0];
-      return `${p.axisValue}<br/>${p.marker} 成本: ${formatCNY(p.value)}`;
+      const cost = params.find((p: any) => p.seriesName === "成本");
+      const req = params.find((p: any) => p.seriesName === "请求数");
+      const lines = [params[0].axisValue];
+      if (cost) lines.push(`${cost.marker} 成本: ${formatCNY(cost.value)}`);
+      if (req) lines.push(`${req.marker} 请求数: ${formatNumber(req.value)}`);
+      return lines.join("<br/>");
     }},
-    grid: { left: 70, right: 20, bottom: 30, top: 20 },
+    legend: { data: ["成本", "请求数"], top: 0, right: 10, textStyle: { color: "#8b949e", fontSize: 11 }, itemWidth: 12, itemHeight: 8 },
+    grid: { left: 60, right: 60, bottom: 24, top: 40 },
     xAxis: {
       type: "category" as const,
       data: trend.points.map((p) => p.date.slice(5)),
       axisLabel: { color: "#8b949e" },
       axisLine: { lineStyle: { color: "#30363d" } },
     },
-    yAxis: {
-      type: "value" as const,
-      min: 0,
-      axisLabel: { color: "#8b949e", formatter: (v: number) => formatCNY(v) },
-      splitLine: { lineStyle: { color: "#21262d" } },
-    },
-    series: [{
-      type: "line" as const,
-      data: trend.points.map((p) => p.cost_cny),
-      smooth: true,
-      areaStyle: { color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: "rgba(88,166,255,0.3)" }, { offset: 1, color: "rgba(88,166,255,0)" }] } },
-      lineStyle: { color: COLORS.blue, width: 2 },
-      itemStyle: { color: COLORS.blue },
-    }],
+    yAxis: [
+      {
+        type: "value" as const,
+        name: "成本",
+        nameTextStyle: { color: "#8b949e", fontSize: 10 },
+        min: 0,
+        axisLabel: { color: "#8b949e", formatter: (v: number) => formatCNY(v) },
+        splitLine: { lineStyle: { color: "#21262d" } },
+      },
+      {
+        type: "value" as const,
+        name: "请求数",
+        nameTextStyle: { color: "#8b949e", fontSize: 10 },
+        min: 0,
+        position: "right" as const,
+        axisLabel: { color: "#8b949e", formatter: (v: number) => formatNumber(v) },
+        splitLine: { show: false },
+      },
+    ],
+    series: [
+      {
+        name: "成本",
+        type: "line" as const,
+        data: trend.points.map((p) => p.cost_cny),
+        smooth: true,
+        yAxisIndex: 0,
+        areaStyle: { color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: "rgba(88,166,255,0.3)" }, { offset: 1, color: "rgba(88,166,255,0)" }] } },
+        lineStyle: { color: COLORS.blue, width: 2 },
+        itemStyle: { color: COLORS.blue },
+      },
+      {
+        name: "请求数",
+        type: "line" as const,
+        data: trend.points.map((p) => p.requests),
+        smooth: true,
+        yAxisIndex: 1,
+        symbol: "circle",
+        symbolSize: 6,
+        lineStyle: { color: COLORS.purple, width: 2, type: "dashed" as const },
+        itemStyle: { color: COLORS.purple },
+      },
+    ],
   };
 
-  // ── Model Pie ──
-  const modelPieOption = {
-    backgroundColor: "transparent",
-    tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
-    legend: { type: "scroll" as const, orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 14 ? name.slice(0, 14) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
-    series: [{
-      type: "pie",
-      radius: ["38%", "70%"],
-      center: ["50%", "40%"],
-      data: modelBreakdown.map((m, i) => ({
-        name: m.name, value: m.total_tokens,
-        itemStyle: { color: BAR_COLORS[i % BAR_COLORS.length] },
-      })),
-      label: { show: false },
-      emphasis: { itemStyle: { shadowBlur: 10, shadowColor: "rgba(0,0,0,0.5)" } },
-    }],
+  // ── Pie helpers ──
+  const TOP_N_PIE = 5;
+  const buildPieSeries = (items: { name: string; total_tokens: number }[]) => {
+    const sorted = [...items].sort((a, b) => b.total_tokens - a.total_tokens);
+    const topNames = new Set(sorted.slice(0, TOP_N_PIE).map((x) => x.name));
+    const total = items.reduce((s, x) => s + x.total_tokens, 0) || 1;
+    return items.map((m, i) => {
+      const isTop = topNames.has(m.name);
+      const pct = (m.total_tokens / total) * 100;
+      const shortName = m.name.length > 22 ? m.name.slice(0, 22) + "…" : m.name;
+      return {
+        name: m.name,
+        value: m.total_tokens,
+        itemStyle: {
+          color: BAR_COLORS[i % BAR_COLORS.length],
+          borderColor: "#161b22",
+          borderWidth: 2,
+        },
+        label: isTop
+          ? {
+              show: true,
+              position: "outside" as const,
+              color: "#e6edf3",
+              fontSize: 12,
+              fontWeight: 600 as const,
+              lineHeight: 16,
+              formatter: `{n|${shortName}}\n{p|${pct.toFixed(1)}%}`,
+              rich: {
+                n: { color: "#e6edf3", fontSize: 12, fontWeight: 600, lineHeight: 16 },
+                p: { color: "#8b949e", fontSize: 11, lineHeight: 14 },
+              },
+            }
+          : { show: false },
+        labelLine: isTop
+          ? { show: true, length: 10, length2: 8, smooth: true, lineStyle: { color: "#30363d", width: 1 } }
+          : { show: false },
+      };
+    });
   };
 
-  // ── Provider Pie ──
-  const providerPieOption = {
-    backgroundColor: "transparent",
-    tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
-    legend: { type: "scroll" as const, orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 14 ? name.slice(0, 14) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
-    series: [{
-      type: "pie",
-      radius: ["38%", "70%"],
-      center: ["50%", "40%"],
-      data: providerBreakdown.map((m, i) => ({
-        name: m.name, value: m.total_tokens,
-        itemStyle: { color: BAR_COLORS[i % BAR_COLORS.length] },
-      })),
-      label: { show: false },
-      emphasis: { itemStyle: { shadowBlur: 10, shadowColor: "rgba(0,0,0,0.5)" } },
-    }],
+  const makePieOption = (items: { name: string; total_tokens: number }[], style: "donut" | "rose" = "donut") => {
+    const total = items.reduce((s, x) => s + x.total_tokens, 0);
+    const isRose = style === "rose";
+    return {
+      backgroundColor: "transparent",
+      tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
+      legend: { type: "scroll" as const, orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 14 ? name.slice(0, 14) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
+      ...(isRose ? {} : {
+        graphic: {
+          type: "group" as const,
+          left: "center",
+          top: "36%",
+          children: [
+            { type: "text" as const, style: { text: formatNumber(total), fill: "#e6edf3", fontSize: 18, fontWeight: 700, textAlign: "center" as const, textVerticalAlign: "middle" as const } },
+            { type: "text" as const, top: 24, style: { text: "总计", fill: "#8b949e", fontSize: 11, textAlign: "center" as const, textVerticalAlign: "middle" as const } },
+          ],
+        },
+      }),
+      series: [{
+        type: "pie",
+        radius: isRose ? ["14%", "50%"] : ["28%", "58%"],
+        center: ["50%", "44%"],
+        roseType: isRose ? ("radius" as const) : (false as const),
+        avoidLabelOverlap: true,
+        minShowLabelAngle: 2,
+        data: buildPieSeries(items),
+        emphasis: { scale: true, scaleSize: 4, label: { show: true } },
+      }],
+    };
   };
+
+  const modelPieOption = makePieOption(modelBreakdown, "donut");
+  const providerPieOption = makePieOption(providerBreakdown, "rose");
 
   // ── Ranking list helper ──
   const maxUserTokens = userRanking.length > 0 ? userRanking[0].total_tokens : 1;
@@ -288,17 +359,12 @@ function App() {
           <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" icon={<DownloadOutlined />} href="/api/extension/installer" target="_blank">
             安装包
           </Button>
-          <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" type="primary" ghost onClick={() => void fetchAll(false)} loading={isRefreshing && !isLoading}>
-            刷新
-          </Button>
+          <Tooltip title={isLoading ? "首次加载中" : isRefreshing ? "刷新中" : `上次更新 ${lastUpdatedAt}`}>
+            <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" type="primary" ghost onClick={() => void fetchAll(false)} loading={isRefreshing && !isLoading}>
+              刷新 {lastUpdatedAt && !isLoading ? <span style={{ opacity: 0.7, fontWeight: 400, marginLeft: 4 }}>· {lastUpdatedAt}</span> : null}
+            </Button>
+          </Tooltip>
         </Space>
-      </div>
-
-      <div className="dashboard-filter-note">
-        当前视图：{currentSourceAppLabel}
-        <span className={`dashboard-status dashboard-status-inline${isRefreshing ? " is-refreshing" : ""}`}>
-          {isLoading ? "首次加载中" : isRefreshing ? "刷新中" : `已更新 ${lastUpdatedAt}`}
-        </span>
       </div>
 
       {loadError ? (
