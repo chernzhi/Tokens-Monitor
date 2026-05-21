@@ -29,6 +29,8 @@ import os
 import sys
 import time
 import argparse
+import hashlib
+import subprocess
 from pathlib import Path
 
 # Add project root to path
@@ -364,6 +366,94 @@ SYNC_INTERVAL_MINUTES=10
 
         print("  ✓ 分发物上传完成")
 
+    def publish_client_update(self):
+        """发布客户端自更新包：上传 ai-monitor-X.Y.Z.exe + .sha256 + .md
+        到 extensions/client/，供 /api/release/client/latest 扫描。
+        """
+        print("\n=== Publish client auto-update ===")
+        version_file = project_root / "client" / "VERSION"
+        if not version_file.is_file():
+            raise RuntimeError("client/VERSION 不存在，请先创建")
+        version = version_file.read_text(encoding="utf-8").strip()
+        if not version:
+            raise RuntimeError("client/VERSION 为空")
+
+        exe = project_root / "client" / "dist" / "ai-monitor.exe"
+        if not exe.is_file():
+            exe = project_root / "client" / "ai-monitor.exe"
+        if not exe.is_file():
+            raise RuntimeError(
+                "未找到 ai-monitor.exe，请先运行 client\\build.ps1 -Platform win"
+            )
+
+        sha = hashlib.sha256()
+        with open(exe, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                sha.update(chunk)
+        digest = sha.hexdigest()
+        size = exe.stat().st_size
+        print(f"  version: v{version}")
+        print(f"  size   : {size:,} bytes")
+        print(f"  sha256 : {digest}")
+
+        notes_file = project_root / "client" / "dist" / f"ai-monitor-{version}.md"
+        if not notes_file.is_file():
+            notes_file = project_root / "client" / f"RELEASE-{version}.md"
+        notes_text = ""
+        if notes_file.is_file():
+            notes_text = notes_file.read_text(encoding="utf-8")
+        else:
+            try:
+                log = subprocess.check_output(
+                    ["git", "log", "-n", "20", "--pretty=format:- %s"],
+                    cwd=str(project_root),
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                notes_text = f"# v{version}\n\n最近变更：\n{log}\n"
+            except Exception:
+                notes_text = f"# v{version}\n"
+
+        client_remote = f"{self.REMOTE_DIR}/extensions/client"
+        self.run(f"mkdir -p {client_remote}", print_output=False)
+
+        remote_exe = f"{client_remote}/ai-monitor-{version}.exe"
+        remote_sha = f"{remote_exe}.sha256"
+        remote_md = f"{client_remote}/ai-monitor-{version}.md"
+
+        self.sftp.put(str(exe), remote_exe)
+        print(f"    ↑ extensions/client/ai-monitor-{version}.exe")
+
+        # sha256 + md 直接通过 SSH 写入，避免本地落一堆临时文件
+        self.run(
+            f"printf '%s' {digest} > {remote_sha}",
+            print_output=False,
+        )
+        print(f"    ↑ extensions/client/ai-monitor-{version}.exe.sha256")
+
+        md_b64 = __import__("base64").b64encode(
+            notes_text.encode("utf-8")
+        ).decode("ascii")
+        self.run(
+            f"echo {md_b64} | base64 -d > {remote_md}",
+            print_output=False,
+        )
+        print(f"    ↑ extensions/client/ai-monitor-{version}.md")
+
+        # 自检：列目录确认 3 个文件齐全
+        out, _, _ = self.run(
+            f"ls -lh {client_remote}/ai-monitor-{version}*",
+            print_output=False,
+        )
+        for line in out.strip().splitlines():
+            print(f"    {line}")
+
+        # 调用一次 /latest 端点验证后端能识别（不强依赖端口可达）
+        check_url = f"http://{self.host}:8000/api/release/client/latest?current=0.0.0&platform=win32-x64"
+        print(f"\n  验证端点（如后端在 docker 内未直接暴露，可忽略）:")
+        print(f"  curl '{check_url}'")
+        print(f"\n  ✓ v{version} 已发布到自更新通道")
+
     def close(self):
         """Close connections."""
         if self.sftp:
@@ -413,10 +503,10 @@ def main():
     parser = argparse.ArgumentParser(description="AI Token Monitor Deployment")
     parser.add_argument(
         "action",
-        choices=["all", "check", "upload", "build", "start", "status", "logs", "stop", "migrate", "artifacts"],
+        choices=["all", "check", "upload", "build", "start", "status", "logs", "stop", "migrate", "artifacts", "publish-update"],
         default="all",
         nargs="?",
-        help="Action: artifacts = 仅上传 VSIX + ai-monitor.exe 到 extensions（需已本地构建）",
+        help="Action: artifacts = 仅上传 VSIX + ai-monitor.exe；publish-update = 发布客户端自更新包到 extensions/client/",
     )
     parser.add_argument("--host", help="Server host (or SSH_HOST env)")
     parser.add_argument("--user", help="SSH user (or SSH_USER env)")
@@ -457,6 +547,8 @@ def main():
             deployer.run_migration()
         elif args.action == "artifacts":
             deployer.upload_artifacts()
+        elif args.action == "publish-update":
+            deployer.publish_client_update()
         
         deployer.close()
         return 0

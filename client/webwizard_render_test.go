@@ -82,3 +82,20 @@ func TestWizardTemplateRendersForRuntime(t *testing.T) {
 	}
 	t.Logf("runtime: rendered %d bytes successfully", len(out))
 }
+
+func TestWebWizardHTML_HasAboutCard(t *testing.T) {
+	if !strings.Contains(webWizardHTML, `id="updateBtn"`) {
+		t.Fatal("update button missing from webWizardHTML header")
+	}
+	if !strings.Contains(webWizardHTML, "/api/wizard/update/status") {
+		t.Fatal("update status endpoint missing from JS")
+	}
+}
+
+func TestWebWizardHTML_HasReconnectPolling(t *testing.T) {
+	for _, s := range []string{"/api/wizard/instance", "startReconnectPolling"} {
+		if !strings.Contains(webWizardHTML, s) {
+			t.Errorf("template missing %q", s)
+		}
+	}
+}

@@ -38,8 +38,14 @@ const webWizardHTML = `<!DOCTYPE html>
   *::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, #64748b 0%, #475569 100%); background-clip: padding-box; border: 2px solid rgba(30,41,59,0); }
   *::-webkit-scrollbar-corner { background: transparent; }
   * { scrollbar-width: thin; scrollbar-color: #475569 rgba(15,23,42,0.4); }
-  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 16px; display: flex; align-items: stretch; justify-content: center; gap: 16px; }
-  .card { background: #1e293b; border-radius: 16px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); padding: 40px; width: 860px; max-width: 96vw; flex: 0 0 auto; overflow-y: auto; max-height: calc(100vh - 32px); }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 16px; display: flex; align-items: stretch; justify-content: stretch; gap: 0; --card-pct: 55%; }
+  .card { background: #1e293b; border-radius: 16px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); padding: 40px; flex: 0 0 var(--card-pct); min-width: 420px; max-width: calc(100% - 360px); overflow-y: auto; max-height: calc(100vh - 32px); }
+  .splitter { flex: 0 0 8px; cursor: col-resize; background: transparent; position: relative; user-select: none; }
+  .splitter::before { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 2px; height: 40px; background: #334155; border-radius: 2px; transition: background 0.15s; }
+  .splitter:hover::before, .splitter.dragging::before { background: #38bdf8; height: 60px; }
+  body.dragging { cursor: col-resize; }
+  body.dragging * { user-select: none !important; pointer-events: none; }
+  body.dragging .splitter { pointer-events: auto; }
   h1 { font-size: 24px; text-align: center; margin-bottom: 8px; color: #38bdf8; }
   .subtitle { text-align: center; color: #94a3b8; margin-bottom: 28px; font-size: 14px; }
   .field { margin-bottom: 18px; }
@@ -87,13 +93,13 @@ const webWizardHTML = `<!DOCTYPE html>
   .step-dot.active { background: #38bdf8; }
   .panel { border: 1px solid #334155; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
   .panel-title { font-size: 13px; color: #94a3b8; margin-bottom: 10px; }
-  .btn-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-  .btn-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .btn-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .btn-grid-3 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
   .btn-small { margin-top: 0; padding: 10px; font-size: 13px; }
   .btn-small.active { border: 1px solid #38bdf8; box-shadow: 0 0 0 1px #38bdf8 inset; }
   .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; color: #cbd5e1; }
   .status-bar { background: #0b1220; border: 1px solid #243244; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; line-height: 1.7; }
-  .log-panel { border: 1px solid #334155; border-radius: 16px; background: #1e293b; box-shadow: 0 25px 50px rgba(0,0,0,0.5); flex: 1 1 auto; min-width: 360px; max-width: 100%; display: flex; flex-direction: column; max-height: calc(100vh - 32px); overflow: hidden; }
+  .log-panel { border: 1px solid #334155; border-radius: 16px; background: #1e293b; box-shadow: 0 25px 50px rgba(0,0,0,0.5); flex: 1 1 auto; min-width: 320px; display: flex; flex-direction: column; max-height: calc(100vh - 32px); overflow: hidden; }
   .log-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid #334155; flex: 0 0 auto; }
   .log-head .lbl { font-size: 14px; color: #e2e8f0; font-weight: 600; }
   .log-head .lbl .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #475569; margin-right: 6px; vertical-align: middle; transition: background 0.2s; }
@@ -149,25 +155,35 @@ const webWizardHTML = `<!DOCTYPE html>
   .launch-section { margin-bottom: 14px; }
   .launch-section:last-of-type { margin-bottom: 0; }
   .launch-section-title { font-size: 12px; color: #64748b; margin-bottom: 8px; padding-left: 2px; letter-spacing: 0.5px; }
-  .launch-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .launch-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
   .launch-btn { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #0b1220; border: 1px solid #243244; border-radius: 10px; color: #e2e8f0; cursor: pointer; transition: all 0.18s; font-size: 13px; font-weight: 500; text-align: left; width: 100%; margin: 0; min-height: 48px; }
   .launch-btn:hover { border-color: #38bdf8; background: #0e1830; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(56,189,248,0.18); }
   .launch-btn:active { transform: translateY(0); }
   .launch-ico { width: 30px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); overflow: hidden; }
   .launch-ico svg { width: 18px; height: 18px; display: block; }
+  .launch-ico img { width: 20px; height: 20px; display: block; }
+  .launch-ico[data-fallback]::before { content: attr(data-fallback); color: #fff; font-weight: 700; font-size: 14px; display: none; }
+  .launch-ico.fallback::before { display: inline; }
+  .launch-ico.fallback img { display: none; }
   .launch-name { flex: 1; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  @media (max-width: 760px) {
+  .card { container-type: inline-size; container-name: card; }
+  @container card (max-width: 720px) {
+    .launch-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .btn-grid, .btn-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  @container card (max-width: 540px) {
     .launch-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  }
-  @media (max-width: 1100px) {
-    body { flex-direction: column; align-items: center; }
-    .log-panel { width: 860px; max-width: 96vw; max-height: 320px; flex: 0 0 auto; }
-  }
-  @media (max-width: 1100px) {
     .btn-grid, .btn-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
-  @media (max-width: 700px) {
+  @container card (max-width: 360px) {
+    .launch-grid { grid-template-columns: 1fr; }
     .btn-grid, .btn-grid-3 { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 1100px) {
+    body { flex-direction: column; align-items: center; gap: 16px; }
+    .card { flex: 0 0 auto; width: 860px; max-width: 96vw; min-width: 0; }
+    .splitter { display: none; }
+    .log-panel { width: 860px; max-width: 96vw; max-height: 320px; flex: 0 0 auto; min-width: 0; }
   }
 </style>
 </head>
@@ -273,9 +289,16 @@ const webWizardHTML = `<!DOCTYPE html>
 
   <!-- ========== Step 2: 安装 ========== -->
   <div class="step" id="step2">
-    <div class="user-info">
-      <div class="user-name" id="displayName"></div>
-      <div class="user-detail" id="displayDetail"></div>
+    <div class="user-info" style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+      <div style="flex:1;min-width:0">
+        <div class="user-name" id="displayName"></div>
+        <div class="user-detail" id="displayDetail"></div>
+      </div>
+      <div id="updateBox" style="text-align:right;font-size:12px;color:#94a3b8;flex-shrink:0">
+        <div>当前 v<span id="curVer">-</span> · <span id="latestVer">检查中…</span></div>
+        <button id="updateBtn" class="btn-secondary btn-small" onclick="updateBtnClick()" style="margin-top:6px;min-width:88px">检查更新</button>
+        <div id="updateMsg" style="margin-top:4px;font-size:11px;color:#64748b;min-height:14px"></div>
+      </div>
     </div>
     {{if not .FirstInstall}}<div class="status-bar mono" id="quickStatus">模式: 未知 | 上游: (direct)</div>
 
@@ -326,43 +349,57 @@ const webWizardHTML = `<!DOCTYPE html>
         <div class="launch-section-title">AI 编辑器 / CLI</div>
         <div class="launch-grid">
           <button class="launch-btn" onclick="launchPreset('cursor')" title="启动 Cursor">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#000 0%,#1f1f1f 100%);color:#fff;font-weight:700;font-size:14px;">C</span>
+            <span class="launch-ico" style="background:#000;" data-fallback="C">
+              <img src="https://cdn.simpleicons.org/cursor/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Cursor</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('vscode')" title="启动 VS Code">
-            <span class="launch-ico" style="background:#0a66c2;">
-              <svg viewBox="0 0 24 24" fill="#fff"><path d="M17.5 2.5l-11 9.5 5 4.5L17.5 2.5zM3 8l3.5 3.5L3 15l1.5 1.5L8.5 13l9 8.5L21 19V5l-3.5-2.5L8.5 11 4.5 7 3 8z"/></svg>
+            <span class="launch-ico" style="background:#007acc;" data-fallback="V">
+              <img src="/wizard/icons/vscode.png" alt="" onerror="icoErr(this)">
             </span>
             <span class="launch-name">VS Code</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('codex')" title="在 PowerShell 中启动 Codex CLI，自动注入本地 MITM 环境变量。">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#10a37f 0%,#0e8a6b 100%);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 9 5 12 8 15"/><polyline points="16 9 19 12 16 15"/></svg>
+            <span class="launch-ico" style="background:#10a37f;" data-fallback="&lt;/&gt;">
+              <img src="https://cdn.simpleicons.org/openai/ffffff" alt="" onerror="icoErr(this)">
             </span>
             <span class="launch-name">Codex</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('windsurf')" title="启动 Windsurf">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#0ea5a4 0%,#0891b2 100%);color:#fff;font-weight:700;font-size:14px;">W</span>
+            <span class="launch-ico" style="background:#fff;" data-fallback="W">
+              <img src="/wizard/icons/windsurf.svg" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Windsurf</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('kiro')" title="启动 Kiro">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#7c3aed 0%,#a855f7 100%);color:#fff;font-weight:700;font-size:14px;">K</span>
+            <span class="launch-ico" style="background:#fff;" data-fallback="K">
+              <img src="/wizard/icons/kiro.svg" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Kiro</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('trae')" title="启动 Trae">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#f43f5e 0%,#e11d48 100%);color:#fff;font-weight:700;font-size:14px;">T</span>
+            <span class="launch-ico" style="background:#fff;" data-fallback="T">
+              <img src="/wizard/icons/trae.png" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Trae</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('qoder')" title="启动 Qoder（阿里 AI IDE）">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#f97316 0%,#ea580c 100%);color:#fff;font-weight:700;font-size:14px;">Q</span>
+            <span class="launch-ico" style="background:#fff;" data-fallback="Q">
+              <img src="/wizard/icons/qoder.svg" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Qoder</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('zed')" title="启动 Zed Editor">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#0ea5e9 0%,#0369a1 100%);color:#fff;font-weight:700;font-size:14px;">Z</span>
+            <span class="launch-ico" style="background:#084ccc;" data-fallback="Z">
+              <img src="https://cdn.simpleicons.org/zedindustries/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Zed</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('claude-code')" title="在 PowerShell 中启动 Claude Code CLI，自动注入本地 MITM 环境变量。">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#d97706 0%,#b45309 100%);color:#fff;font-weight:700;font-size:14px;">CC</span>
+            <span class="launch-ico" style="background:#d97706;" data-fallback="CC">
+              <img src="https://cdn.simpleicons.org/anthropic/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">Claude Code</span>
           </button>
         </div>
@@ -372,14 +409,14 @@ const webWizardHTML = `<!DOCTYPE html>
         <div class="launch-section-title">终端</div>
         <div class="launch-grid">
           <button class="launch-btn" onclick="launchPreset('powershell')" title="启动 PowerShell">
-            <span class="launch-ico" style="background:#012456;">
-              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 7 10 12 5 17"/><line x1="13" y1="17" x2="19" y2="17"/></svg>
+            <span class="launch-ico" style="background:#012456;" data-fallback="&gt;_">
+              <img src="https://cdn.simpleicons.org/powershell/ffffff" alt="" onerror="icoErr(this)">
             </span>
             <span class="launch-name">PowerShell</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('cmd')" title="启动 CMD">
-            <span class="launch-ico" style="background:#1e293b;">
-              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 8 10 12 6 16"/><line x1="12" y1="16" x2="18" y2="16"/></svg>
+            <span class="launch-ico" style="background:#1e293b;" data-fallback="&gt;_">
+              <img src="https://cdn.simpleicons.org/windowsterminal/ffffff" alt="" onerror="icoErr(this)">
             </span>
             <span class="launch-name">CMD</span>
           </button>
@@ -390,24 +427,35 @@ const webWizardHTML = `<!DOCTYPE html>
         <div class="launch-section-title">JetBrains 系列</div>
         <div class="launch-grid">
           <button class="launch-btn" onclick="launchPreset('idea')" title="启动 IntelliJ IDEA">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#087cfa 0%,#fe315d 50%,#f97a12 100%);color:#fff;font-weight:700;font-size:13px;">IJ</span>
+            <span class="launch-ico" style="background:linear-gradient(135deg,#087cfa 0%,#fe315d 50%,#f97a12 100%);" data-fallback="IJ">
+              <img src="https://cdn.simpleicons.org/intellijidea/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">IntelliJ IDEA</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('webstorm')" title="启动 WebStorm">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#00cdd7 0%,#087cfa 50%,#fff200 100%);color:#000;font-weight:700;font-size:13px;">WS</span>
+            <span class="launch-ico" style="background:linear-gradient(135deg,#00cdd7 0%,#087cfa 50%,#fff200 100%);" data-fallback="WS">
+              <img src="https://cdn.simpleicons.org/webstorm/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">WebStorm</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('pycharm')" title="启动 PyCharm">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#21d789 0%,#fcf84a 50%,#07c3f2 100%);color:#000;font-weight:700;font-size:13px;">PC</span>
+            <span class="launch-ico" style="background:linear-gradient(135deg,#21d789 0%,#fcf84a 50%,#07c3f2 100%);" data-fallback="PC">
+              <img src="https://cdn.simpleicons.org/pycharm/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">PyCharm</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('goland')" title="启动 GoLand">
-            <span class="launch-ico" style="background:linear-gradient(135deg,#0eb9c3 0%,#bf3bb4 50%,#3bea62 100%);color:#fff;font-weight:700;font-size:13px;">GL</span>
+            <span class="launch-ico" style="background:linear-gradient(135deg,#0eb9c3 0%,#bf3bb4 50%,#3bea62 100%);" data-fallback="GL">
+              <img src="https://cdn.simpleicons.org/goland/ffffff" alt="" onerror="icoErr(this)">
+            </span>
             <span class="launch-name">GoLand</span>
           </button>
         </div>
       </div>
     </div>
+
+    <!-- 自动更新横幅（下载进度/错误时显示） -->
+    <div id="updateBanner" style="display:none;padding:10px 14px;border-radius:8px;margin:12px 0;color:#0f172a;font-size:13px"></div>
     {{end}}
 
     <div id="setupActions">
@@ -430,6 +478,8 @@ const webWizardHTML = `<!DOCTYPE html>
   </div>
 </div>
 
+<div class="splitter" id="splitter" title="拖动调整宽度"></div>
+
 <div class="log-panel" id="logPanel">
   <div class="log-head">
     <div class="lbl" id="logLbl"><span class="dot"></span>运行日志</div>
@@ -442,6 +492,12 @@ var authUser = null;
 var basePath = '{{.BasePath}}';
 var wizardToken = '{{.WizardToken}}';
 var consoleStatus = null;
+
+// Simple Icons CDN 加载失败时回退到字母占位（data-fallback 属性提供字母）。
+function icoErr(img) {
+  var p = img.parentNode;
+  if (p) p.classList.add('fallback');
+}
 
 function wizardHeaders(extra) {
   var headers = extra || {};
@@ -479,7 +535,44 @@ document.addEventListener('DOMContentLoaded', function() {
     setTimeout(function() { s.style.display = 'none'; s.className = ''; }, 260);
     if (statusHideTimer) { clearTimeout(statusHideTimer); statusHideTimer = null; }
   });
+  initSplitter();
 });
+
+// 左右面板分隔条拖动 + 百分比持久化到 localStorage。
+function initSplitter() {
+  var sp = document.getElementById('splitter');
+  if (!sp) return;
+  var saved = parseFloat(localStorage.getItem('wizardCardPct'));
+  if (!isNaN(saved) && saved >= 25 && saved <= 75) {
+    document.body.style.setProperty('--card-pct', saved + '%');
+  }
+  var dragging = false;
+  sp.addEventListener('mousedown', function(e) {
+    if (window.innerWidth <= 1100) return; // 移动端禁用
+    dragging = true;
+    sp.classList.add('dragging');
+    document.body.classList.add('dragging');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e) {
+    if (!dragging) return;
+    var pad = 16; // body padding
+    var usable = window.innerWidth - pad * 2;
+    var pct = ((e.clientX - pad) / usable) * 100;
+    if (pct < 25) pct = 25;
+    if (pct > 75) pct = 75;
+    document.body.style.setProperty('--card-pct', pct + '%');
+  });
+  document.addEventListener('mouseup', function() {
+    if (!dragging) return;
+    dragging = false;
+    sp.classList.remove('dragging');
+    document.body.classList.remove('dragging');
+    var cur = document.body.style.getPropertyValue('--card-pct');
+    var n = parseFloat(cur);
+    if (!isNaN(n)) localStorage.setItem('wizardCardPct', n.toFixed(2));
+  });
+}
 
 function activateModeButton(mode) {
   ['modeObserveBtn', 'modeSessionBtn', 'modeGlobalBtn', 'modeCleanupBtn'].forEach(function(id) {
@@ -996,6 +1089,157 @@ function initLogPanel() {
     } catch (err) {}
   });
 }
+
+// ── 自动更新（顶部信息栏） ─────────────────────────────────
+var updateState = { hasUpdate: false, latest: '', busy: false };
+
+function setUpdateMsg(text, color) {
+  var el = document.getElementById('updateMsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = color || '#64748b';
+}
+
+function renderUpdateState(s) {
+  var verEl = document.getElementById('curVer');
+  if (!verEl) return;
+  verEl.textContent = (s && s.current_version) || '';
+  var latest = document.getElementById('latestVer');
+  var btn = document.getElementById('updateBtn');
+  var banner = document.getElementById('updateBanner');
+
+  var hasUpdate = !!(s && s.release && s.release.has_update);
+  updateState.hasUpdate = hasUpdate;
+  updateState.latest = hasUpdate ? s.release.latest_version : '';
+
+  if (hasUpdate) {
+    latest.textContent = '新版 v' + s.release.latest_version;
+    latest.style.color = '#fbbf24';
+    if (!updateState.busy) {
+      btn.textContent = '立即更新';
+      btn.disabled = false;
+    }
+  } else {
+    latest.textContent = '已是最新';
+    latest.style.color = '#94a3b8';
+    if (!updateState.busy) {
+      btn.textContent = '检查更新';
+      btn.disabled = false;
+    }
+  }
+
+  if (s && s.downloading) {
+    banner.style.display = 'block';
+    banner.style.background = '#dbeafe';
+    banner.textContent = '下载中… ' + (s.progress || 0) + '%';
+  } else if (s && s.error) {
+    banner.style.display = 'block';
+    banner.style.background = '#fecaca';
+    banner.textContent = '更新检查失败: ' + s.error;
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+function refreshUpdateStatus() {
+  fetch(basePath + '/api/wizard/update/status')
+    .then(function(r){return r.json();})
+    .then(renderUpdateState)
+    .catch(function(){});
+}
+
+function updateBtnClick() {
+  if (updateState.busy) return;
+  if (updateState.hasUpdate) {
+    applyUpdate();
+  } else {
+    checkUpdate();
+  }
+}
+
+function checkUpdate() {
+  var btn = document.getElementById('updateBtn');
+  updateState.busy = true;
+  btn.disabled = true;
+  btn.textContent = '检查中…';
+  setUpdateMsg('正在向服务器查询新版本…');
+  fetch(basePath + '/api/wizard/update/check', {method:'POST', headers: wizardHeaders()})
+    .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, data:d}; }); })
+    .then(function(res){
+      if (!res.ok) {
+        setUpdateMsg('✗ ' + (res.data && res.data.error || 'HTTP 错误'), '#f87171');
+      } else if (res.data && res.data.release && res.data.release.has_update) {
+        setUpdateMsg('🆕 发现 v' + res.data.release.latest_version, '#fbbf24');
+      } else {
+        setUpdateMsg('已是最新版本', '#34d399');
+      }
+    })
+    .catch(function(e){ setUpdateMsg('✗ 网络错误: ' + e.message, '#f87171'); })
+    .finally(function(){
+      updateState.busy = false;
+      refreshUpdateStatus();
+      setTimeout(function(){ setUpdateMsg(''); }, 4000);
+    });
+}
+
+function applyUpdate() {
+  if (!confirm('确认立即更新到 v' + updateState.latest + '？应用会自动重启。')) return;
+  var btn = document.getElementById('updateBtn');
+  updateState.busy = true;
+  btn.disabled = true;
+  btn.textContent = '更新中…';
+  setUpdateMsg('正在下载新版本…');
+  fetch(basePath + '/api/wizard/update/apply', {method:'POST', headers: wizardHeaders()})
+    .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, data:d}; }); })
+    .then(function(res){
+      if (!res.ok) {
+        setUpdateMsg('✗ ' + (res.data && res.data.error || 'HTTP 错误'), '#f87171');
+        updateState.busy = false;
+        btn.disabled = false;
+        btn.textContent = '立即更新';
+        return;
+      }
+      setUpdateMsg('已派发更新，等待新版本启动…', '#34d399');
+      btn.textContent = '重启中…';
+      startReconnectPolling();
+    })
+    .catch(function(e){
+      setUpdateMsg('✗ ' + e.message, '#f87171');
+      updateState.busy = false;
+      btn.disabled = false;
+      btn.textContent = '立即更新';
+    });
+}
+
+function startReconnectPolling() {
+  var elapsed = 0;
+  var currentPort = location.port || '80';
+  var t = setInterval(function() {
+    elapsed += 1;
+    fetch('/api/wizard/instance', {cache:'no-store'})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(info){
+        if (!info || !info.port) return;
+        if (String(info.port) !== currentPort) {
+          clearInterval(t);
+          location.href = location.protocol + '//127.0.0.1:' + info.port + '/wizard';
+          return;
+        }
+        clearInterval(t);
+        location.reload();
+      })
+      .catch(function(){ /* 仍在重启窗口期 */ });
+    if (elapsed >= 30) {
+      clearInterval(t);
+      setUpdateMsg('重启耗时较长，请手动关闭本窗口后重新打开 ai-monitor。', '#f87171');
+    }
+  }, 1000);
+}
+
+if (document.getElementById('updateBtn')) {
+  setInterval(refreshUpdateStatus, 5000);
+  refreshUpdateStatus();
+}
 </script>
 </body>
 </html>`
@@ -1400,6 +1644,94 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 	}
 	if subPath == "/api/overview" && r.Method == http.MethodGet {
 		s.handleOverviewProxy(w, r)
+		return
+	}
+
+	if r.Method == http.MethodGet && serveWizardIcon(w, r, subPath) {
+		return
+	}
+
+	if subPath == "/api/wizard/instance" && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		info, _ := readInstanceInfo()
+		if info == nil {
+			info = &InstanceInfo{
+				PID:     os.Getpid(),
+				Port:    s.listenPort,
+				Version: Version,
+			}
+		}
+		_ = json.NewEncoder(w).Encode(info)
+		return
+	}
+
+	if subPath == "/api/wizard/update/status" && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		if s.Updater == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"current_version": Version,
+				"release":         nil,
+				"error":           "",
+				"progress":        int32(0),
+				"downloading":     false,
+			})
+			return
+		}
+		info, lastErr, pct, downloading := s.Updater.Snapshot()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"current_version": Version,
+			"release":         info,
+			"error":           lastErr,
+			"progress":        pct,
+			"downloading":     downloading,
+		})
+		return
+	}
+	if subPath == "/api/wizard/update/check" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if s.Updater == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "updater 未启用"})
+			return
+		}
+		info, err := s.Updater.CheckNow(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"release": info})
+		return
+	}
+	if subPath == "/api/wizard/update/apply" && r.Method == http.MethodPost {
+		if !s.authorizeWizardAction(r) {
+			s.rejectUnauthorizedWizardAction(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if s.Updater == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "updater 未启用"})
+			return
+		}
+		info, _, _, _ := s.Updater.Snapshot()
+		if info == nil || !info.HasUpdate {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "当前没有可用的新版本"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "starting"})
+		u := s.Updater
+		go func() {
+			if err := u.ApplyUpdate(info); err != nil {
+				log.Printf("[updater] ApplyUpdate 失败: %v", err)
+			}
+		}()
 		return
 	}
 

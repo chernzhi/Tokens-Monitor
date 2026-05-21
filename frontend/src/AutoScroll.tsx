@@ -9,6 +9,7 @@ interface Props {
 /**
  * Vertical auto-scroll container for dashboard lists.
  * If content fits, no scroll. If overflows, smoothly loops.
+ * Wheel input pauses auto-scroll for ~4s and lets the user scroll freely.
  */
 export default function AutoScroll({ children, speed = 20, pauseOnHover = true }: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
@@ -16,9 +17,11 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
   const [needsScroll, setNeedsScroll] = useState(false);
   const [paused, setPaused] = useState(false);
   const [compactMode, setCompactMode] = useState(false);
+  const [manualScroll, setManualScroll] = useState(false);
   const offset = useRef(0);
   const raf = useRef(0);
   const lastTime = useRef(0);
+  const manualTimer = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -45,15 +48,15 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
     return () => ro.disconnect();
   }, [children]);
 
-  const shouldAnimate = needsScroll && !compactMode;
+  const shouldAnimate = needsScroll && !compactMode && !manualScroll;
 
   useEffect(() => {
     const inner = innerRef.current;
     if (!shouldAnimate || paused) {
       cancelAnimationFrame(raf.current);
       lastTime.current = 0;
-      offset.current = 0;
-      if (inner) {
+      if (!needsScroll && inner) {
+        offset.current = 0;
         inner.style.transform = "translateY(0)";
       }
       return;
@@ -78,7 +81,32 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
     };
     raf.current = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf.current);
-  }, [paused, shouldAnimate, speed]);
+  }, [paused, shouldAnimate, speed, needsScroll]);
+
+  // Wheel: pause auto-scroll, let user drive offset directly. Resume after idle.
+  useEffect(() => {
+    const outer = outerRef.current;
+    if (!outer || !needsScroll || compactMode) return;
+    const onWheel = (e: WheelEvent) => {
+      const inner = innerRef.current;
+      if (!inner) return;
+      e.preventDefault();
+      const fullH = manualScroll ? inner.scrollHeight : inner.scrollHeight / 2;
+      const max = Math.max(fullH - outer.clientHeight, 0);
+      let next = offset.current + e.deltaY;
+      next = Math.max(0, Math.min(next, max));
+      offset.current = next;
+      inner.style.transform = `translateY(-${next}px)`;
+      if (!manualScroll) setManualScroll(true);
+      if (manualTimer.current) window.clearTimeout(manualTimer.current);
+      manualTimer.current = window.setTimeout(() => {
+        setManualScroll(false);
+        lastTime.current = 0;
+      }, 4000);
+    };
+    outer.addEventListener("wheel", onWheel, { passive: false });
+    return () => outer.removeEventListener("wheel", onWheel);
+  }, [needsScroll, compactMode, manualScroll]);
 
   return (
     <div
@@ -92,7 +120,7 @@ export default function AutoScroll({ children, speed = 20, pauseOnHover = true }
     >
       <div ref={innerRef} className="auto-scroll-inner">
         {children}
-        {/* 内容超出可视区域时复制一份做无缝循环；不超出时不复制，避免重复展示 */}
+        {/* 内容超出可视区域时复制一份做无缝循环；手动滚动或不超出时不复制 */}
         {shouldAnimate ? children : null}
       </div>
     </div>

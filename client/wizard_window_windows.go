@@ -14,6 +14,30 @@ import (
 	webview2 "github.com/jchv/go-webview2"
 )
 
+// activeWizardCloser 是最近一次 openWizardWindow 注册的 close 回调。
+// shutdown 路径调用 closeActiveWizardWindow 一次性关闭 WebView2 宿主窗口，
+// 避免「卡死无响应的旧窗口」（截图中标题 find "" 的孤儿窗口）。
+var (
+	activeWizardMu     sync.Mutex
+	activeWizardCloser func()
+)
+
+func setActiveWizardCloser(fn func()) {
+	activeWizardMu.Lock()
+	activeWizardCloser = fn
+	activeWizardMu.Unlock()
+}
+
+func closeActiveWizardWindow() {
+	activeWizardMu.Lock()
+	fn := activeWizardCloser
+	activeWizardCloser = nil
+	activeWizardMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
 // DWM 自定义标题栏：Win11 (build 22000+) 支持 caption 颜色 / 文字颜色 / 边框颜色，
 // Win10 1809+ 支持深色模式。失败静默忽略——降级到系统默认外观。
 const (
@@ -161,6 +185,7 @@ func openWizardWindow(url, title string, closeOnRequest *func()) (<-chan struct{
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		defer close(done)
+		defer setActiveWizardCloser(nil)
 
 		var w webview2.WebView
 		defer func() {
@@ -179,7 +204,7 @@ func openWizardWindow(url, title string, closeOnRequest *func()) (<-chan struct{
 				Title:  title,
 				Width:  1440,
 				Height: 920,
-				IconId: 2,
+				IconId: 1,
 				Center: true,
 			},
 		})
@@ -212,20 +237,22 @@ func openWizardWindow(url, title string, closeOnRequest *func()) (<-chan struct{
 			}()
 		}
 
-		if closeOnRequest != nil {
-			localW := w
-			localHwnd := hwnd
-			*closeOnRequest = func() {
-				// 双保险：先 PostMessage(WM_CLOSE) 触发标准关闭流程
-				// （走 WindowProc，能正确销毁子 WebView2 控件），失败再 Terminate。
-				// 单纯 Terminate() 在 Win11 + 新版 WebView2 上有时只退出主循环但
-				// 不销毁宿主窗口，造成「卡死无响应的旧窗口」。
-				if localHwnd != 0 {
-					postWMClose(localHwnd)
-				}
-				// 同时排队一次 Terminate 作为兜底（如果 WM_CLOSE 被某个处理器吞掉）
-				localW.Dispatch(func() { localW.Terminate() })
+		localW := w
+		localHwnd := hwnd
+		closer := func() {
+			// 双保险：先 PostMessage(WM_CLOSE) 触发标准关闭流程
+			// （走 WindowProc，能正确销毁子 WebView2 控件），失败再 Terminate。
+			// 单纯 Terminate() 在 Win11 + 新版 WebView2 上有时只退出主循环但
+			// 不销毁宿主窗口，造成「卡死无响应的旧窗口」。
+			if localHwnd != 0 {
+				postWMClose(localHwnd)
 			}
+			// 同时排队一次 Terminate 作为兜底（如果 WM_CLOSE 被某个处理器吞掉）
+			localW.Dispatch(func() { localW.Terminate() })
+		}
+		setActiveWizardCloser(closer)
+		if closeOnRequest != nil {
+			*closeOnRequest = closer
 		}
 
 		wOnce.Do(func() { ready <- nil })

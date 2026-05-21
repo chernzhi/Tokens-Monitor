@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useState, useEffect, useCallback } from "react";
-import { Alert, Button, Radio, Select, Space } from "antd";
+import { Alert, Button, Radio, Select, Space, Tooltip } from "antd";
 import {
   DashboardOutlined,
   ThunderboltOutlined,
@@ -7,7 +7,6 @@ import {
   TeamOutlined,
   ApiOutlined,
   RobotOutlined,
-  DesktopOutlined,
   DownloadOutlined,
 } from "@ant-design/icons";
 import { api, type Overview, type TrendData, type RankingItem, type BreakdownItem } from "./api";
@@ -130,14 +129,12 @@ function App() {
 
   // ── Stat Cards (with animated numbers) ──
   const statCards = [
-    { label: "总 Token 消耗", icon: <ThunderboltOutlined />, rawValue: overview.total_tokens, format: formatTokens, color: "yellow", sub: overview.tokens_change_pct != null ? `环比 ${overview.tokens_change_pct > 0 ? "+" : ""}${overview.tokens_change_pct}%` : "所有 AI 模型消耗的 Token 总数" },
-    { label: "总成本", icon: <DollarOutlined />, rawValue: overview.total_cost_cny, format: formatCNY, color: "green", sub: overview.cost_change_pct != null ? `环比 ${overview.cost_change_pct > 0 ? "+" : ""}${overview.cost_change_pct}%　已定价 ${pricedPct.toFixed(0)}%` : `环比 暂无　已定价 ${pricedPct.toFixed(0)}%` },
-    { label: "总请求数", icon: <ApiOutlined />, rawValue: overview.total_requests, format: formatNumber, color: "purple", sub: "API 调用总次数" },
-    { label: "精确 Token 占比", icon: <ThunderboltOutlined />, rawValue: exactTokenPct, format: (n: number) => `${n.toFixed(1)}%`, color: "orange", sub: `精确 ${formatTokens(overview.exact_tokens)} / 估算 ${formatTokens(overview.estimated_tokens)}` },
-    { label: "活跃用户", icon: <TeamOutlined />, rawValue: overview.active_users, format: (n: number) => Math.round(n).toString(), color: "cyan", sub: "本月有 AI 调用的用户数" },
-    { label: "在线客户端", icon: <DesktopOutlined />, rawValue: onlineClients, format: (n: number) => Math.round(n).toString(), color: "blue", sub: "当前在线的监控客户端" },
-    { label: "估算请求数", icon: <ApiOutlined />, rawValue: overview.estimated_requests, format: formatNumber, color: "purple", sub: `占全部请求 ${estimatedRequestPct.toFixed(1)}%` },
-    { label: "人均 Token", icon: <RobotOutlined />, rawValue: overview.avg_tokens_per_user, format: formatTokens, color: "pink", sub: `人均成本 ${formatCNY(overview.avg_cost_per_user)}` },
+    { label: "总 Token 消耗", icon: <ThunderboltOutlined />, rawValue: overview.total_tokens, format: formatTokens, color: "yellow", sub: overview.tokens_change_pct != null ? `环比 ${overview.tokens_change_pct > 0 ? "+" : ""}${overview.tokens_change_pct}%` : "所有 AI 模型消耗的 Token 总数", hint: `当前区间所有 AI 模型消耗 Token 总数。环比基准：上一同长度区间（共 ${trendDays} 天）。精确 ${formatTokens(overview.exact_tokens)} / 估算 ${formatTokens(overview.estimated_tokens)}` },
+    { label: "总成本", icon: <DollarOutlined />, rawValue: overview.total_cost_cny, format: formatCNY, color: "green", sub: overview.cost_change_pct != null ? `环比 ${overview.cost_change_pct > 0 ? "+" : ""}${overview.cost_change_pct}%　已定价 ${pricedPct.toFixed(0)}%` : `环比 暂无　已定价 ${pricedPct.toFixed(0)}%`, hint: `按各供应商定价表估算的人民币成本。已定价 ${formatTokens(overview.priced_tokens)}（${pricedPct.toFixed(1)}%），未定价 ${formatTokens(overview.unpriced_tokens)}。环比基准：上一同长度区间。` },
+    { label: "总请求数", icon: <ApiOutlined />, rawValue: overview.total_requests, format: formatNumber, color: "purple", sub: `估算 ${estimatedRequestPct.toFixed(0)}%　精确 ${(100 - estimatedRequestPct).toFixed(0)}%`, hint: `API 调用总次数 ${formatNumber(overview.total_requests)}。其中精确 token 计数 ${formatNumber(overview.exact_requests)}，估算 ${formatNumber(overview.estimated_requests)}（无 usage 字段，按 token 数倒推）。` },
+    { label: "Token 精确占比", icon: <ThunderboltOutlined />, rawValue: exactTokenPct, format: (n: number) => `${n.toFixed(1)}%`, color: "orange", sub: `精确 ${formatTokens(overview.exact_tokens)} / 估算 ${formatTokens(overview.estimated_tokens)}`, hint: "上游返回了 usage 的 token 视为精确，其余按响应字符估算。占比越高数据越可靠。" },
+    { label: "活跃用户", icon: <TeamOutlined />, rawValue: overview.active_users, format: (n: number) => Math.round(n).toString(), color: "cyan", sub: `在线客户端 ${onlineClients}`, hint: `活跃用户：当前区间有 AI 调用记录的去重用户数。在线客户端：心跳 5 分钟内的监控客户端数（独立口径，含同一用户多设备）。` },
+    { label: "人均 Token", icon: <RobotOutlined />, rawValue: overview.avg_tokens_per_user, format: formatTokens, color: "pink", sub: `人均成本 ${formatCNY(overview.avg_cost_per_user)}`, hint: "总 Token / 活跃用户。可用于识别异常用户：排行榜中远高于人均的需关注。" },
   ];
 
   // ── Trend Chart ──
@@ -198,67 +195,138 @@ function App() {
   const costTrendOption = {
     backgroundColor: "transparent",
     tooltip: { trigger: "axis" as const, formatter: (params: any) => {
-      const p = params[0];
-      return `${p.axisValue}<br/>${p.marker} 成本: ${formatCNY(p.value)}`;
+      const cost = params.find((p: any) => p.seriesName === "成本");
+      const req = params.find((p: any) => p.seriesName === "请求数");
+      const lines = [params[0].axisValue];
+      if (cost) lines.push(`${cost.marker} 成本: ${formatCNY(cost.value)}`);
+      if (req) lines.push(`${req.marker} 请求数: ${formatNumber(req.value)}`);
+      return lines.join("<br/>");
     }},
-    grid: { left: 70, right: 20, bottom: 30, top: 20 },
+    legend: { data: ["成本", "请求数"], top: 0, right: 10, textStyle: { color: "#8b949e", fontSize: 11 }, itemWidth: 12, itemHeight: 8 },
+    grid: { left: 60, right: 60, bottom: 24, top: 40 },
     xAxis: {
       type: "category" as const,
       data: trend.points.map((p) => p.date.slice(5)),
       axisLabel: { color: "#8b949e" },
       axisLine: { lineStyle: { color: "#30363d" } },
     },
-    yAxis: {
-      type: "value" as const,
-      min: 0,
-      axisLabel: { color: "#8b949e", formatter: (v: number) => formatCNY(v) },
-      splitLine: { lineStyle: { color: "#21262d" } },
-    },
-    series: [{
-      type: "line" as const,
-      data: trend.points.map((p) => p.cost_cny),
-      smooth: true,
-      areaStyle: { color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: "rgba(88,166,255,0.3)" }, { offset: 1, color: "rgba(88,166,255,0)" }] } },
-      lineStyle: { color: COLORS.blue, width: 2 },
-      itemStyle: { color: COLORS.blue },
-    }],
+    yAxis: [
+      {
+        type: "value" as const,
+        name: "成本",
+        nameTextStyle: { color: "#8b949e", fontSize: 10 },
+        min: 0,
+        axisLabel: { color: "#8b949e", formatter: (v: number) => formatCNY(v) },
+        splitLine: { lineStyle: { color: "#21262d" } },
+      },
+      {
+        type: "value" as const,
+        name: "请求数",
+        nameTextStyle: { color: "#8b949e", fontSize: 10 },
+        min: 0,
+        position: "right" as const,
+        axisLabel: { color: "#8b949e", formatter: (v: number) => formatNumber(v) },
+        splitLine: { show: false },
+      },
+    ],
+    series: [
+      {
+        name: "成本",
+        type: "line" as const,
+        data: trend.points.map((p) => p.cost_cny),
+        smooth: true,
+        yAxisIndex: 0,
+        areaStyle: { color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: "rgba(88,166,255,0.3)" }, { offset: 1, color: "rgba(88,166,255,0)" }] } },
+        lineStyle: { color: COLORS.blue, width: 2 },
+        itemStyle: { color: COLORS.blue },
+      },
+      {
+        name: "请求数",
+        type: "line" as const,
+        data: trend.points.map((p) => p.requests),
+        smooth: true,
+        yAxisIndex: 1,
+        symbol: "circle",
+        symbolSize: 6,
+        lineStyle: { color: COLORS.purple, width: 2, type: "dashed" as const },
+        itemStyle: { color: COLORS.purple },
+      },
+    ],
   };
 
-  // ── Model Pie ──
-  const modelPieOption = {
-    backgroundColor: "transparent",
-    tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
-    legend: { orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 18 ? name.slice(0, 18) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8 },
-    series: [{
-      type: "pie",
-      radius: ["35%", "65%"],
-      center: ["50%", "42%"],
-      data: modelBreakdown.map((m, i) => ({
-        name: m.name, value: m.total_tokens,
-        itemStyle: { color: BAR_COLORS[i % BAR_COLORS.length] },
-      })),
-      label: { show: false },
-      emphasis: { itemStyle: { shadowBlur: 10, shadowColor: "rgba(0,0,0,0.5)" } },
-    }],
+  // ── Pie helpers ──
+  const TOP_N_PIE = 5;
+  const buildPieSeries = (items: { name: string; total_tokens: number }[]) => {
+    const sorted = [...items].sort((a, b) => b.total_tokens - a.total_tokens);
+    const topNames = new Set(sorted.slice(0, TOP_N_PIE).map((x) => x.name));
+    const total = items.reduce((s, x) => s + x.total_tokens, 0) || 1;
+    return items.map((m, i) => {
+      const isTop = topNames.has(m.name);
+      const pct = (m.total_tokens / total) * 100;
+      const shortName = m.name.length > 22 ? m.name.slice(0, 22) + "…" : m.name;
+      return {
+        name: m.name,
+        value: m.total_tokens,
+        itemStyle: {
+          color: BAR_COLORS[i % BAR_COLORS.length],
+          borderColor: "#161b22",
+          borderWidth: 2,
+        },
+        label: isTop
+          ? {
+              show: true,
+              position: "outside" as const,
+              color: "#e6edf3",
+              fontSize: 12,
+              fontWeight: 600 as const,
+              lineHeight: 16,
+              formatter: `{n|${shortName}}\n{p|${pct.toFixed(1)}%}`,
+              rich: {
+                n: { color: "#e6edf3", fontSize: 12, fontWeight: 600, lineHeight: 16 },
+                p: { color: "#8b949e", fontSize: 11, lineHeight: 14 },
+              },
+            }
+          : { show: false },
+        labelLine: isTop
+          ? { show: true, length: 10, length2: 8, smooth: true, lineStyle: { color: "#30363d", width: 1 } }
+          : { show: false },
+      };
+    });
   };
 
-  // ── Provider Pie ──
-  const providerPieOption = {
-    backgroundColor: "transparent",
-    tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
-    legend: { orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, itemWidth: 10, itemHeight: 10, itemGap: 8 },
-    series: [{
-      type: "pie",
-      radius: ["35%", "65%"],
-      center: ["50%", "42%"],
-      data: providerBreakdown.map((m, i) => ({
-        name: m.name, value: m.total_tokens,
-        itemStyle: { color: BAR_COLORS[i % BAR_COLORS.length] },
-      })),
-      label: { show: false },
-      emphasis: { itemStyle: { shadowBlur: 10, shadowColor: "rgba(0,0,0,0.5)" } },
-    }],
+  const makePieOption = (items: { name: string; total_tokens: number }[], style: "donut" | "rose" = "donut") => {
+    const total = items.reduce((s, x) => s + x.total_tokens, 0);
+    const isRose = style === "rose";
+    return {
+      backgroundColor: "transparent",
+      tooltip: { trigger: "item" as const, formatter: "{b}: {d}%" },
+      legend: { type: "scroll" as const, orient: "horizontal" as const, bottom: 0, left: "center", textStyle: { color: "#8b949e", fontSize: 11 }, formatter: (name: string) => name.length > 14 ? name.slice(0, 14) + "…" : name, itemWidth: 10, itemHeight: 10, itemGap: 8, pageIconColor: "#8b949e", pageTextStyle: { color: "#8b949e" } },
+      ...(isRose ? {} : {
+        graphic: {
+          type: "group" as const,
+          left: "center",
+          top: "36%",
+          children: [
+            { type: "text" as const, style: { text: formatNumber(total), fill: "#e6edf3", fontSize: 18, fontWeight: 700, textAlign: "center" as const, textVerticalAlign: "middle" as const } },
+            { type: "text" as const, top: 24, style: { text: "总计", fill: "#8b949e", fontSize: 11, textAlign: "center" as const, textVerticalAlign: "middle" as const } },
+          ],
+        },
+      }),
+      series: [{
+        type: "pie",
+        radius: isRose ? ["14%", "50%"] : ["28%", "58%"],
+        center: ["50%", "44%"],
+        roseType: isRose ? ("radius" as const) : (false as const),
+        avoidLabelOverlap: true,
+        minShowLabelAngle: 2,
+        data: buildPieSeries(items),
+        emphasis: { scale: true, scaleSize: 4, label: { show: true } },
+      }],
+    };
   };
+
+  const modelPieOption = makePieOption(modelBreakdown, "donut");
+  const providerPieOption = makePieOption(providerBreakdown, "rose");
 
   // ── Ranking list helper ──
   const maxUserTokens = userRanking.length > 0 ? userRanking[0].total_tokens : 1;
@@ -279,6 +347,7 @@ function App() {
             className="dashboard-select"
           />
           <Radio.Group className="dashboard-radio-group" value={trendDays} onChange={(e) => setTrendDays(e.target.value)} buttonStyle="solid" size="small">
+            <Radio.Button value={1}>今日</Radio.Button>
             <Radio.Button value={7}>近7天</Radio.Button>
             <Radio.Button value={15}>近15天</Radio.Button>
             <Radio.Button value={30}>近30天</Radio.Button>
@@ -290,17 +359,12 @@ function App() {
           <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" icon={<DownloadOutlined />} href="/api/extension/installer" target="_blank">
             安装包
           </Button>
-          <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" type="primary" ghost onClick={() => void fetchAll(false)} loading={isRefreshing && !isLoading}>
-            刷新
-          </Button>
+          <Tooltip title={isLoading ? "首次加载中" : isRefreshing ? "刷新中" : `上次更新 ${lastUpdatedAt}`}>
+            <Button className="dashboard-refresh-btn dashboard-refresh-btn-inline" type="primary" ghost onClick={() => void fetchAll(false)} loading={isRefreshing && !isLoading}>
+              刷新 {lastUpdatedAt && !isLoading ? <span style={{ opacity: 0.7, fontWeight: 400, marginLeft: 4 }}>· {lastUpdatedAt}</span> : null}
+            </Button>
+          </Tooltip>
         </Space>
-      </div>
-
-      <div className="dashboard-filter-note">
-        当前视图：{currentSourceAppLabel}
-        <span className={`dashboard-status dashboard-status-inline${isRefreshing ? " is-refreshing" : ""}`}>
-          {isLoading ? "首次加载中" : isRefreshing ? "刷新中" : `已更新 ${lastUpdatedAt}`}
-        </span>
       </div>
 
       {loadError ? (
@@ -317,13 +381,15 @@ function App() {
       {/* Stat Cards */}
       <div className="stat-cards">
         {statCards.map((card) => (
-          <div className="stat-card" key={card.label}>
-            <div className="label">{card.icon} {card.label}</div>
-            <div className={`value color-${card.color}`}>
-              <AnimatedNumber value={card.rawValue} format={card.format} />
+          <Tooltip key={card.label} title={card.hint} placement="bottom" mouseEnterDelay={0.3}>
+            <div className="stat-card">
+              <div className="label">{card.icon} {card.label}</div>
+              <div className={`value color-${card.color}`}>
+                <AnimatedNumber value={card.rawValue} format={card.format} />
+              </div>
+              <div className="sub">{card.sub}</div>
             </div>
-            <div className="sub">{card.sub}</div>
-          </div>
+          </Tooltip>
         ))}
       </div>
 
@@ -373,12 +439,13 @@ function App() {
                 {userRanking.map((u, i) => (
                   <div className="rank-row" key={u.id}>
                     <span className="rank-idx" style={{ color: i < 3 ? COLORS.yellow : "#8b949e" }}>{i + 1}</span>
-                    <span className="rank-name rank-name-user" title={u.employee_id ? `${u.name}(${u.employee_id})` : u.name}>{u.name}{u.employee_id ? `(${u.employee_id})` : ""}</span>
+                    <span className="rank-name rank-name-user" title={u.name}>{u.name}</span>
                     <div className="rank-bar-bg">
                       <div className="rank-bar" style={{ width: `${(u.total_tokens / maxUserTokens) * 100}%`, background: BAR_COLORS[i % BAR_COLORS.length] }} />
                     </div>
                     <span className="rank-user-metrics">
                       <span className="rank-val rank-val-token">{formatTokens(u.total_tokens)}</span>
+                      <span className="rank-val rank-val-requests">{formatNumber(u.requests)} 次</span>
                       <span className="rank-val rank-val-cost">{formatCNY(u.cost_cny)}</span>
                     </span>
                   </div>

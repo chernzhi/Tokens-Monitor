@@ -353,6 +353,7 @@ type ProxyServer struct {
 	takeoverMu   sync.RWMutex
 	takeoverMode string
 	wizardToken  string
+	Updater      *Updater // 自动更新（可为 nil，例如单测）
 }
 
 // SetTakeoverMode 在 main.go 决定本次接管模式后调用，让 /status 能如实展示。

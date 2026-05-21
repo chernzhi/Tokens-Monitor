@@ -214,6 +214,9 @@ func startMonitorRuntime(cfg *Config, certMgr *CertManager, sourceApp string, co
 	}()
 
 	proxy := NewProxyServer(cfg, reporter, certMgr, configPath)
+	updater := NewUpdater(cfg)
+	go updater.Start(reporterCtx)
+	proxy.Updater = updater
 	ln, listenPort, err := tryListenMitmPort(cfg.Port)
 	if err != nil {
 		reporterCancel() // 失败路径：取消 reporter ctx，避免 goroutine + context 泄漏
