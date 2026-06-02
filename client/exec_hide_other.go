@@ -26,4 +26,3 @@ func newDetachedGuiCmd(name string, args ...string) *exec.Cmd {
 func newConsoleCmd(name string, args ...string) *exec.Cmd {
 	return exec.Command(name, args...)
 }
-

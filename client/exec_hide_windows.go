@@ -84,4 +84,3 @@ func newConsoleCmd(name string, args ...string) *exec.Cmd {
 	}
 	return cmd
 }
-

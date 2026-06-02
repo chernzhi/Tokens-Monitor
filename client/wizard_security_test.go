@@ -110,4 +110,3 @@ func TestResolveCustomLaunchBinary(t *testing.T) {
 		t.Fatalf("existing path resolve failed: got=%q err=%v", got, err)
 	}
 }
-

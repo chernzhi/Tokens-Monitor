@@ -11,10 +11,10 @@ import (
 // 不会被列入——它们不依赖 system PAC，重启意义不大。
 func TestDetectRunningElectronEditorsListsOnlyElectronAndOnlyRunning(t *testing.T) {
 	running := map[string]bool{
-		"Cursor.exe":  true,
-		"Code.exe":    true,
-		"idea64.exe":  true, // JetBrains 不算 Electron，应被忽略
-		"pwsh.exe":    true, // 终端不算
+		"Cursor.exe":   true,
+		"Code.exe":     true,
+		"idea64.exe":   true, // JetBrains 不算 Electron，应被忽略
+		"pwsh.exe":     true, // 终端不算
 		"VSCodium.exe": false,
 	}
 	got := detectRunningElectronEditors(func(image string) bool {
@@ -32,8 +32,8 @@ func TestDetectRunningElectronEditorsListsOnlyElectronAndOnlyRunning(t *testing.
 		"cursor": true,
 	}
 	wantNotContains := map[string]bool{
-		"vscodium": true, // 没在跑
-		"idea":     true, // 不是 Electron
+		"vscodium":   true, // 没在跑
+		"idea":       true, // 不是 Electron
 		"powershell": true,
 	}
 	for w := range wantContains {
