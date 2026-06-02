@@ -89,9 +89,15 @@ func TestUpdaterCheckNow_404TreatedAsNoRelease(t *testing.T) {
 	}))
 	defer srv.Close()
 	u := &Updater{serverURL: srv.URL, currentVersion: "3.2.9", checkClient: &http.Client{}, downloadClient: &http.Client{}, cfg: &Config{}}
+	// 预置一个旧的「有更新」缓存，模拟服务端先发布后撤下 release 的场景。
+	u.setLatest(&ReleaseInfo{LatestVersion: "3.3.0", HasUpdate: true})
 	info, err := u.CheckNow(context.Background())
 	if err != nil || info != nil {
 		t.Errorf("404 should return (nil,nil); got info=%v err=%v", info, err)
+	}
+	// 404 必须清空缓存，否则 /status 会继续误报有更新。
+	if cached, _, _, _ := u.Snapshot(); cached != nil {
+		t.Errorf("404 should clear cached latest; got %+v", cached)
 	}
 }
 

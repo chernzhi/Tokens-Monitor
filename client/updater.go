@@ -112,8 +112,12 @@ func (u *Updater) CheckNow(ctx context.Context) (*ReleaseInfo, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
+		// 服务端没有为该平台配置 release：视为「无可用更新」。
+		// 必须同时清掉之前缓存的 latest，否则轮询 /status 仍会上报旧的
+		// has_update=true，导致 UI 一直显示「立即更新」并尝试下载已撤下的版本。
 		u.mu.Lock()
 		u.lastError = ""
+		u.latest = nil
 		u.mu.Unlock()
 		return nil, nil
 	}

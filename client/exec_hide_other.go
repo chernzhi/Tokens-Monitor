@@ -15,3 +15,15 @@ func newDetachedCmd(name string, args ...string) *exec.Cmd {
 	return exec.Command(name, args...)
 }
 
+// newDetachedGuiCmd 在非 Windows 平台与 exec.Command 等价；
+// SW_HIDE / STARTUPINFO 的窗口隐藏问题只在 Windows 上存在。
+func newDetachedGuiCmd(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...)
+}
+
+// newConsoleCmd 在非 Windows 平台与 exec.Command 等价；
+// CREATE_NEW_CONSOLE 只对 Windows 有意义。
+func newConsoleCmd(name string, args ...string) *exec.Cmd {
+	return exec.Command(name, args...)
+}
+

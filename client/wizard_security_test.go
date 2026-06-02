@@ -1,8 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -44,12 +47,67 @@ func TestWizardPageInjectsRuntimeToken(t *testing.T) {
 	}
 }
 
-func TestConsoleLaunchRejectsCustomBinary(t *testing.T) {
-	resp := validateConsoleLaunchRequest(consoleLaunchRequest{CustomBinary: "powershell.exe", CustomArgs: []string{"-Command", "whoami"}})
-	if resp.Success {
-		t.Fatal("custom_binary launch unexpectedly allowed")
+func TestConsoleLaunchAllowsCustomBinary(t *testing.T) {
+	resp := validateConsoleLaunchRequest(consoleLaunchRequest{CustomBinary: `C:\Tools\App\app.exe`, CustomArgs: []string{"--profile", "dev"}})
+	if !resp.Success {
+		t.Fatalf("custom_binary launch rejected: %q", resp.Message)
 	}
-	if !strings.Contains(resp.Message, "preset") {
+}
+
+func TestConsoleLaunchRejectsMixedPresetAndCustomBinary(t *testing.T) {
+	resp := validateConsoleLaunchRequest(consoleLaunchRequest{Preset: "vscode", CustomBinary: `C:\Tools\App\app.exe`})
+	if resp.Success {
+		t.Fatal("mixed preset/custom launch unexpectedly allowed")
+	}
+	if !strings.Contains(resp.Message, "不能同时") {
 		t.Fatalf("message=%q", resp.Message)
 	}
 }
+
+func TestConsoleLaunchRejectsInvalidCustomBinary(t *testing.T) {
+	resp := validateConsoleLaunchRequest(consoleLaunchRequest{CustomBinary: "app.exe\n--bad"})
+	if resp.Success {
+		t.Fatal("invalid custom_binary unexpectedly allowed")
+	}
+}
+
+func TestResolveCustomLaunchBinary(t *testing.T) {
+	lookPath := func(name string) (string, error) {
+		if name == "code.cmd" {
+			return `C:\Tools\code.cmd`, nil
+		}
+		return "", fmt.Errorf("not found")
+	}
+
+	// 裸命令名：从 PATH 解析为绝对路径。
+	got, err := resolveCustomLaunchBinary("code.cmd", lookPath)
+	if err != nil || got != `C:\Tools\code.cmd` {
+		t.Fatalf("bare command resolve failed: got=%q err=%v", got, err)
+	}
+
+	// 裸命令名不存在：报 PATH 找不到。
+	if _, err := resolveCustomLaunchBinary("nope-binary", lookPath); err == nil ||
+		!strings.Contains(err.Error(), "PATH") {
+		t.Fatalf("expected PATH not-found error, got %v", err)
+	}
+
+	// 路径不存在：报找不到应用文件，且不应调用 lookPath。
+	noLookPath := func(string) (string, error) {
+		t.Fatal("lookPath should not be called for an explicit path")
+		return "", nil
+	}
+	if _, err := resolveCustomLaunchBinary(`C:\__nope__\App\App.exe`, noLookPath); err == nil ||
+		!strings.Contains(err.Error(), "找不到应用文件") {
+		t.Fatalf("expected missing-file error, got %v", err)
+	}
+
+	// 真实存在的绝对路径：原样返回。
+	realFile := filepath.Join(t.TempDir(), "app.exe")
+	if err := os.WriteFile(realFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveCustomLaunchBinary(realFile, noLookPath); err != nil || got != realFile {
+		t.Fatalf("existing path resolve failed: got=%q err=%v", got, err)
+	}
+}
+

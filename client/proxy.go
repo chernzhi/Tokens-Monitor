@@ -2039,7 +2039,7 @@ func (s *ProxyServer) roundTripUpstream(req *http.Request) (*http.Response, erro
 		resp.Body = &idleTimeoutReadCloser{
 			ReadCloser: resp.Body,
 			cancel:     cancel,
-			idle:       upstreamBodyIdleForReq(req),
+			idle:       upstreamBodyIdle(req, resp.Header),
 			label:      req.URL.String(),
 		}
 	} else {
@@ -2063,6 +2063,25 @@ func upstreamBodyIdleForReq(req *http.Request) time.Duration {
 		return 0
 	}
 	return upstreamBodyIdleTimeout
+}
+
+// upstreamBodyIdle 在 upstreamBodyIdleForReq（基于请求路径的特例）之上，
+// 进一步根据「响应是否为流式」决定响应体的「连续无字节」超时。
+//
+// 任何 SSE / chunked / 无 Content-Length 的流式响应（OpenAI、Anthropic
+// /v1/messages、GitHub Copilot / Cursor 的 /chat/completions、各类 reasoning
+// 模型等）在模型长时间推理时，响应体可能长时间无字节下发；若沿用默认 5 分钟
+// 「无字节即取消」，会 cancel 请求 context 并关闭 body，客户端表现为
+// "stream disconnected before completion"。对流式响应禁用 idle timer，
+// 交由上游/服务端正常结束或由客户端断开。
+//
+// 非流式响应（带 Content-Length 的整块 JSON）仍保留 idle timer，用于
+// 检测真正卡死的上游连接，避免连接句柄长期泄漏。
+func upstreamBodyIdle(req *http.Request, respHeader http.Header) time.Duration {
+	if isStreamingResponse(respHeader) {
+		return 0
+	}
+	return upstreamBodyIdleForReq(req)
 }
 
 func (s *ProxyServer) closeIdleUpstreamConnections() {

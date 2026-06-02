@@ -65,9 +65,9 @@ func TestDetectRunningElectronEditorsDedupe(t *testing.T) {
 		calls++
 		return true
 	})
-	// Electron 类预设当前 6 个（vscode/cursor/windsurf/kiro/vscodium/trae），每个查一次
-	if calls != 6 {
-		t.Fatalf("expected 6 image queries (one per Electron preset), got %d", calls)
+	// Electron 类预设当前 7 个（vscode/cursor/windsurf/kiro/vscodium/trae/codex-app），每个查一次
+	if calls != 7 {
+		t.Fatalf("expected 7 image queries (one per Electron preset), got %d", calls)
 	}
 }
 

@@ -65,11 +65,20 @@ func main() {
 	defaultConfigPath := filepath.Join(appDataDir(), "config.json")
 	configPath := flag.String("config", defaultConfigPath, "配置文件路径")
 	showVersion := flag.Bool("version", false, "显示版本号并退出")
-	postUpdate := flag.String("post-update", "", "（内部）由 updater.bat 调用，传入备份文件路径用于成功后清理")
+	postUpdate := flag.String("post-update", "", "（内部）更新成功后由新版本拉起，传入备份文件路径用于成功后清理")
+	applySwap := flag.String("apply-swap", "", "（内部）由旧版本派发：要被覆盖的已安装 exe 路径")
+	applyBackup := flag.String("apply-backup", "", "（内部）配合 --apply-swap：备份文件路径")
+	applyOldPID := flag.String("apply-oldpid", "", "（内部）配合 --apply-swap：旧进程 PID")
+	applyLog := flag.String("apply-log", "", "（内部）配合 --apply-swap：updater 日志路径")
 	forceCleanup := flag.Bool("force-cleanup", false, "强制清理: 杀掉所有 ai-monitor.exe + 删除 instance.json/instance.lock，用于多实例残留")
 	flag.Parse()
 	if *forceCleanup {
 		doForceCleanup()
+		return
+	}
+	if strings.TrimSpace(*applySwap) != "" {
+		// 由旧版本派发的「自我替换」模式：覆盖已安装 exe 后重启新版本，然后退出。
+		RunApplySwap(*applySwap, *applyBackup, *applyOldPID, *applyLog)
 		return
 	}
 	if *postUpdate != "" {

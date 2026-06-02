@@ -161,17 +161,40 @@ func TestResolvePresetBinary_CLIPresetKeepsPathFirst(t *testing.T) {
 func TestIsShimExecutable(t *testing.T) {
 	cases := map[string]bool{
 		`C:\Program Files\cursor\resources\app\bin\cursor.cmd`: true,
-		`C:\Tools\code.cmd`:                                    true,
-		`C:\Tools\foo.bat`:                                     true,
-		`C:\Tools\bar.ps1`:                                     true,
-		`C:\Program Files\cursor\Cursor.exe`:                   false,
-		`/usr/local/bin/cursor`:                                false,
-		``:                                                     false,
+		`C:\Tools\code.cmd`:                  true,
+		`C:\Tools\foo.bat`:                   true,
+		`C:\Tools\bar.ps1`:                   true,
+		`C:\Program Files\cursor\Cursor.exe`: false,
+		`/usr/local/bin/cursor`:              false,
+		``:                                   false,
 	}
 	for path, want := range cases {
 		if got := isShimExecutable(path); got != want {
 			t.Errorf("isShimExecutable(%q)=%v want %v", path, got, want)
 		}
+	}
+}
+
+func TestCodexLaunchModeDetection(t *testing.T) {
+	nativeCLI := `C:/Users/test/AppData/Local/OpenAI/Codex/bin/codex.exe`
+	storeGUI := `C:/Program Files/WindowsApps/OpenAI.Codex_26.527.7698.0_x64__2p2nqsd0c76g0/app/Codex.exe`
+
+	if !launchNeedsTerminal(nil, nativeCLI) {
+		t.Fatal("custom native Codex CLI should open in a visible terminal")
+	}
+	if launchNeedsVisibleGUI(nil, nativeCLI) {
+		t.Fatal("native Codex CLI should not use GUI detached launch")
+	}
+
+	codexApp := &launchPreset{Name: "codex-app"}
+	if launchNeedsTerminal(codexApp, storeGUI) {
+		t.Fatal("Store/Appx Codex GUI should not open in a terminal")
+	}
+	if !launchNeedsVisibleGUI(codexApp, storeGUI) {
+		t.Fatal("Store/Appx Codex GUI should avoid HideWindow detached launch")
+	}
+	if !launchNeedsVisibleGUI(nil, storeGUI) {
+		t.Fatal("custom Codex GUI path should avoid HideWindow detached launch")
 	}
 }
 

@@ -27,6 +27,10 @@ type launchPreset struct {
 	Candidates  []string
 	Args        []string
 	KnownPaths  []string
+	// Discover 是 KnownPaths / PATH 都找不到时的兜底自动发现钩子（平台相关）。
+	// 用于安装位置因机器而异、无法靠固定路径命中的桌面应用（如 Codex 桌面版）。
+	// 返回 (exe 绝对路径, true) 表示发现成功。非 Windows 平台为 nil / no-op。
+	Discover func() (string, bool)
 }
 
 var managedLaunchPresets = []launchPreset{
@@ -96,9 +100,43 @@ var managedLaunchPresets = []launchPreset{
 		Description: "启动 Codex CLI（仅当前进程走本地 MITM）",
 		Candidates:  []string{"codex.cmd", "codex.exe", "codex"},
 		KnownPaths: []string{
+			// 新版原生 Codex CLI 默认安装位置（rust 版，旁边带 node.exe/rg.exe/
+			// codex-command-runner.exe）。不在 PATH 时靠这里命中。
+			"%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\codex.exe",
+			"%PROGRAMFILES%\\OpenAI\\Codex\\bin\\codex.exe",
 			"%APPDATA%\\npm\\codex.cmd",
 			"/usr/local/bin/codex",
 			"/opt/homebrew/bin/codex",
+		},
+	},
+	{
+		// Codex 桌面版（独立 Electron App / ChatGPT 桌面端内的 Codex）。
+		// 与 codex CLI 不同：发请求的 codex 引擎只认 HTTPS_PROXY / CODEX_CA_CERTIFICATE
+		// 环境变量，不认 Windows 系统代理。GUI 从开始菜单启动若 env 未刷新就漏记，
+		// 必须通过本预设注入 env 启动（或安装后彻底重启）。exe 路径因版本而异，
+		// 解析不到时请改用「自定义应用」指向实际 Codex.exe。
+		Name:        "codex-app",
+		Description: "启动 Codex 桌面版（注入本地 MITM 环境变量，确保 token 被统计）",
+		Candidates:  []string{"Codex.exe", "codex-app.exe"},
+		Discover:    discoverCodexApp,
+		KnownPaths: []string{
+			// Microsoft Store / Appx 版：Get-AppxPackage 的 InstallLocation 下 app\Codex.exe。
+			"%PROGRAMFILES%\\WindowsApps\\OpenAI.Codex_*\\app\\Codex.exe",
+			"%LOCALAPPDATA%\\Programs\\codex\\Codex.exe",
+			"%LOCALAPPDATA%\\Programs\\Codex\\Codex.exe",
+			"%LOCALAPPDATA%\\Programs\\@openai\\codex\\Codex.exe",
+			"%PROGRAMFILES%\\Codex\\Codex.exe",
+			// 版本/厂商子目录因安装方式而异，用 glob 兜底自动发现：
+			"%LOCALAPPDATA%\\Programs\\*\\Codex.exe",
+			"%LOCALAPPDATA%\\Programs\\*\\*\\Codex.exe",
+			"%LOCALAPPDATA%\\Programs\\*odex*\\Codex.exe",
+			"%PROGRAMFILES%\\*odex*\\Codex.exe",
+			"%PROGRAMFILES(X86)%\\*odex*\\Codex.exe",
+			// Squirrel/Electron 风格：%LOCALAPPDATA%\Codex\app-1.2.3\Codex.exe
+			"%LOCALAPPDATA%\\Codex\\app-*\\Codex.exe",
+			"%LOCALAPPDATA%\\*odex*\\app-*\\Codex.exe",
+			// 部分版本把 codex 引擎装进 ChatGPT 桌面端目录：
+			"%LOCALAPPDATA%\\Programs\\ChatGPT\\Codex.exe",
 		},
 	},
 	{
@@ -468,6 +506,24 @@ func launchChildWithExistingProxyDetached(cfg *Config, certMgr *CertManager, com
 	sourceApp := inferSourceApp(commandArgs, preset)
 	envVars := buildManagedLaunchEnv(cfg, certMgr, sourceApp, port, preset)
 	if runtime.GOOS == "windows" {
+		// 终端类 CLI（Codex CLI / Claude Code CLI / codex-app 命中原生 CLI）需要一个
+		// 真实可见的控制台才能交互。直接 newDetachedCmd 会用 DETACHED + CREATE_NO_WINDOW
+		// 把它启动成无窗口后台进程，用户既看不到也没法输入，表现为「点了没反应」。
+		// 这里改为在新建的 PowerShell 控制台里运行，env 经 PowerShell 继承注入。
+		if launchNeedsTerminal(preset, commandArgs[0]) {
+			wrapped := wrapInPowerShellTerminal(commandArgs)
+			cmd := newConsoleCmd(wrapped[0], wrapped[1:]...)
+			cmd.Env = mergeEnv(os.Environ(), envVars)
+			return cmd.Start()
+		}
+		// GUI 程序不能用 HideWindow=true 启动，否则部分 WebView2/Electron 壳第一次
+		// ShowWindow 会吃到 STARTUPINFO 里的 SW_HIDE，进程已启动但窗口不可见。
+		// 这同样适用于「自定义应用」指向 Codex.exe / 其它 GUI exe 的场景。
+		if launchNeedsVisibleGUI(preset, commandArgs[0]) {
+			cmd := newDetachedGuiCmd(commandArgs[0], commandArgs[1:]...)
+			cmd.Env = mergeEnv(os.Environ(), envVars)
+			return cmd.Start()
+		}
 		// 优先用 newDetachedCmd 直接 spawn 目标，避开 cmd /c start "" 包装。
 		// 少一层 cmd+conhost 能显著减少 Default Desktop 堆占用，
 		// 缓解长时间运行后偶发的 "Not enough memory resources" CreateProcess 失败。
@@ -478,6 +534,83 @@ func launchChildWithExistingProxyDetached(cfg *Config, certMgr *CertManager, com
 	cmd := exec.Command(commandArgs[0], commandArgs[1:]...)
 	cmd.Env = mergeEnv(os.Environ(), envVars)
 	return cmd.Start()
+}
+
+// launchNeedsTerminal 判断从仪表盘一键启动时，是否应当为目标开一个可见终端窗口。
+// 终端类 CLI（codex / claude-code）始终需要；codex-app 仅当命中的是原生 Codex CLI
+// （而非 Electron 桌面版 GUI）时需要——桌面版 GUI 仍走分离启动。
+func launchNeedsTerminal(preset *launchPreset, exePath string) bool {
+	if preset == nil {
+		return isKnownTerminalCLI(exePath)
+	}
+	switch strings.ToLower(strings.TrimSpace(preset.Name)) {
+	case "codex", "claude-code":
+		return true
+	case "codex-app":
+		return isNativeCodexCLI(exePath)
+	default:
+		return false
+	}
+}
+
+// launchNeedsVisibleGUI 判断是否应当以「可见 GUI」方式分离启动目标。
+// 这里的重点不是置前窗口，而是避免 HideWindow=true 写入 STARTUPINFO 后把
+// GUI 的首次 ShowWindow 强制改成 SW_HIDE。
+func launchNeedsVisibleGUI(preset *launchPreset, exePath string) bool {
+	if strings.TrimSpace(exePath) == "" || isShimExecutable(exePath) || isKnownTerminalCLI(exePath) {
+		return false
+	}
+	if preset != nil {
+		return isGUIPreset(preset)
+	}
+	return strings.EqualFold(filepath.Ext(exePath), ".exe")
+}
+
+func isKnownTerminalCLI(exePath string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(exePath)))
+	switch base {
+	case "codex", "codex.cmd":
+		return true
+	case "codex.exe":
+		return isNativeCodexCLI(exePath)
+	case "claude", "claude.cmd", "claude.exe":
+		return true
+	default:
+		return false
+	}
+}
+
+// isNativeCodexCLI 判断路径是否为新版原生 Codex CLI（`...\OpenAI\Codex\bin\codex.exe`），
+// 以便与 Electron 桌面版 `Codex.exe`（直接位于 Programs 目录、非 bin 下）区分。
+func isNativeCodexCLI(exePath string) bool {
+	if strings.TrimSpace(exePath) == "" {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(exePath))
+	if base != "codex.exe" {
+		return false
+	}
+	parent := strings.ToLower(filepath.Base(filepath.Dir(exePath)))
+	return parent == "bin"
+}
+
+// wrapInPowerShellTerminal 把目标命令包装成在新 PowerShell 控制台里运行：
+//
+//	powershell -NoExit -Command & '<exe>' '<arg1>' '<arg2>' ...
+//
+// -NoExit 让 CLI 退出后窗口仍保留，便于查看输出。env 由外层 PowerShell 进程继承，
+// 再传给 CLI，因此本地 MITM 的 HTTPS_PROXY / CA 证书等环境变量照常注入。
+func wrapInPowerShellTerminal(commandArgs []string) []string {
+	var sb strings.Builder
+	sb.WriteString("& '")
+	sb.WriteString(strings.ReplaceAll(commandArgs[0], "'", "''"))
+	sb.WriteString("'")
+	for _, a := range commandArgs[1:] {
+		sb.WriteString(" '")
+		sb.WriteString(strings.ReplaceAll(a, "'", "''"))
+		sb.WriteString("'")
+	}
+	return []string{"powershell.exe", "-NoExit", "-Command", sb.String()}
 }
 
 func inferSourceApp(commandArgs []string, preset *launchPreset) string {
@@ -506,7 +639,7 @@ func inferSourceApp(commandArgs []string, preset *launchPreset) string {
 		return "trae"
 	case "zed":
 		return "zed"
-	case "codex":
+	case "codex", "codex-app":
 		return "codex"
 	case "idea", "idea64":
 		return "jetbrains"
@@ -769,6 +902,8 @@ func managedPresetProcessImage(preset *launchPreset) (imageName, displayName str
 		return "VSCodium.exe", "VS Codium"
 	case "trae":
 		return "Trae.exe", "Trae"
+	case "codex-app":
+		return "Codex.exe", "Codex 桌面版"
 	default:
 		return "", ""
 	}
@@ -826,6 +961,17 @@ func resolvePresetBinary(preset launchPreset, lookPath func(string) (string, err
 				continue
 			}
 			tried = append(tried, resolved)
+			// 含通配符（* ? [）的路径走 glob：JetBrains 的版本号目录、
+			// Codex 桌面版因版本不同的安装子目录都靠它命中。
+			if strings.ContainsAny(resolved, "*?[") {
+				matches, _ := filepath.Glob(resolved)
+				for _, m := range matches {
+					if exists(m) {
+						return m, true
+					}
+				}
+				continue
+			}
 			if exists(resolved) {
 				return resolved, true
 			}
@@ -850,12 +996,22 @@ func resolvePresetBinary(preset launchPreset, lookPath func(string) (string, err
 		if got, ok := tryLookPath(); ok {
 			return got, tried, nil
 		}
+		if preset.Discover != nil {
+			if got, ok := preset.Discover(); ok && exists(got) {
+				return got, tried, nil
+			}
+		}
 	} else {
 		if got, ok := tryLookPath(); ok {
 			return got, tried, nil
 		}
 		if got, ok := tryKnownPaths(); ok {
 			return got, tried, nil
+		}
+		if preset.Discover != nil {
+			if got, ok := preset.Discover(); ok && exists(got) {
+				return got, tried, nil
+			}
 		}
 	}
 

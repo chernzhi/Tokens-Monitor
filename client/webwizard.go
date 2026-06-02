@@ -345,6 +345,8 @@ const webWizardHTML = `<!DOCTYPE html>
     <div class="panel">
       <div class="panel-title">一键启动编辑器 / 终端（已启用自动重启同名运行实例）</div>
 
+      <div id="restartHintBanner" style="display:none;padding:10px 14px;border-radius:8px;margin:0 0 12px;background:#7c2d12;color:#fed7aa;font-size:13px;line-height:1.5;border:1px solid #c2410c"></div>
+
       <div class="launch-section">
         <div class="launch-section-title">AI 编辑器 / CLI</div>
         <div class="launch-grid">
@@ -365,6 +367,12 @@ const webWizardHTML = `<!DOCTYPE html>
               <img src="https://cdn.simpleicons.org/openai/ffffff" alt="" onerror="icoErr(this)">
             </span>
             <span class="launch-name">Codex</span>
+          </button>
+          <button class="launch-btn" onclick="launchPreset('codex-app')" title="启动 Codex 桌面版并注入 HTTPS_PROXY+CA 证书。Codex 引擎只认环境变量，桌面版从开始菜单启动可能漏记 token，请用此入口启动。找不到 exe 时改用「自定义应用」指向实际 Codex.exe。">
+            <span class="launch-ico" style="background:#10a37f;" data-fallback="C">
+              <img src="https://cdn.simpleicons.org/openai/ffffff" alt="" onerror="icoErr(this)">
+            </span>
+            <span class="launch-name">Codex 桌面版</span>
           </button>
           <button class="launch-btn" onclick="launchPreset('windsurf')" title="启动 Windsurf">
             <span class="launch-ico" style="background:#fff;" data-fallback="W">
@@ -451,6 +459,19 @@ const webWizardHTML = `<!DOCTYPE html>
             <span class="launch-name">GoLand</span>
           </button>
         </div>
+      </div>
+
+      <div class="launch-section">
+        <div class="launch-section-title">自定义应用</div>
+        <div class="field">
+          <label>应用地址</label>
+          <input id="customBinary" type="text" placeholder="C:\Program Files\App\App.exe 或 code.cmd" />
+        </div>
+        <div class="field">
+          <label>启动参数（可选）</label>
+          <input id="customArgs" type="text" placeholder="例如：--reuse-window &quot;D:\Repos\project&quot;" />
+        </div>
+        <button class="btn-secondary btn-small" onclick="launchCustomApp()" title="启动自定义应用并注入本地代理环境。">启动自定义应用</button>
       </div>
     </div>
 
@@ -688,6 +709,91 @@ async function launchPreset(name) {
       method: 'POST',
       headers: wizardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ preset: name, restart_running: true }),
+    });
+    var data = await resp.json();
+    if (resp.ok && data.success) {
+      setStatus('success', '✓ ' + data.message);
+    } else {
+      setStatus('error', '✗ ' + (data.message || '启动失败'));
+    }
+  } catch (err) {
+    setStatus('error', '✗ 网络错误: ' + err.message);
+  }
+}
+
+function splitCustomArgs(input) {
+  input = (input || '').trim();
+  if (!input) return [];
+  var args = [];
+  var current = '';
+  var quote = '';
+  var escaped = false;
+  for (var i = 0; i < input.length; i++) {
+    var ch = input[i];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      var next = input[i + 1] || '';
+      if (next === '"' || next === "'" || next === '\\') {
+        escaped = true;
+        continue;
+      }
+      current += ch;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = '';
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        args.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += '\\';
+  if (quote) throw new Error('启动参数引号未闭合');
+  if (current) args.push(current);
+  return args;
+}
+
+async function launchCustomApp() {
+  var binaryEl = document.getElementById('customBinary');
+  var argsEl = document.getElementById('customArgs');
+  var binary = (binaryEl && binaryEl.value || '').trim();
+  if ((binary[0] === '"' && binary[binary.length - 1] === '"') || (binary[0] === "'" && binary[binary.length - 1] === "'")) {
+    binary = binary.slice(1, -1).trim();
+  }
+  if (!binary) {
+    setStatus('error', '✗ 请填写应用地址');
+    if (binaryEl) binaryEl.focus();
+    return;
+  }
+  var args = [];
+  try {
+    args = splitCustomArgs(argsEl && argsEl.value || '');
+  } catch (err) {
+    setStatus('error', '✗ ' + err.message);
+    if (argsEl) argsEl.focus();
+    return;
+  }
+  setStatus('info', '正在启动自定义应用...');
+  try {
+    var resp = await fetch(basePath + '/api/console/launch', {
+      method: 'POST',
+      headers: wizardHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ custom_binary: binary, custom_args: args, restart_running: false }),
     });
     var data = await resp.json();
     if (resp.ok && data.success) {
@@ -956,10 +1062,32 @@ window.addEventListener('load', function() {
       goToStep2();
       loadOverview();
       setInterval(loadOverview, 30000);
+      refreshRestartHints();
+      setInterval(refreshRestartHints, 15000);
     }
   });
   initLogPanel();
 });
+
+// 自检：监控已启用，但 Codex 扩展/桌面版若在启用前就打开，token 会漏记，提示重启。
+async function refreshRestartHints() {
+  var banner = document.getElementById('restartHintBanner');
+  if (!banner) return;
+  try {
+    var resp = await fetch(basePath + '/api/wizard/restart-hints', { headers: wizardHeaders({}) });
+    if (!resp.ok) { banner.style.display = 'none'; return; }
+    var data = await resp.json();
+    var running = (data && data.running) || [];
+    if (!running.length) { banner.style.display = 'none'; return; }
+    var names = running.map(function(r){ return r.display || r.image; }).join('、');
+    banner.innerHTML = '⚠️ 检测到 <b>' + names + '</b> 正在运行。若它在启用监控<b>之前</b>就已打开，'
+      + '其中的 Codex（扩展或桌面版）不会继承本机代理，token 将<b>漏记</b>。'
+      + '请<b>完全退出并重启</b>，或直接用上方对应按钮重新启动。';
+    banner.style.display = 'block';
+  } catch (e) {
+    banner.style.display = 'none';
+  }
+}
 
 // ── 使用统计 ─────────────────────────────────────────────────
 var overviewState = { days: 1, loading: false };
@@ -1666,6 +1794,29 @@ func (s *ProxyServer) serveWizard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if subPath == "/api/wizard/restart-hints" && r.Method == http.MethodGet {
+		// 监控服务器（即本进程）在跑就代表 MITM 已激活。Codex 引擎只认环境变量，
+		// 而 GUI（VS Code/Cursor 里的 Codex 扩展、Codex 桌面版）若在监控启用前
+		// 就已打开，其子进程不会继承新写入的 HTTPS_PROXY/CA，导致 token 漏记。
+		// 这里列出当前在跑的 Electron 类编辑器/桌面版，提示用户彻底重启。
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		editors := detectRunningElectronEditors(func(image string) bool {
+			running, _ := isProcessImageRunning(image)
+			return running
+		})
+		hints := make([]map[string]string, 0, len(editors))
+		for _, e := range editors {
+			hints = append(hints, map[string]string{
+				"preset":  e.Preset,
+				"image":   e.ImageName,
+				"display": e.Display,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"running": hints})
+		return
+	}
+
 	if subPath == "/api/wizard/update/status" && r.Method == http.MethodGet {
 		w.Header().Set("Content-Type", "application/json")
 		if s.Updater == nil {
@@ -1992,13 +2143,63 @@ func tryLockWithTimeout(mu *sync.Mutex, timeout time.Duration) bool {
 }
 
 func validateConsoleLaunchRequest(req consoleLaunchRequest) consoleActionResponse {
-	if strings.TrimSpace(req.CustomBinary) != "" || len(req.CustomArgs) > 0 {
-		return consoleActionResponse{Success: false, Message: "仅允许使用 preset 启动内置应用"}
+	preset := strings.TrimSpace(req.Preset)
+	customBinary := normalizeCustomLaunchBinary(req.CustomBinary)
+	if customBinary != "" {
+		if preset != "" {
+			return consoleActionResponse{Success: false, Message: "preset 与自定义应用地址不能同时提供"}
+		}
+		if len(req.CustomArgs) > 64 {
+			return consoleActionResponse{Success: false, Message: "启动参数过多"}
+		}
+		parts := append([]string{customBinary}, req.CustomArgs...)
+		for _, part := range parts {
+			if strings.ContainsAny(part, "\x00\r\n") {
+				return consoleActionResponse{Success: false, Message: "应用地址或参数包含非法字符"}
+			}
+		}
+		return consoleActionResponse{Success: true}
 	}
-	if strings.TrimSpace(req.Preset) == "" {
+	if len(req.CustomArgs) > 0 {
+		return consoleActionResponse{Success: false, Message: "custom_args 需要配合 custom_binary"}
+	}
+	if preset == "" {
 		return consoleActionResponse{Success: false, Message: "请提供 preset"}
 	}
 	return consoleActionResponse{Success: true}
+}
+
+func normalizeCustomLaunchBinary(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		first, last := value[0], value[len(value)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			value = strings.TrimSpace(value[1 : len(value)-1])
+		}
+	}
+	return value
+}
+
+// resolveCustomLaunchBinary 在启动自定义应用前解析并校验可执行文件位置。
+// 含路径分隔符（绝对或相对路径）按字面校验文件是否存在；裸命令名则交给
+// lookPath 从 PATH 解析为绝对路径（Windows 下 lookPath 会按 PATHEXT 补全
+// .exe/.cmd/.bat）。解析失败返回面向用户的错误，避免前端假成功。
+func resolveCustomLaunchBinary(binary string, lookPath func(string) (string, error)) (string, error) {
+	binary = strings.TrimSpace(binary)
+	if binary == "" {
+		return "", fmt.Errorf("应用地址为空")
+	}
+	if filepath.IsAbs(binary) || strings.ContainsAny(binary, `\/`) {
+		if fileExists(binary) {
+			return binary, nil
+		}
+		return "", fmt.Errorf("找不到应用文件: %s", binary)
+	}
+	resolved, err := lookPath(binary)
+	if err != nil {
+		return "", fmt.Errorf("PATH 中找不到命令: %s", binary)
+	}
+	return resolved, nil
 }
 
 func (s *ProxyServer) handleConsoleLaunch(w http.ResponseWriter, r *http.Request) {
@@ -2020,12 +2221,31 @@ func (s *ProxyServer) handleConsoleLaunch(w http.ResponseWriter, r *http.Request
 	defer wizardActionMu.Unlock()
 
 	presetName := strings.ToLower(strings.TrimSpace(req.Preset))
-	command, preset, err := resolveLaunchCommand(nil, presetName, exec.LookPath)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: err.Error()})
-		return
+	var command []string
+	var preset *launchPreset
+	if customBinary := normalizeCustomLaunchBinary(req.CustomBinary); customBinary != "" {
+		// 启动前先解析校验路径：
+		//   - 绝对/相对路径：校验文件是否存在；
+		//   - 裸命令名：从 PATH 解析为绝对路径。
+		// 否则 .cmd/.bat shim 经 `cmd /c start /b` 包装后即使目标不存在，
+		// cmd.Start() 仍会成功，导致前端误报「已启动」。
+		resolved, err := resolveCustomLaunchBinary(customBinary, exec.LookPath)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: err.Error()})
+			return
+		}
+		command = append([]string{resolved}, req.CustomArgs...)
+	} else {
+		var err error
+		command, preset, err = resolveLaunchCommand(nil, presetName, exec.LookPath)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(consoleActionResponse{Success: false, Message: err.Error()})
+			return
+		}
 	}
 	if req.RestartRunning {
 		if image, _ := managedPresetProcessImage(preset); image != "" {
